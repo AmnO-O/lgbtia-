@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 CLASS_NO_HATE = 0
 CLASS_IMPLICIT_HATE = 1
 CLASS_EXPLICIT_HATE = 2
+NUM_CLASSES = 3
 
 TARGET_CLASSES = {
     CLASS_NO_HATE: "no",
