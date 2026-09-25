@@ -51,9 +51,17 @@ class TaskBTrainer:
         
         # Mixed Precision (AMP) support for GPU speedup (2-3x faster forward/backward)
         self.use_amp = (self.device.type == "cuda")
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        device_type = self.device.type if self.device.type in ["cuda", "cpu"] else "cuda"
+        self.device_type = device_type
+        
+        # Use modern torch.amp.GradScaler if available, fallback to torch.cuda.amp.GradScaler
+        if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+            self.scaler = torch.amp.GradScaler(device_type, enabled=self.use_amp)
+        else:
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+            
         if self.use_amp:
-            print("[TaskBTrainer] PyTorch Automatic Mixed Precision (AMP - FP16) Enabled.")
+            print(f"[TaskBTrainer] PyTorch Automatic Mixed Precision (AMP - FP16 on {self.device}) Enabled.")
         
         # Calculate balanced class weights if available to prevent majority class collapse
         class_weights = getattr(config, 'class_weights', None)
@@ -97,7 +105,7 @@ class TaskBTrainer:
             hs_labels = hs_labels.to(self.device, non_blocking=True)
 
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with torch.amp.autocast(self.device_type, enabled=self.use_amp):
                 logits, _, _ = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -137,7 +145,7 @@ class TaskBTrainer:
             role_ids = role_ids.to(self.device, non_blocking=True)
             hs_labels = hs_labels.to(self.device, non_blocking=True)
 
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with torch.amp.autocast(self.device_type, enabled=self.use_amp):
                 logits, _, _ = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
