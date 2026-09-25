@@ -7,7 +7,7 @@ Techniques Implemented:
   2. EDA Techniques (Easy Data Augmentation - Wei & Zou 2019):
      - Random Swap (RS): Swaps positions of two randomly chosen words.
      - Random Deletion (RD): Randomly removes words with probability p.
-     - Random Masking / Insertion (RM): Injects <mask> tokens to train robust attention against missing words.
+     - Random Masking / Insertion (RM): Injects <mask_token> to train robust attention against missing words.
   3. Multilingual Social Media Slang & Contraction Injection (EN, IT, NL, FA, VI).
   4. Context Dropout (Title / Description Masking): Prevents bias toward metadata.
   5. Minority Class Oversampling (specifically for 'yes_implicit').
@@ -113,7 +113,7 @@ def random_deletion(text: str, p: float = 0.10) -> str:
     return " ".join(kept)
 
 
-def random_mask(text: str, mask_token: str = "<mask>", p: float = 0.10) -> str:
+def random_mask(text: str, mask_token: str = "<mask_token>", p: float = 0.10) -> str:
     """
     Random Masking (RM): Replaces random words with mask_token.
     Trains the cross-attention layers to identify implicit hatred even when keywords are hidden.
@@ -253,10 +253,12 @@ def augment_multilingual_dataframe(
     implicit_upsample_ratio: float = 0.50,
     p_eda: float = 0.50,               # Probability of applying EDA (Swap, Delete, Mask)
     p_slang: float = 0.30,             # Probability of applying Slang/Teencode noise
+    p_noise: Optional[float] = None,   # Alias for p_slang / noise
     use_back_translation: bool = False, # Set True if you have MarianMT installed / GPU memory
     pivot_lang: str = "de",
-    mask_token: str = "<mask>",
-    random_state: int = 42
+    mask_token: str = "<mask_token>",
+    random_state: int = 42,
+    **kwargs
 ) -> pd.DataFrame:
     """
     Full Multilingual Augmentation Pipeline for Task B:
@@ -268,6 +270,9 @@ def augment_multilingual_dataframe(
     """
     random.seed(random_state)
     np.random.seed(random_state)
+    
+    # Handle p_noise alias if supplied
+    effective_slang_p = p_noise if p_noise is not None else p_slang
     
     bt_augmenter = None
     if use_back_translation:
@@ -314,7 +319,7 @@ def augment_multilingual_dataframe(
                     comment = random_mask(comment, mask_token=mask_token, p=0.10)
             
             # 3. Slang / Typographical variation
-            if random.random() < p_slang:
+            if random.random() < effective_slang_p:
                 comment = augment_slang_noise(comment, lang=lang, p=0.20)
                 
             new_row[comment_col] = comment
