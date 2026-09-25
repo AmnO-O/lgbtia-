@@ -180,20 +180,33 @@ class TaskBClassAwareAttentionModel(nn.Module):
             nn.Linear(hidden_dim, NUM_CLASSES)
         )
 
-    def init_queries_from_text(self, tokenizer: Any, device: Optional[torch.device] = None):
+    def init_queries_from_text(self, tokenizer: Any, lang: str = "en", device: Optional[torch.device] = None):
         """
         Semantically initialize query_embeddings by encoding
-        the natural language question strings using mmBERT's own embedding layer.
+        the natural language question strings across English, Italian, Dutch, Persian, or Vietnamese.
         Safely restores model training mode upon completion.
         """
         was_training = self.training
         self.eval()
         dev = device or self.query_embeddings.device
+        lang_key = lang.lower().strip()
         
         try:
             with torch.no_grad():
                 for i, probe in enumerate(self.probes):
-                    text = probe.question_vi if probe.question_vi.strip() else probe.question_en
+                    # Select target language text with English fallback
+                    text = ""
+                    if lang_key == "it" and getattr(probe, "question_it", ""):
+                        text = probe.question_it
+                    elif lang_key == "nl" and getattr(probe, "question_nl", ""):
+                        text = probe.question_nl
+                    elif lang_key == "fa" and getattr(probe, "question_fa", ""):
+                        text = probe.question_fa
+                    elif lang_key == "vi" and getattr(probe, "question_vi", ""):
+                        text = probe.question_vi
+                    else:
+                        text = probe.question_en
+
                     if not text.strip():
                         continue
                     tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=64)
@@ -203,7 +216,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
                     mask = tokens["attention_mask"].unsqueeze(-1)
                     emb = (outputs.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
                     self.query_embeddings.data[i].copy_(emb.squeeze(0).to(self.query_embeddings.dtype))
-            print(f"[TaskBClassAwareAttentionModel] Initialized {self.num_queries} queries using mmBERT semantic embeddings.")
+            print(f"[TaskBClassAwareAttentionModel] Initialized {self.num_queries} queries using mmBERT embeddings for language: [{lang_key.upper()}].")
         finally:
             self.train(was_training)
 

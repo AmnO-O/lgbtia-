@@ -1,74 +1,65 @@
 import os
 import time
 import json
-from typing import Dict, Any, Optional, Tuple
-
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score, f1_score, classification_report
+from sklearn.metrics import f1_score, accuracy_score
+from typing import Optional, Dict, Any, Tuple, List, Union
 
-from .config import PipelineConfig, IDX2HATE
-from .models.mmbert import unfreeze_last_n
+from .config import PipelineConfig, HATE_CLASSES, HATE2IDX, IDX2HATE
 from .losses import FocalLoss
+from .models.mmbert import unfreeze_last_n
+from .models.task_b_class_aware import TaskBClassAwareAttentionModel
+
 
 class TaskBTrainer:
     """
-    Dedicated Trainer for Task B: Class-Aware Multi-Head Cross-Attention (MHCA) Architecture.
-    Trains hate speech classification (3 classes: no, yes_implicit, yes_explicit) with:
-      - Explicit Role Embeddings (<T>, <D>, <C>)
-      - Learned Class Queries [q_NonHate, q_Implicit, q_Explicit]
-      - Optional Query Interaction (MHSA) Ablation
-      - 2-Phase Fine-Tuning (Frozen backbone -> unfreeze last N layers)
+    Dedicated Trainer for Task B (Class-Aware Multi-Query Cross-Attention Model)
+    Features:
+      - Two-Phase Transfer Learning (Phase 1: Frozen Backbone Warmup -> Phase 2: Joint Backbone Fine-Tuning)
+      - Integrated Linear Warmup + Cosine Annealing Learning Rate Scheduler
+      - Differential Layer Learning Rates (Separate Backbone LR and Head LR)
+      - Automatic Mixed Precision (AMP) with FP16/BF16 on CUDA / CPU Fallback
+      - Class-Balanced Multi-Class Focal Loss with Label Smoothing
+      - Dynamic Early Stopping and Macro-F1 Checkpoint Serialization
     """
     def __init__(
         self,
-        model: nn.Module,
         config: PipelineConfig,
+        model: TaskBClassAwareAttentionModel,
         train_loader: DataLoader,
         val_loader: DataLoader,
         df_val: pd.DataFrame,
+        class_weights: Optional[List[float]] = None,
+        device: Optional[torch.device] = None,
+        use_amp: bool = True
     ):
-        self.model = model
         self.config = config
+        self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.df_val = df_val
+        self.class_weights = class_weights
 
-        # Device assignment
-        if config.device:
-            self.device = torch.device(config.device)
-        elif torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            self.device = torch.device("mps")
+        # Hardware Setup
+        if device is not None:
+            self.device = device
         else:
-            self.device = torch.device("cpu")
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         self.model.to(self.device)
-        
-        # Mixed Precision (AMP) support for GPU speedup (2-3x faster forward/backward)
-        self.use_amp = (self.device.type == "cuda")
-        device_type = self.device.type if self.device.type in ["cuda", "cpu"] else "cuda"
-        self.device_type = device_type
-        
-        # Use modern torch.amp.GradScaler if available, fallback to torch.cuda.amp.GradScaler
-        if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-            self.scaler = torch.amp.GradScaler(device_type, enabled=self.use_amp)
-        else:
-            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
-            
-        if self.use_amp:
-            print(f"[TaskBTrainer] PyTorch Automatic Mixed Precision (AMP - FP16 on {self.device}) Enabled.")
-        
-        # Configure Loss Function: Focal Loss or CrossEntropyLoss with balanced weights & label smoothing
-        class_weights = getattr(config, 'class_weights', None)
+        self.use_amp = use_amp and (self.device.type == 'cuda')
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
+        self.device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
+
+        # Loss Function Setup
         label_smoothing = getattr(config, 'label_smoothing', 0.05)
         loss_type = getattr(config, 'loss_type', 'focal')
-        focal_gamma = getattr(config, 'focal_gamma', 2.0)
+        focal_gamma = getattr(config, 'focal_gamma', 1.0)
         
         weights_tensor = None
         if class_weights is not None:
@@ -91,10 +82,12 @@ class TaskBTrainer:
                 print(f"[TaskBTrainer] Loss: Standard CrossEntropyLoss (label_smoothing={label_smoothing})")
             
         self.history = []
-
         os.makedirs(self.config.output_dir, exist_ok=True)
 
     def build_optimizer(self, lr: float, backbone_lr: Optional[float] = None) -> torch.optim.Optimizer:
+        """
+        Builds AdamW optimizer with distinct learning rate parameter groups.
+        """
         backbone_prms = [p for n, p in self.model.named_parameters()
                          if p.requires_grad and n.startswith('mmbert.')]
         head_prms = [p for n, p in self.model.named_parameters()
@@ -104,14 +97,39 @@ class TaskBTrainer:
             return torch.optim.AdamW([
                 {'params': backbone_prms, 'lr': backbone_lr, 'weight_decay': self.config.weight_decay},
                 {'params': head_prms, 'lr': lr, 'weight_decay': self.config.weight_decay},
-            ])
+            ], betas=(0.9, 0.98), eps=1e-6)
         return torch.optim.AdamW(
             [p for p in self.model.parameters() if p.requires_grad],
             lr=lr,
-            weight_decay=self.config.weight_decay
+            weight_decay=self.config.weight_decay,
+            betas=(0.9, 0.98),
+            eps=1e-6
         )
 
-    def train_epoch(self, optimizer: torch.optim.Optimizer) -> float:
+    def build_scheduler(self, optimizer: torch.optim.Optimizer, num_epochs: int):
+        """
+        Builds a Cosine Annealing learning rate scheduler with Linear Warmup.
+        """
+        total_steps = len(self.train_loader) * num_epochs
+        warmup_steps = int(total_steps * 0.10) # 10% warmup
+        
+        try:
+            from transformers import get_cosine_schedule_with_warmup
+            return get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_steps,
+                min_lr_ratio=0.01
+            )
+        except Exception:
+            # Fallback to PyTorch native CosineAnnealingLR if transformers helper is not available
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=total_steps,
+                eta_min=1e-7
+            )
+
+    def train_epoch(self, optimizer: torch.optim.Optimizer, scheduler: Optional[Any] = None) -> float:
         self.model.train()
         total_loss = 0.0
 
@@ -144,17 +162,20 @@ class TaskBTrainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.clip_grad_norm)
                 optimizer.step()
 
+            if scheduler is not None:
+                scheduler.step()
+
             total_loss += loss.item()
 
-        return total_loss / len(self.train_loader)
+        return total_loss / max(len(self.train_loader), 1)
 
     @torch.no_grad()
     def eval_epoch(self) -> Tuple[float, Dict[str, float], np.ndarray, np.ndarray]:
         self.model.eval()
         total_loss = 0.0
         all_preds = []
-        all_probs = []
         all_labels = []
+        all_probs = []
 
         for batch in self.val_loader:
             input_ids, attention_mask, role_ids, _, hs_labels, _ = batch
@@ -170,28 +191,27 @@ class TaskBTrainer:
                     role_ids=role_ids
                 )
                 loss = self.criterion(logits, hs_labels)
+
             total_loss += loss.item()
+            probs = F.softmax(logits, dim=-1)
+            preds = torch.argmax(probs, dim=-1)
 
-            probs = F.softmax(logits.float(), dim=-1).cpu().numpy()
-            preds = np.argmax(probs, axis=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(hs_labels.cpu().numpy())
+            all_probs.append(probs.cpu().numpy())
 
-            all_probs.append(probs)
-            all_preds.append(preds)
-            all_labels.append(hs_labels.cpu().numpy())
+        avg_loss = total_loss / max(len(self.val_loader), 1)
+        y_true = np.array(all_labels)
+        y_pred = np.array(all_preds)
+        y_prob = np.concatenate(all_probs, axis=0) if len(all_probs) > 0 else np.zeros((0, 3))
 
-        avg_loss = total_loss / len(self.val_loader)
-        y_pred = np.concatenate(all_preds)
-        y_true = np.concatenate(all_labels)
-        y_prob = np.concatenate(all_probs, axis=0)
-
-        acc = float(accuracy_score(y_true, y_pred))
         macro_f1 = float(f1_score(y_true, y_pred, average='macro', zero_division=0))
-        
-        # Per-class F1
+        acc = float(accuracy_score(y_true, y_pred))
         f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
+
         metrics = {
-            'hs_acc': acc,
             'hs_macro_f1': macro_f1,
+            'hs_acc': acc,
             'hs_f1_no': float(f1_per_class[0]) if len(f1_per_class) > 0 else 0.0,
             'hs_f1_implicit': float(f1_per_class[1]) if len(f1_per_class) > 1 else 0.0,
             'hs_f1_explicit': float(f1_per_class[2]) if len(f1_per_class) > 2 else 0.0,
@@ -201,16 +221,18 @@ class TaskBTrainer:
     def run_training_loop(self, tag: str, num_epochs: int, lr: float,
                           backbone_lr: Optional[float] = None) -> str:
         optimizer = self.build_optimizer(lr=lr, backbone_lr=backbone_lr)
+        scheduler = self.build_scheduler(optimizer, num_epochs=num_epochs)
+        
         best_metric = -1.0
         best_val_loss = float('inf')
         counter = 0
         best_checkpoint_path = os.path.join(self.config.output_dir, f"{tag}.pt")
 
-        print(f"\n--- [Task B Class-Aware] Starting {tag} (Max Epochs: {num_epochs}, Patience: {self.config.patience}, Head LR: {lr}) ---")
+        print(f"\n--- [Task B Class-Aware] Starting {tag} (Max Epochs: {num_epochs}, Patience: {self.config.patience}, Head LR: {lr:.2e}, Backbone LR: {backbone_lr}) ---")
 
         for epoch in range(num_epochs):
             t0 = time.time()
-            train_loss = self.train_epoch(optimizer)
+            train_loss = self.train_epoch(optimizer, scheduler=scheduler)
             val_loss, metrics, _, _ = self.eval_epoch()
             elapsed = time.time() - t0
 

@@ -7,7 +7,17 @@ ModernBERT/mmBERT backbones, Bi-LSTM, and Transformer baselines.
 from .config import PipelineConfig, HATE_CLASSES, HATE2IDX, IDX2HATE
 from .data import StereoQueerDataset, MMBertSeqDataset, DataPipeline, safe_clean, encode_target, decode_target
 from .task_b_data import TaskBRoleDataset
-from .models.task_b_questions import QueryProbe, DEFAULT_TASK_B_PROBES, get_default_probes
+from .augmentation import (
+    random_swap,
+    random_deletion,
+    random_mask,
+    augment_slang_noise,
+    augment_context_dropout,
+    BackTranslationAugmenter,
+    augment_multilingual_dataframe,
+    augment_task_b_dataframe,
+)
+from .models.task_b_questions import QueryProbe, DEFAULT_TASK_B_PROBES, get_default_probes, get_probes_for_language
 from .models.task_b_class_aware import TaskBClassAwareAttentionModel, RMSNorm
 from .losses import MultiTaskLoss, FocalLoss
 from .metrics import evaluate_stereoqueer, print_metrics
@@ -23,9 +33,18 @@ __all__ = [
     "StereoQueerDataset",
     "MMBertSeqDataset",
     "TaskBRoleDataset",
+    "random_swap",
+    "random_deletion",
+    "random_mask",
+    "augment_slang_noise",
+    "augment_context_dropout",
+    "BackTranslationAugmenter",
+    "augment_multilingual_dataframe",
+    "augment_task_b_dataframe",
     "QueryProbe",
     "DEFAULT_TASK_B_PROBES",
     "get_default_probes",
+    "get_probes_for_language",
     "RMSNorm",
     "TaskBClassAwareAttentionModel",
     "DataPipeline",
