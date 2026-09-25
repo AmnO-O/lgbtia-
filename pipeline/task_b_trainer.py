@@ -48,8 +48,16 @@ class TaskBTrainer:
             self.device = torch.device("cpu")
 
         self.model.to(self.device)
-        # 3-class Cross-Entropy Loss
-        self.criterion = nn.CrossEntropyLoss()
+        
+        # Calculate balanced class weights if available to prevent majority class collapse
+        class_weights = getattr(config, 'class_weights', None)
+        if class_weights is not None:
+            weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(self.device)
+            self.criterion = nn.CrossEntropyLoss(weight=weights_tensor)
+            print(f"[TaskBTrainer] Balanced Class Weights applied: {class_weights}")
+        else:
+            self.criterion = nn.CrossEntropyLoss()
+            
         self.history = []
 
         os.makedirs(self.config.output_dir, exist_ok=True)
