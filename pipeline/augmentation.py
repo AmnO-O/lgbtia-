@@ -10,7 +10,7 @@ Techniques Implemented:
      - Random Masking / Insertion (RM): Injects <mask_token> to train robust attention against missing words.
   3. Multilingual Social Media Slang & Contraction Injection (EN, IT, NL, FA, VI).
   4. Context Dropout (Title / Description Masking): Prevents bias toward metadata.
-  5. Minority Class Oversampling (specifically for 'yes_implicit').
+  5. Per-Language Stratified Minority Oversampling (Implicit Hate).
 """
 
 import random
@@ -224,18 +224,15 @@ class BackTranslationAugmenter:
             
         self._lazy_init()
         if not self._initialized:
-            # Graceful fallback to EDA (swap + deletion) if translation weights cannot be downloaded
             return random_swap(random_deletion(text, p=0.10), n_swaps=1)
             
         try:
             import torch
             with torch.no_grad():
-                # Forward (src -> pivot)
                 inputs = self.forward_tok(text, return_tensors="pt", truncation=True, max_length=128).to(self.device)
                 pivot_ids = self.forward_model.generate(**inputs, max_length=128)
                 pivot_text = self.forward_tok.decode(pivot_ids[0], skip_special_tokens=True)
                 
-                # Backward (pivot -> src)
                 inputs_back = self.backward_tok(pivot_text, return_tensors="pt", truncation=True, max_length=128).to(self.device)
                 back_ids = self.backward_model.generate(**inputs_back, max_length=128)
                 return self.backward_tok.decode(back_ids[0], skip_special_tokens=True)
@@ -244,48 +241,98 @@ class BackTranslationAugmenter:
 
 
 # =============================================================================
-# 3. COMPOSITE PIPELINE AUGMENTATION
+# 3. COMPOSITE PIPELINE AUGMENTATION (PER-LANGUAGE STRATIFIED)
 # =============================================================================
 
 def augment_multilingual_dataframe(
     df: pd.DataFrame,
-    lang: str = "en",
+    lang: Optional[str] = None,        # If None, automatically detects and augments per language ('lang' column)
     implicit_upsample_ratio: float = 0.50,
     p_eda: float = 0.50,               # Probability of applying EDA (Swap, Delete, Mask)
     p_slang: float = 0.30,             # Probability of applying Slang/Teencode noise
     p_noise: Optional[float] = None,   # Alias for p_slang / noise
-    use_back_translation: bool = False, # Set True if you have MarianMT installed / GPU memory
+    use_back_translation: bool = False,
     pivot_lang: str = "de",
     mask_token: str = "<mask_token>",
     random_state: int = 42,
     **kwargs
 ) -> pd.DataFrame:
     """
-    Full Multilingual Augmentation Pipeline for Task B:
-      - Upsamples minority Implicit Hate samples.
-      - Applies EDA (Random Swap, Random Deletion, Random Masking).
-      - Applies Social Media Slang & Contraction Perturbation.
-      - Optional Back-Translation (Source -> Pivot -> Source).
-      - Context Dropout on video metadata.
+    Stratified Multilingual Augmentation:
+      - When 'lang' column is present in df, it automatically groups by language (e.g. EN, IT, NL),
+        applying matching native slang dictionaries and language-specific perturbations.
+      - Upsamples minority Implicit Hate across every active language.
+      - Injects Context Dropout and EDA to prevent metadata memorization.
     """
     random.seed(random_state)
     np.random.seed(random_state)
     
-    # Handle p_noise alias if supplied
     effective_slang_p = p_noise if p_noise is not None else p_slang
+
+    # Check if we should automatically perform multi-language stratified augmentation
+    has_lang_col = "lang" in df.columns
     
+    if has_lang_col and (lang is None or lang == "auto" or lang == "all"):
+        unique_langs = df["lang"].dropna().unique()
+        print(f"[StratifiedMultilingualAugmentation] Auto-detected languages: {list(unique_langs)}")
+        augmented_subsets = []
+        for l in unique_langs:
+            df_sub = df[df["lang"] == l]
+            df_sub_aug = _augment_single_lang_df(
+                df_sub,
+                lang=str(l).lower(),
+                implicit_upsample_ratio=implicit_upsample_ratio,
+                p_eda=p_eda,
+                p_slang=effective_slang_p,
+                use_back_translation=use_back_translation,
+                pivot_lang=pivot_lang,
+                mask_token=mask_token,
+                random_state=random_state
+            )
+            augmented_subsets.append(df_sub_aug)
+            
+        df_combined = pd.concat(augmented_subsets, ignore_index=True)
+        df_combined = df_combined.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
+        print(f"[StratifiedMultilingualAugmentation Complete] Original: {len(df)} -> Total Augmented: {len(df_combined)}")
+        return df_combined
+
+    # Fallback to single/specified language
+    target_lang = lang if lang is not None else "en"
+    return _augment_single_lang_df(
+        df,
+        lang=target_lang,
+        implicit_upsample_ratio=implicit_upsample_ratio,
+        p_eda=p_eda,
+        p_slang=effective_slang_p,
+        use_back_translation=use_back_translation,
+        pivot_lang=pivot_lang,
+        mask_token=mask_token,
+        random_state=random_state
+    )
+
+
+def _augment_single_lang_df(
+    df: pd.DataFrame,
+    lang: str,
+    implicit_upsample_ratio: float,
+    p_eda: float,
+    p_slang: float,
+    use_back_translation: bool,
+    pivot_lang: str,
+    mask_token: str,
+    random_state: int
+) -> pd.DataFrame:
+    """Internal helper to augment a single language dataframe."""
     bt_augmenter = None
     if use_back_translation:
         bt_augmenter = BackTranslationAugmenter(src_lang=lang, pivot_lang=pivot_lang)
     
     augmented_rows = []
     
-    # Identify target column names
     comment_col = "yt_comment" if "yt_comment" in df.columns else ("comment" if "comment" in df.columns else "text")
     title_col = "yt_title" if "yt_title" in df.columns else "title"
     desc_col = "yt_description" if "yt_description" in df.columns else "description"
     
-    # Filter implicit samples (hs == 1 or 'yes_implicit')
     is_implicit = False
     if 'hate_speech' in df.columns:
         is_implicit = (df['hate_speech'] == 'yes_implicit') | (df['hate_speech'] == 1)
@@ -302,6 +349,9 @@ def augment_multilingual_dataframe(
         
         for _, row in sampled_implicit.iterrows():
             new_row = row.copy()
+            
+            # If row has its own language tag, respect it for slang mapping
+            row_lang = str(row.get('lang', lang)).lower().strip()
             comment = str(row.get(comment_col, ''))
             
             # 1. Back-Translation (if enabled)
@@ -318,9 +368,9 @@ def augment_multilingual_dataframe(
                 elif eda_choice == "mask":
                     comment = random_mask(comment, mask_token=mask_token, p=0.10)
             
-            # 3. Slang / Typographical variation
-            if random.random() < effective_slang_p:
-                comment = augment_slang_noise(comment, lang=lang, p=0.20)
+            # 3. Slang / Typographical variation using row's exact language
+            if random.random() < p_slang:
+                comment = augment_slang_noise(comment, lang=row_lang, p=0.20)
                 
             new_row[comment_col] = comment
             
@@ -338,8 +388,7 @@ def augment_multilingual_dataframe(
     if augmented_rows:
         df_aug = pd.DataFrame(augmented_rows)
         df_combined = pd.concat([df, df_aug], ignore_index=True)
-        df_combined = df_combined.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
-        print(f"[FullAugmentation ({lang.upper()})] Original: {len(df)} -> Augmented: {len(df_combined)} (+{len(df_aug)} augmented implicit)")
+        print(f"  [Augment {lang.upper()}] Original: {len(df)} -> Augmented: {len(df_combined)} (+{len(df_aug)} implicit)")
         return df_combined
         
     return df
