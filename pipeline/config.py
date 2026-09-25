@@ -41,6 +41,10 @@ class PipelineConfig:
     clip_grad_norm: float = 1.0
     patience: int = 7
     epochs: int = 30
+    loss_type: str = "focal"                    # 'focal' or 'cross_entropy'
+    focal_gamma: float = 2.0                    # Focusing parameter for FocalLoss
+    label_smoothing: float = 0.05               # Regularization for loss
+    class_weights: Optional[List[float]] = None # Balanced class weights [no, implicit, explicit]
     
     # 2-Phase Training settings for pretrained backbones
     two_phase: bool = True

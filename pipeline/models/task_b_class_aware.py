@@ -38,7 +38,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
         mmbert_model: nn.Module,
         d_model: int = 768,
         num_heads: int = 8,
-        dropout: float = 0.2,
+        dropout: float = 0.25,
         use_query_interaction: bool = True,   # Ablation hypothesis H2 toggle
         hidden_dim: Optional[int] = None,
     ):

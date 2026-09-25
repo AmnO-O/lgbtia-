@@ -13,6 +13,7 @@ from sklearn.metrics import accuracy_score, f1_score, classification_report
 
 from .config import PipelineConfig, IDX2HATE
 from .models.mmbert import unfreeze_last_n
+from .losses import FocalLoss
 
 class TaskBTrainer:
     """
@@ -63,14 +64,31 @@ class TaskBTrainer:
         if self.use_amp:
             print(f"[TaskBTrainer] PyTorch Automatic Mixed Precision (AMP - FP16 on {self.device}) Enabled.")
         
-        # Calculate balanced class weights if available to prevent majority class collapse
+        # Configure Loss Function: Focal Loss or CrossEntropyLoss with balanced weights & label smoothing
         class_weights = getattr(config, 'class_weights', None)
+        label_smoothing = getattr(config, 'label_smoothing', 0.05)
+        loss_type = getattr(config, 'loss_type', 'focal')
+        focal_gamma = getattr(config, 'focal_gamma', 2.0)
+        
+        weights_tensor = None
         if class_weights is not None:
             weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(self.device)
-            self.criterion = nn.CrossEntropyLoss(weight=weights_tensor)
-            print(f"[TaskBTrainer] Balanced Class Weights applied: {class_weights}")
+
+        if loss_type == "focal":
+            self.criterion = FocalLoss(
+                gamma=focal_gamma,
+                alpha=weights_tensor,
+                label_smoothing=label_smoothing,
+                reduction="mean"
+            )
+            print(f"[TaskBTrainer] Loss: Multi-Class Focal Loss (gamma={focal_gamma}, alpha={class_weights}, label_smoothing={label_smoothing})")
         else:
-            self.criterion = nn.CrossEntropyLoss()
+            if weights_tensor is not None:
+                self.criterion = nn.CrossEntropyLoss(weight=weights_tensor, label_smoothing=label_smoothing)
+                print(f"[TaskBTrainer] Loss: Weighted CrossEntropyLoss (weights={class_weights}, label_smoothing={label_smoothing})")
+            else:
+                self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+                print(f"[TaskBTrainer] Loss: Standard CrossEntropyLoss (label_smoothing={label_smoothing})")
             
         self.history = []
 

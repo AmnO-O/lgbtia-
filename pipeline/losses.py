@@ -1,59 +1,83 @@
-from typing import Tuple, Dict
 import torch
 import torch.nn as nn
-from .config import PipelineConfig
+import torch.nn.functional as F
+from typing import Optional, Union, List
 
-class MultiTaskLoss(nn.Module):
+
+class FocalLoss(nn.Module):
     """
-    Weighted combination of subtask losses for StereoQueerEval:
-      - Stereotype (Binary classification): BCEWithLogitsLoss
-      - Hate Speech (3-class classification): CrossEntropyLoss
-      - Target (10-dimensional multi-label bitmask): BCEWithLogitsLoss
+    Multi-class Focal Loss with optional class-weighting (alpha) and label smoothing.
     
-    Weights account for the larger magnitude of CrossEntropy vs BCE to ensure
-    balanced gradient descent across all three subtasks.
+    Formula:
+        FL(p_t) = - alpha_t * (1 - p_t)^gamma * log(p_t)
+        
+    Args:
+        gamma (float): Focusing parameter (gamma >= 0). 
+                       When gamma = 0, Focal Loss is equivalent to CrossEntropyLoss.
+                       Higher gamma puts more emphasis on hard/misclassified examples.
+        alpha (Tensor or List[float], optional): Class balancing weights. 
+                       Shape [C] matching the number of classes.
+        label_smoothing (float): Label smoothing epsilon (0.0 to 1.0).
+        reduction (str): 'mean', 'sum', or 'none'.
     """
-    def __init__(self, config: PipelineConfig):
-        super(MultiTaskLoss, self).__init__()
-        self.target_task = config.target_task
-        self.st_weight = config.loss_st_weight
-        self.hs_weight = config.loss_hs_weight
-        self.tg_weight = config.loss_tg_weight
-
-        self.loss_st_fn = nn.BCEWithLogitsLoss()
-        self.loss_hs_fn = nn.CrossEntropyLoss()
-        self.loss_tg_fn = nn.BCEWithLogitsLoss()
-
-    def forward(
+    def __init__(
         self,
-        st_logits: torch.Tensor,
-        hs_logits: torch.Tensor,
-        tg_logits: torch.Tensor,
-        st_true: torch.Tensor,
-        hs_true: torch.Tensor,
-        tg_true: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        loss_st = self.loss_st_fn(st_logits.squeeze(-1), st_true)
-        loss_hs = self.loss_hs_fn(hs_logits, hs_true)
-        loss_tg = self.loss_tg_fn(tg_logits, tg_true)
-
-        if self.target_task == 'st':
-            total_loss = loss_st
-        elif self.target_task == 'hs':
-            total_loss = loss_hs
-        elif self.target_task == 'tg':
-            total_loss = loss_tg
+        gamma: float = 2.0,
+        alpha: Optional[Union[torch.Tensor, List[float]]] = None,
+        label_smoothing: float = 0.0,
+        reduction: str = "mean"
+    ):
+        super().__init__()
+        self.gamma = float(gamma)
+        self.label_smoothing = float(label_smoothing)
+        self.reduction = reduction
+        
+        if alpha is not None:
+            if not isinstance(alpha, torch.Tensor):
+                alpha = torch.tensor(alpha, dtype=torch.float32)
+            self.register_buffer("alpha", alpha)
         else:
-            total_loss = (
-                self.st_weight * loss_st +
-                self.hs_weight * loss_hs +
-                self.tg_weight * loss_tg
-            )
+            self.alpha = None
 
-        breakdown = {
-            "loss_total": total_loss.item(),
-            "loss_st": loss_st.item(),
-            "loss_hs": loss_hs.item(),
-            "loss_tg": loss_tg.item()
-        }
-        return total_loss, breakdown
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            inputs: Logits tensor of shape [B, C]
+            targets: Ground truth class indices of shape [B]
+        Returns:
+            Scalar loss (if reduction='mean' or 'sum') or per-sample loss [B] (if reduction='none')
+        """
+        B, C = inputs.shape
+        log_p = F.log_softmax(inputs, dim=-1) # [B, C]
+        p = torch.exp(log_p)                  # [B, C]
+
+        # Gather target probabilities and log probabilities: [B]
+        target_p = p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)       # [B]
+        target_log_p = log_p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1) # [B]
+
+        # Focal modulating factor: (1 - p_t)^gamma
+        focal_weight = torch.pow(1.0 - target_p, self.gamma) # [B]
+
+        # Standard hard-target CE loss per sample: - log(p_t)
+        ce_loss = - target_log_p # [B]
+
+        # Apply label smoothing if requested
+        if self.label_smoothing > 0.0:
+            # smoothed CE = (1 - eps) * CE(target) + eps * (- mean(log_p))
+            smooth_loss = - log_p.mean(dim=-1) # [B]
+            ce_loss = (1.0 - self.label_smoothing) * ce_loss + self.label_smoothing * smooth_loss
+
+        # Apply focal modulation
+        focal_loss = focal_weight * ce_loss # [B]
+
+        # Apply alpha class weights if provided
+        if self.alpha is not None:
+            alpha_t = self.alpha[targets] # [B]
+            focal_loss = alpha_t * focal_loss
+
+        # Reduction
+        if self.reduction == "mean":
+            return focal_loss.mean()
+        elif self.reduction == "sum":
+            return focal_loss.sum()
+        return focal_loss
