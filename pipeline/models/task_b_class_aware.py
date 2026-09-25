@@ -90,14 +90,16 @@ class TaskBClassAwareAttentionModel(nn.Module):
             self.dropout_self = nn.Dropout(dropout)
 
         # ---------------------------------------------------------------------
-        # LAYER 3: Shared Scoring Head f_θ
-        # Shared MLP mapping each z'_c [B, d_model] to scalar score s_c
+        # LAYER 3: Joint Cross-Class Classification Head
+        # Projects concatenated query representations [B, 3 * d_model] -> [B, NUM_CLASSES]
+        # Enables joint comparative reasoning across (NonHate vs. Implicit vs. Explicit)
         # ---------------------------------------------------------------------
-        self.shared_scoring_head = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
-            nn.ReLU(),
+        self.classifier = nn.Sequential(
+            nn.Linear(NUM_CLASSES * d_model, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, NUM_CLASSES)
         )
 
     def forward(
@@ -167,11 +169,11 @@ class TaskBClassAwareAttentionModel(nn.Module):
             z_prime = z  # [B, 3, d_model]
 
         # ---------------------------------------------------------------------
-        # LAYER 3: Shared Scoring Head f_θ & Classification
+        # LAYER 3: Joint Cross-Class Classification Head
+        # Concatenate 3 class representations: [B, 3, d_model] -> [B, 3 * d_model]
         # ---------------------------------------------------------------------
-        # Apply shared MLP across each of the 3 class vectors
-        # z_prime is [B, 3, d_model] -> shared_scoring_head maps to [B, 3, 1] -> squeeze to [B, 3]
-        s = self.shared_scoring_head(z_prime).squeeze(-1)  # [B, 3] (raw logits)
+        z_flat = z_prime.reshape(B, NUM_CLASSES * self.d_model)  # [B, 3 * d_model]
+        s = self.classifier(z_flat)                              # [B, 3] (raw logits)
 
         # ---------------------------------------------------------------------
         # TASK C BRIDGE: Hate-Type-Aware Representation h_B
