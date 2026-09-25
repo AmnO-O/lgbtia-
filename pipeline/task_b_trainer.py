@@ -49,6 +49,12 @@ class TaskBTrainer:
 
         self.model.to(self.device)
         
+        # Mixed Precision (AMP) support for GPU speedup (2-3x faster forward/backward)
+        self.use_amp = (self.device.type == "cuda")
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        if self.use_amp:
+            print("[TaskBTrainer] PyTorch Automatic Mixed Precision (AMP - FP16) Enabled.")
+        
         # Calculate balanced class weights if available to prevent majority class collapse
         class_weights = getattr(config, 'class_weights', None)
         if class_weights is not None:
@@ -85,24 +91,33 @@ class TaskBTrainer:
 
         for batch in self.train_loader:
             input_ids, attention_mask, role_ids, _, hs_labels, _ = batch
-            input_ids = input_ids.to(self.device)
-            attention_mask = attention_mask.to(self.device)
-            role_ids = role_ids.to(self.device)
-            hs_labels = hs_labels.to(self.device)
+            input_ids = input_ids.to(self.device, non_blocking=True)
+            attention_mask = attention_mask.to(self.device, non_blocking=True)
+            role_ids = role_ids.to(self.device, non_blocking=True)
+            hs_labels = hs_labels.to(self.device, non_blocking=True)
 
             optimizer.zero_grad()
-            logits, _, _ = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                role_ids=role_ids
-            )
-            loss = self.criterion(logits, hs_labels)
-            loss.backward()
+            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                logits, _, _ = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    role_ids=role_ids
+                )
+                loss = self.criterion(logits, hs_labels)
 
-            if self.config.clip_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.clip_grad_norm)
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+                if self.config.clip_grad_norm > 0:
+                    self.scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.clip_grad_norm)
+                self.scaler.step(optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                if self.config.clip_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.clip_grad_norm)
+                optimizer.step()
 
-            optimizer.step()
             total_loss += loss.item()
 
         return total_loss / len(self.train_loader)
@@ -117,20 +132,21 @@ class TaskBTrainer:
 
         for batch in self.val_loader:
             input_ids, attention_mask, role_ids, _, hs_labels, _ = batch
-            input_ids = input_ids.to(self.device)
-            attention_mask = attention_mask.to(self.device)
-            role_ids = role_ids.to(self.device)
-            hs_labels = hs_labels.to(self.device)
+            input_ids = input_ids.to(self.device, non_blocking=True)
+            attention_mask = attention_mask.to(self.device, non_blocking=True)
+            role_ids = role_ids.to(self.device, non_blocking=True)
+            hs_labels = hs_labels.to(self.device, non_blocking=True)
 
-            logits, _, _ = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                role_ids=role_ids
-            )
-            loss = self.criterion(logits, hs_labels)
+            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                logits, _, _ = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    role_ids=role_ids
+                )
+                loss = self.criterion(logits, hs_labels)
             total_loss += loss.item()
 
-            probs = F.softmax(logits, dim=-1).cpu().numpy()
+            probs = F.softmax(logits.float(), dim=-1).cpu().numpy()
             preds = np.argmax(probs, axis=1)
 
             all_probs.append(probs)
@@ -159,6 +175,7 @@ class TaskBTrainer:
     def run_training_loop(self, tag: str, num_epochs: int, lr: float,
                           backbone_lr: Optional[float] = None) -> str:
         optimizer = self.build_optimizer(lr=lr, backbone_lr=backbone_lr)
+        best_metric = -1.0
         best_val_loss = float('inf')
         counter = 0
         best_checkpoint_path = os.path.join(self.config.output_dir, f"{tag}.pt")
@@ -186,11 +203,16 @@ class TaskBTrainer:
                 f"Macro F1: {metrics['hs_macro_f1']:.4f} (No: {metrics['hs_f1_no']:.3f}, Imp: {metrics['hs_f1_implicit']:.3f}, Exp: {metrics['hs_f1_explicit']:.3f}) | {elapsed:.1f}s"
             )
 
-            if val_loss < best_val_loss:
+            # Checkpoint based on highest Macro-F1 (or lower val_loss if F1 tied)
+            current_f1 = metrics['hs_macro_f1']
+            is_better = (current_f1 > best_metric + 1e-4) or (abs(current_f1 - best_metric) <= 1e-4 and val_loss < best_val_loss)
+            
+            if is_better:
+                best_metric = current_f1
                 best_val_loss = val_loss
                 counter = 0
                 torch.save(self.model.state_dict(), best_checkpoint_path)
-                print(f"  --> Saved Best Checkpoint: {best_checkpoint_path}")
+                print(f"  --> Saved Best Checkpoint (Macro-F1: {current_f1:.4f}): {best_checkpoint_path}")
             else:
                 counter += 1
                 if counter >= self.config.patience:
