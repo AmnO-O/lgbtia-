@@ -8,6 +8,7 @@ ID_ORDER = ['l', 'g', 'b', 't', 'q', 'i', 'a', 'nb', 'lgbtqia+']
 SCOPE_DIM = len(ID_ORDER)   # index 9 represents group (1.0) vs individual (0.0)
 TARGET_DIM = SCOPE_DIM + 1  # 9 identities + 1 scope = 10 bits
 
+HATE_CLASSES = ['no', 'yes_implicit', 'yes_explicit']
 HATE2IDX = {'no': 0, 'yes_implicit': 1, 'yes_explicit': 2}
 IDX2HATE = {v: k for k, v in HATE2IDX.items()}
 
