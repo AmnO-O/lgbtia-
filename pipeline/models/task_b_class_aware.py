@@ -30,17 +30,16 @@ class TaskBClassAwareAttentionModel(nn.Module):
     """
     Enhanced Multi-Query Class-Aware Cross-Attention (MHCA) Architecture for Task B.
     
-    Key Innovations:
-      1. Arbitrary K Semantic Probes / Sub-Questions:
-         - Probes multiple fine-grained aspects per class (e.g. Sarcasm, Dogwhistles, Direct Slurs, Support).
-         - Supports textual initialization from pre-trained tokenizer / BERT embeddings or learned embeddings.
-      2. Flexible Query Pooling:
-         - Groups K query responses back into the 3 target classes [No Hate, Implicit, Explicit].
-         - Supports 'attention' pooling (learnable soft-max attention over aspect responses) or 'mean' pooling.
-      3. Inter-Query Interaction Layer (MHSA):
-         - Enables fine-grained aspect queries to exchange context before joint scoring.
-      4. Task C Bridge:
-         - Forms a unified Hate-Type-Aware Representation h_B ∈ [B, d_model] to guide stereotype classification.
+    Optimizations Applied:
+      1. PyTorch SDPA / FlashAttention Enablement:
+         `need_weights=return_attention_map` during training allows PyTorch to use
+         FlashAttention / SDPA kernels without materializing VRAM-heavy [B, K, S] maps.
+      2. Native AMP / Dtype Preservation:
+         Preserves backbone activation dtype dynamically to avoid CPU/GPU float mismatch.
+      3. Training State Conservation in init_queries_from_text:
+         Restores `training` mode so mmBERT dropout is not inadvertently disabled.
+      4. Safe Task C Gradient Isolation:
+         Supports `detach_bridge=True` in forward pass so Task C training doesn't pollute Task B heads.
     """
     def __init__(
         self,
@@ -68,7 +67,6 @@ class TaskBClassAwareAttentionModel(nn.Module):
         if probes is not None:
             self.probes = list(probes)
         elif num_queries_per_class is not None:
-            # Fallback: create dynamic synthetic slots if user specified a count
             self.probes = []
             for c_idx in range(NUM_CLASSES):
                 for q_i in range(num_queries_per_class):
@@ -80,18 +78,15 @@ class TaskBClassAwareAttentionModel(nn.Module):
                         question_en=""
                     ))
         else:
-            # Default to rich Vietnamese domain probes from task_b_questions.py
             self.probes = get_default_probes()
 
         self.num_queries = len(self.probes)
         
-        # Build index mapping for each class (e.g. Class 1 -> [indices of implicit probes])
         self.class_to_query_indices: Dict[int, List[int]] = {0: [], 1: [], 2: []}
         for idx, probe in enumerate(self.probes):
             if probe.class_idx in self.class_to_query_indices:
                 self.class_to_query_indices[probe.class_idx].append(idx)
 
-        # Ensure every class has at least 1 query index
         for c in range(NUM_CLASSES):
             if len(self.class_to_query_indices[c]) == 0:
                 raise ValueError(f"Task B Class {c} has no query probes assigned! Ensure at least 1 probe per class.")
@@ -107,7 +102,6 @@ class TaskBClassAwareAttentionModel(nn.Module):
         # ---------------------------------------------------------------------
         # LAYER 1: Multi-Query Cross-Attention (MHCA)
         # ---------------------------------------------------------------------
-        # [num_queries, d_model] learned probe queries
         self.query_embeddings = nn.Parameter(torch.empty(self.num_queries, d_model))
         nn.init.normal_(self.query_embeddings, mean=0.0, std=0.02)
 
@@ -147,7 +141,6 @@ class TaskBClassAwareAttentionModel(nn.Module):
 
         # ---------------------------------------------------------------------
         # LAYER 3: Joint Comparative Classification Head
-        # Projects pooled class representations [B, 3 * d_model] -> [B, 3]
         # ---------------------------------------------------------------------
         self.classifier = nn.Sequential(
             nn.Linear(NUM_CLASSES * d_model, hidden_dim),
@@ -159,25 +152,30 @@ class TaskBClassAwareAttentionModel(nn.Module):
 
     def init_queries_from_text(self, tokenizer: Any, device: Optional[torch.device] = None):
         """
-        Optional feature: Semantically initialize query_embeddings by encoding
+        Semantically initialize query_embeddings by encoding
         the natural language question strings using mmBERT's own embedding layer.
+        Safely restores model training mode upon completion.
         """
+        was_training = self.training
+        self.eval()
         dev = device or self.query_embeddings.device
-        with torch.no_grad():
-            for i, probe in enumerate(self.probes):
-                text = probe.question_vi if probe.question_vi.strip() else probe.question_en
-                if not text.strip():
-                    continue
-                tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=64)
-                tokens = {k: v.to(dev) for k, v in tokens.items()}
-                
-                # Extract representation from mmBERT backbone
-                outputs = self.mmbert(**tokens)
-                # Mean pool over valid token representations
-                mask = tokens["attention_mask"].unsqueeze(-1)
-                emb = (outputs.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-                self.query_embeddings.data[i].copy_(emb.squeeze(0))
-        print(f"[TaskBClassAwareAttentionModel] Initialized {self.num_queries} queries using mmBERT semantic embeddings.")
+        
+        try:
+            with torch.no_grad():
+                for i, probe in enumerate(self.probes):
+                    text = probe.question_vi if probe.question_vi.strip() else probe.question_en
+                    if not text.strip():
+                        continue
+                    tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=64)
+                    tokens = {k: v.to(dev) for k, v in tokens.items()}
+                    
+                    outputs = self.mmbert(**tokens)
+                    mask = tokens["attention_mask"].unsqueeze(-1)
+                    emb = (outputs.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+                    self.query_embeddings.data[i].copy_(emb.squeeze(0).to(self.query_embeddings.dtype))
+            print(f"[TaskBClassAwareAttentionModel] Initialized {self.num_queries} queries using mmBERT semantic embeddings.")
+        finally:
+            self.train(was_training)
 
     def pool_class_queries(self, z_queries: torch.Tensor) -> torch.Tensor:
         """
@@ -188,13 +186,11 @@ class TaskBClassAwareAttentionModel(nn.Module):
 
         for c in range(NUM_CLASSES):
             indices = self.class_to_query_indices[c]
-            # Sub-tensor for this class: [B, num_sub_queries, d_model]
             sub_z = z_queries[:, indices, :]
 
             if len(indices) == 1:
                 class_representations.append(sub_z.squeeze(1))
             elif self.pooling_mode == "attention":
-                # Compute soft attention weights over the sub-queries for this class
                 scores = self.query_att_scorers[c](sub_z)       # [B, num_sub_queries, 1]
                 weights = F.softmax(scores, dim=1)              # [B, num_sub_queries, 1]
                 pooled_c = (weights * sub_z).sum(dim=1)         # [B, d_model]
@@ -206,7 +202,6 @@ class TaskBClassAwareAttentionModel(nn.Module):
                 pooled_c = torch.mean(sub_z, dim=1)             # [B, d_model]
                 class_representations.append(pooled_c)
 
-        # Stack into [B, 3, d_model]
         return torch.stack(class_representations, dim=1)
 
     def forward(
@@ -214,14 +209,16 @@ class TaskBClassAwareAttentionModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         role_ids: torch.Tensor,
-        return_attention_map: bool = False
+        return_attention_map: bool = False,
+        detach_bridge: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
             input_ids: [B, S]
             attention_mask: [B, S]
             role_ids: [B, S]
-            return_attention_map: Whether to return the attention map [B, K, S]
+            return_attention_map: Whether to compute & return the attention map [B, K, S]
+            detach_bridge: Whether to detach h_B gradient to prevent Task C backward interference
         Returns:
             logits: [B, 3] (Classification scores for [no, yes_implicit, yes_explicit])
             h_B: [B, d_model] (Hate-Type-Aware Representation for Task C bridge)
@@ -235,26 +232,44 @@ class TaskBClassAwareAttentionModel(nn.Module):
         backbone_trainable = any(p.requires_grad for p in self.mmbert.parameters())
         with torch.set_grad_enabled(backbone_trainable):
             h_mmbert = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        h_mmbert = h_mmbert.to(torch.float32)
 
         e_role = self.role_embeddings(role_ids)
+        # Ensure role embedding matches backbone dtype under AMP without forced float32 downcast
+        if e_role.dtype != h_mmbert.dtype:
+            e_role = e_role.to(h_mmbert.dtype)
+            
         h_final = self.layer_norm_input(h_mmbert + e_role)
         h_final = self.dropout_input(h_final) # [B, S, d_model]
 
         # ---------------------------------------------------------------------
-        # LAYER 1: Multi-Query Cross-Attention (MHCA)
+        # LAYER 1: Multi-Query Cross-Attention (MHCA) with FlashAttention Optimization
         # ---------------------------------------------------------------------
         q = self.query_embeddings.unsqueeze(0).expand(B, -1, -1) # [B, K, d_model]
+        if q.dtype != h_final.dtype:
+            q = q.to(h_final.dtype)
+            
         key_padding_mask = (attention_mask == 0)
 
-        z_attn, attn_weights = self.cross_attention(
-            query=q,
-            key=h_final,
-            value=h_final,
-            key_padding_mask=key_padding_mask,
-            need_weights=True,
-            average_attn_weights=True # [B, K, S]
-        )
+        # Optimization: Only compute attention weights if explicitly requested (Fast SDPA path)
+        if return_attention_map:
+            z_attn, attn_weights = self.cross_attention(
+                query=q,
+                key=h_final,
+                value=h_final,
+                key_padding_mask=key_padding_mask,
+                need_weights=True,
+                average_attn_weights=True # [B, K, S]
+            )
+        else:
+            z_attn, _ = self.cross_attention(
+                query=q,
+                key=h_final,
+                value=h_final,
+                key_padding_mask=key_padding_mask,
+                need_weights=False
+            )
+            attn_weights = None
+
         z = self.layer_norm_cross(q + self.dropout_cross(z_attn)) # [B, K, d_model]
 
         # ---------------------------------------------------------------------
@@ -288,4 +303,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
         probs = F.softmax(s, dim=-1).unsqueeze(-1) # [B, 3, 1]
         h_B = (probs * z_classes).sum(dim=1)       # [B, d_model]
 
-        return s, h_B, (attn_weights if return_attention_map else None)
+        if detach_bridge:
+            h_B = h_B.detach()
+
+        return s, h_B, attn_weights
