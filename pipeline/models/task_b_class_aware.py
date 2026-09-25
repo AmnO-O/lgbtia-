@@ -26,32 +26,54 @@ ROLE_COMMENT = 3
 NUM_ROLES = 4
 
 
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Normalization (RMSNorm) - Zhang & Sennrich (2019).
+    Scales inputs by the root mean square of activation values, providing superior
+    gradient stabilization, faster CUDA execution, and strict invariance to activation scaling.
+    """
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super(RMSNorm, self).__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # RMSNorm(x) = (x / sqrt(mean(x^2) + eps)) * weight
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x_normed = x * torch.rsqrt(variance + self.eps)
+        return self.weight * x_normed
+
+
 class TaskBClassAwareAttentionModel(nn.Module):
     """
     Enhanced Multi-Query Class-Aware Cross-Attention (MHCA) Architecture for Task B.
     
-    Optimizations Applied:
-      1. PyTorch SDPA / FlashAttention Enablement:
-         `need_weights=return_attention_map` during training allows PyTorch to use
-         FlashAttention / SDPA kernels without materializing VRAM-heavy [B, K, S] maps.
-      2. Native AMP / Dtype Preservation:
-         Preserves backbone activation dtype dynamically to avoid CPU/GPU float mismatch.
-      3. Training State Conservation in init_queries_from_text:
-         Restores `training` mode so mmBERT dropout is not inadvertently disabled.
-      4. Safe Task C Gradient Isolation:
-         Supports `detach_bridge=True` in forward pass so Task C training doesn't pollute Task B heads.
+    Architectural Highlights:
+      1. Pre-LN / Pre-RMSNorm Residual Connections:
+         Normalizes inputs *before* Attention and Interaction sub-layers (x + Sublayer(Norm(x))).
+         This provides an unobstructed residual highway, preventing gradient vanishing or exploding
+         during backbone fine-tuning.
+      2. RMSNorm vs LayerNorm:
+         Uses RMSNorm by default for tighter gradient variance bounds and faster GPU computation.
+      3. PyTorch SDPA / FlashAttention Enablement:
+         `need_weights=return_attention_map` allows PyTorch to execute fast FlashAttention kernels.
+      4. Dynamic Multi-Query Probing with Aspect Pooling:
+         Probes fine-grained semantic angles (sarcasm, dogwhistle, slurs, support) and aggregates
+         them into the 3 target classes using learnable attention pooling.
+      5. Task C Gradient Isolation (`detach_bridge=True`).
     """
     def __init__(
         self,
         mmbert_model: nn.Module,
         d_model: int = 768,
         num_heads: int = 8,
-        dropout: float = 0.25,
+        dropout: float = 0.20,
         use_query_interaction: bool = True,
         hidden_dim: Optional[int] = None,
         probes: Optional[List[QueryProbe]] = None,
         num_queries_per_class: Optional[int] = None,
         pooling_mode: str = "attention", # 'attention', 'mean', or 'max'
+        use_rmsnorm: bool = True,        # Toggle RMSNorm vs standard LayerNorm
     ):
         super(TaskBClassAwareAttentionModel, self).__init__()
         self.mmbert = mmbert_model
@@ -59,7 +81,10 @@ class TaskBClassAwareAttentionModel(nn.Module):
         self.num_heads = num_heads
         self.use_query_interaction = use_query_interaction
         self.pooling_mode = pooling_mode
+        self.use_rmsnorm = use_rmsnorm
         hidden_dim = hidden_dim or d_model // 2
+
+        NormClass = RMSNorm if use_rmsnorm else nn.LayerNorm
 
         # ---------------------------------------------------------------------
         # 1. Setup Query Probes & Mapping
@@ -96,14 +121,18 @@ class TaskBClassAwareAttentionModel(nn.Module):
         # ---------------------------------------------------------------------
         self.role_embeddings = nn.Embedding(NUM_ROLES, d_model)
         nn.init.normal_(self.role_embeddings.weight, mean=0.0, std=0.02)
-        self.layer_norm_input = nn.LayerNorm(d_model)
+        self.norm_input = NormClass(d_model)
         self.dropout_input = nn.Dropout(dropout)
 
         # ---------------------------------------------------------------------
-        # LAYER 1: Multi-Query Cross-Attention (MHCA)
+        # LAYER 1: Multi-Query Cross-Attention (Pre-Norm MHCA)
         # ---------------------------------------------------------------------
         self.query_embeddings = nn.Parameter(torch.empty(self.num_queries, d_model))
         nn.init.normal_(self.query_embeddings, mean=0.0, std=0.02)
+
+        # Pre-Norm for Queries & Context
+        self.norm_q_cross = NormClass(d_model)
+        self.norm_kv_cross = NormClass(d_model)
 
         self.cross_attention = nn.MultiheadAttention(
             embed_dim=d_model,
@@ -111,20 +140,19 @@ class TaskBClassAwareAttentionModel(nn.Module):
             dropout=dropout,
             batch_first=True
         )
-        self.layer_norm_cross = nn.LayerNorm(d_model)
         self.dropout_cross = nn.Dropout(dropout)
 
         # ---------------------------------------------------------------------
-        # LAYER 2: Inter-Query Interaction Layer (MHSA)
+        # LAYER 2: Inter-Query Interaction Layer (Pre-Norm MHSA)
         # ---------------------------------------------------------------------
         if self.use_query_interaction:
+            self.norm_self = NormClass(d_model)
             self.self_attention = nn.MultiheadAttention(
                 embed_dim=d_model,
                 num_heads=num_heads,
                 dropout=dropout,
                 batch_first=True
             )
-            self.layer_norm_self = nn.LayerNorm(d_model)
             self.dropout_self = nn.Dropout(dropout)
 
         # ---------------------------------------------------------------------
@@ -142,9 +170,11 @@ class TaskBClassAwareAttentionModel(nn.Module):
         # ---------------------------------------------------------------------
         # LAYER 3: Joint Comparative Classification Head
         # ---------------------------------------------------------------------
+        self.norm_head_in = NormClass(NUM_CLASSES * d_model)
         self.classifier = nn.Sequential(
+            self.norm_head_in,
             nn.Linear(NUM_CLASSES * d_model, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            NormClass(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, NUM_CLASSES)
@@ -234,55 +264,61 @@ class TaskBClassAwareAttentionModel(nn.Module):
             h_mmbert = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
 
         e_role = self.role_embeddings(role_ids)
-        # Ensure role embedding matches backbone dtype under AMP without forced float32 downcast
         if e_role.dtype != h_mmbert.dtype:
             e_role = e_role.to(h_mmbert.dtype)
             
-        h_final = self.layer_norm_input(h_mmbert + e_role)
+        h_final = self.norm_input(h_mmbert + e_role)
         h_final = self.dropout_input(h_final) # [B, S, d_model]
 
         # ---------------------------------------------------------------------
-        # LAYER 1: Multi-Query Cross-Attention (MHCA) with FlashAttention Optimization
+        # LAYER 1: Multi-Query Cross-Attention (Pre-Norm Architecture)
+        # Residual Highway: z = q + CrossAttn(Norm(q), Norm(h_final), Norm(h_final))
         # ---------------------------------------------------------------------
-        q = self.query_embeddings.unsqueeze(0).expand(B, -1, -1) # [B, K, d_model]
-        if q.dtype != h_final.dtype:
-            q = q.to(h_final.dtype)
+        q_raw = self.query_embeddings.unsqueeze(0).expand(B, -1, -1) # [B, K, d_model]
+        if q_raw.dtype != h_final.dtype:
+            q_raw = q_raw.to(h_final.dtype)
             
         key_padding_mask = (attention_mask == 0)
 
-        # Optimization: Only compute attention weights if explicitly requested (Fast SDPA path)
+        # Pre-normalization on query and context inputs
+        q_normed = self.norm_q_cross(q_raw)
+        kv_normed = self.norm_kv_cross(h_final)
+
         if return_attention_map:
             z_attn, attn_weights = self.cross_attention(
-                query=q,
-                key=h_final,
-                value=h_final,
+                query=q_normed,
+                key=kv_normed,
+                value=kv_normed,
                 key_padding_mask=key_padding_mask,
                 need_weights=True,
                 average_attn_weights=True # [B, K, S]
             )
         else:
             z_attn, _ = self.cross_attention(
-                query=q,
-                key=h_final,
-                value=h_final,
+                query=q_normed,
+                key=kv_normed,
+                value=kv_normed,
                 key_padding_mask=key_padding_mask,
                 need_weights=False
             )
             attn_weights = None
 
-        z = self.layer_norm_cross(q + self.dropout_cross(z_attn)) # [B, K, d_model]
+        # Clean Pre-LN residual addition
+        z = q_raw + self.dropout_cross(z_attn) # [B, K, d_model]
 
         # ---------------------------------------------------------------------
-        # LAYER 2: Inter-Query Interaction Layer (MHSA)
+        # LAYER 2: Inter-Query Interaction Layer (Pre-Norm MHSA)
+        # Residual Highway: z' = z + SelfAttn(Norm(z))
         # ---------------------------------------------------------------------
         if self.use_query_interaction:
+            z_normed = self.norm_self(z)
             z_self, _ = self.self_attention(
-                query=z,
-                key=z,
-                value=z,
+                query=z_normed,
+                key=z_normed,
+                value=z_normed,
                 need_weights=False
             )
-            z_prime = self.layer_norm_self(z + self.dropout_self(z_self)) # [B, K, d_model]
+            z_prime = z + self.dropout_self(z_self) # [B, K, d_model]
         else:
             z_prime = z # [B, K, d_model]
 
@@ -292,7 +328,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
         z_classes = self.pool_class_queries(z_prime) # [B, 3, d_model]
 
         # ---------------------------------------------------------------------
-        # LAYER 3: Joint Cross-Class Classification Head
+        # LAYER 3: Joint Comparative Classification Head
         # ---------------------------------------------------------------------
         z_flat = z_classes.reshape(B, NUM_CLASSES * self.d_model) # [B, 3 * d_model]
         s = self.classifier(z_flat)                              # [B, 3]

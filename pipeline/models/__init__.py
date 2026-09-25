@@ -14,6 +14,7 @@ from .task_b_questions import (
     NUM_CLASSES,
 )
 from .task_b_class_aware import (
+    RMSNorm,
     TaskBClassAwareAttentionModel,
     ROLE_PAD,
     ROLE_TITLE,
@@ -42,6 +43,7 @@ __all__ = [
     "CLASS_IMPLICIT_HATE",
     "CLASS_EXPLICIT_HATE",
     "NUM_CLASSES",
+    "RMSNorm",
     "TaskBClassAwareAttentionModel",
     "ROLE_PAD",
     "ROLE_TITLE",

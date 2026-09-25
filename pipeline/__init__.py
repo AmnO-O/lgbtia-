@@ -8,7 +8,7 @@ from .config import PipelineConfig, HATE_CLASSES, HATE2IDX, IDX2HATE
 from .data import StereoQueerDataset, MMBertSeqDataset, DataPipeline, safe_clean, encode_target, decode_target
 from .task_b_data import TaskBRoleDataset
 from .models.task_b_questions import QueryProbe, DEFAULT_TASK_B_PROBES, get_default_probes
-from .models.task_b_class_aware import TaskBClassAwareAttentionModel
+from .models.task_b_class_aware import TaskBClassAwareAttentionModel, RMSNorm
 from .losses import MultiTaskLoss, FocalLoss
 from .metrics import evaluate_stereoqueer, print_metrics
 from .trainer import StereoQueerTrainer
@@ -26,6 +26,7 @@ __all__ = [
     "QueryProbe",
     "DEFAULT_TASK_B_PROBES",
     "get_default_probes",
+    "RMSNorm",
     "TaskBClassAwareAttentionModel",
     "DataPipeline",
     "safe_clean",
