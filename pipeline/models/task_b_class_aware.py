@@ -1,7 +1,18 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List, Union
+
+from .task_b_questions import (
+    QueryProbe,
+    DEFAULT_TASK_B_PROBES,
+    get_default_probes,
+    get_queries_per_class,
+    CLASS_NO_HATE,
+    CLASS_IMPLICIT_HATE,
+    CLASS_EXPLICIT_HATE,
+    NUM_CLASSES,
+)
 
 # Role IDs for explicit role injection
 # 0: Pad / Special tokens
@@ -14,24 +25,22 @@ ROLE_DESC = 2
 ROLE_COMMENT = 3
 NUM_ROLES = 4
 
-# Class index ordering for Task B queries:
-# 0: non_hate ('no')
-# 1: implicit ('yes_implicit')
-# 2: explicit ('yes_explicit')
-CLASS_NON_HATE = 0
-CLASS_IMPLICIT = 1
-CLASS_EXPLICIT = 2
-NUM_CLASSES = 3
 
 class TaskBClassAwareAttentionModel(nn.Module):
     """
-    Task B (Hate Speech) Class-Aware Attention Architecture with:
-      - Layer 0: mmBERT backbone + Explicit Role Embeddings (Title vs Description vs Comment)
-      - Layer 1: Class-Aware Multi-Head Cross-Attention (MHCA) with 3 learned label queries
-                 [q_NonHate, q_Implicit, q_Explicit] ∈ [3, d_model]
-      - Layer 2: Query Interaction Layer (MHSA) between label queries for boundary calibration
-      - Layer 3: Shared Scoring Head f_θ (MLP) -> logits s ∈ [B, 3]
-      - Task C Bridge: Hate-Type-Aware Representation h_B = ∑_c (p_c · z'_c) ∈ [B, d_model]
+    Enhanced Multi-Query Class-Aware Cross-Attention (MHCA) Architecture for Task B.
+    
+    Key Innovations:
+      1. Arbitrary K Semantic Probes / Sub-Questions:
+         - Probes multiple fine-grained aspects per class (e.g. Sarcasm, Dogwhistles, Direct Slurs, Support).
+         - Supports textual initialization from pre-trained tokenizer / BERT embeddings or learned embeddings.
+      2. Flexible Query Pooling:
+         - Groups K query responses back into the 3 target classes [No Hate, Implicit, Explicit].
+         - Supports 'attention' pooling (learnable soft-max attention over aspect responses) or 'mean' pooling.
+      3. Inter-Query Interaction Layer (MHSA):
+         - Enables fine-grained aspect queries to exchange context before joint scoring.
+      4. Task C Bridge:
+         - Forms a unified Hate-Type-Aware Representation h_B ∈ [B, d_model] to guide stereotype classification.
     """
     def __init__(
         self,
@@ -39,33 +48,69 @@ class TaskBClassAwareAttentionModel(nn.Module):
         d_model: int = 768,
         num_heads: int = 8,
         dropout: float = 0.25,
-        use_query_interaction: bool = True,   # Ablation hypothesis H2 toggle
+        use_query_interaction: bool = True,
         hidden_dim: Optional[int] = None,
+        probes: Optional[List[QueryProbe]] = None,
+        num_queries_per_class: Optional[int] = None,
+        pooling_mode: str = "attention", # 'attention', 'mean', or 'max'
     ):
         super(TaskBClassAwareAttentionModel, self).__init__()
         self.mmbert = mmbert_model
         self.d_model = d_model
         self.num_heads = num_heads
         self.use_query_interaction = use_query_interaction
+        self.pooling_mode = pooling_mode
         hidden_dim = hidden_dim or d_model // 2
 
         # ---------------------------------------------------------------------
-        # LAYER 0: Explicit Role Injection Embeddings
+        # 1. Setup Query Probes & Mapping
         # ---------------------------------------------------------------------
-        # E_role for Title, Description, Comment, and Pad
+        if probes is not None:
+            self.probes = list(probes)
+        elif num_queries_per_class is not None:
+            # Fallback: create dynamic synthetic slots if user specified a count
+            self.probes = []
+            for c_idx in range(NUM_CLASSES):
+                for q_i in range(num_queries_per_class):
+                    self.probes.append(QueryProbe(
+                        id=f"class_{c_idx}_slot_{q_i}",
+                        class_idx=c_idx,
+                        aspect=f"slot_{q_i}",
+                        question_vi="",
+                        question_en=""
+                    ))
+        else:
+            # Default to rich Vietnamese domain probes from task_b_questions.py
+            self.probes = get_default_probes()
+
+        self.num_queries = len(self.probes)
+        
+        # Build index mapping for each class (e.g. Class 1 -> [indices of implicit probes])
+        self.class_to_query_indices: Dict[int, List[int]] = {0: [], 1: [], 2: []}
+        for idx, probe in enumerate(self.probes):
+            if probe.class_idx in self.class_to_query_indices:
+                self.class_to_query_indices[probe.class_idx].append(idx)
+
+        # Ensure every class has at least 1 query index
+        for c in range(NUM_CLASSES):
+            if len(self.class_to_query_indices[c]) == 0:
+                raise ValueError(f"Task B Class {c} has no query probes assigned! Ensure at least 1 probe per class.")
+
+        # ---------------------------------------------------------------------
+        # LAYER 0: Role Embeddings (Title vs Description vs Comment)
+        # ---------------------------------------------------------------------
         self.role_embeddings = nn.Embedding(NUM_ROLES, d_model)
         nn.init.normal_(self.role_embeddings.weight, mean=0.0, std=0.02)
         self.layer_norm_input = nn.LayerNorm(d_model)
         self.dropout_input = nn.Dropout(dropout)
 
         # ---------------------------------------------------------------------
-        # LAYER 1: Class-Aware Multi-Head Cross-Attention (MHCA)
+        # LAYER 1: Multi-Query Cross-Attention (MHCA)
         # ---------------------------------------------------------------------
-        # 3 Learned Class Queries: [q_NonHate, q_Implicit, q_Explicit]
-        self.query_embeddings = nn.Parameter(torch.empty(NUM_CLASSES, d_model))
+        # [num_queries, d_model] learned probe queries
+        self.query_embeddings = nn.Parameter(torch.empty(self.num_queries, d_model))
         nn.init.normal_(self.query_embeddings, mean=0.0, std=0.02)
 
-        # Cross-Attention where Q=learned class queries, K=V=H_final
         self.cross_attention = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=num_heads,
@@ -76,8 +121,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
         self.dropout_cross = nn.Dropout(dropout)
 
         # ---------------------------------------------------------------------
-        # LAYER 2: Query Interaction Layer (MHSA) [Ablation H2]
-        # Self-Attention between the 3 class queries (NonHate <-> Implicit <-> Explicit)
+        # LAYER 2: Inter-Query Interaction Layer (MHSA)
         # ---------------------------------------------------------------------
         if self.use_query_interaction:
             self.self_attention = nn.MultiheadAttention(
@@ -90,9 +134,20 @@ class TaskBClassAwareAttentionModel(nn.Module):
             self.dropout_self = nn.Dropout(dropout)
 
         # ---------------------------------------------------------------------
-        # LAYER 3: Joint Cross-Class Classification Head
-        # Projects concatenated query representations [B, 3 * d_model] -> [B, NUM_CLASSES]
-        # Enables joint comparative reasoning across (NonHate vs. Implicit vs. Explicit)
+        # Aspect-to-Class Aggregation (Soft-Attention Pooling Heads)
+        # ---------------------------------------------------------------------
+        if self.pooling_mode == "attention":
+            self.query_att_scorers = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(d_model, d_model // 4),
+                    nn.Tanh(),
+                    nn.Linear(d_model // 4, 1)
+                ) for _ in range(NUM_CLASSES)
+            ])
+
+        # ---------------------------------------------------------------------
+        # LAYER 3: Joint Comparative Classification Head
+        # Projects pooled class representations [B, 3 * d_model] -> [B, 3]
         # ---------------------------------------------------------------------
         self.classifier = nn.Sequential(
             nn.Linear(NUM_CLASSES * d_model, hidden_dim),
@@ -101,6 +156,58 @@ class TaskBClassAwareAttentionModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, NUM_CLASSES)
         )
+
+    def init_queries_from_text(self, tokenizer: Any, device: Optional[torch.device] = None):
+        """
+        Optional feature: Semantically initialize query_embeddings by encoding
+        the natural language question strings using mmBERT's own embedding layer.
+        """
+        dev = device or self.query_embeddings.device
+        with torch.no_grad():
+            for i, probe in enumerate(self.probes):
+                text = probe.question_vi if probe.question_vi.strip() else probe.question_en
+                if not text.strip():
+                    continue
+                tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=64)
+                tokens = {k: v.to(dev) for k, v in tokens.items()}
+                
+                # Extract representation from mmBERT backbone
+                outputs = self.mmbert(**tokens)
+                # Mean pool over valid token representations
+                mask = tokens["attention_mask"].unsqueeze(-1)
+                emb = (outputs.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+                self.query_embeddings.data[i].copy_(emb.squeeze(0))
+        print(f"[TaskBClassAwareAttentionModel] Initialized {self.num_queries} queries using mmBERT semantic embeddings.")
+
+    def pool_class_queries(self, z_queries: torch.Tensor) -> torch.Tensor:
+        """
+        Pools [B, K, d_model] query representations into [B, 3, d_model] class representations.
+        """
+        B, K, D = z_queries.shape
+        class_representations = []
+
+        for c in range(NUM_CLASSES):
+            indices = self.class_to_query_indices[c]
+            # Sub-tensor for this class: [B, num_sub_queries, d_model]
+            sub_z = z_queries[:, indices, :]
+
+            if len(indices) == 1:
+                class_representations.append(sub_z.squeeze(1))
+            elif self.pooling_mode == "attention":
+                # Compute soft attention weights over the sub-queries for this class
+                scores = self.query_att_scorers[c](sub_z)       # [B, num_sub_queries, 1]
+                weights = F.softmax(scores, dim=1)              # [B, num_sub_queries, 1]
+                pooled_c = (weights * sub_z).sum(dim=1)         # [B, d_model]
+                class_representations.append(pooled_c)
+            elif self.pooling_mode == "max":
+                pooled_c, _ = torch.max(sub_z, dim=1)           # [B, d_model]
+                class_representations.append(pooled_c)
+            else: # 'mean'
+                pooled_c = torch.mean(sub_z, dim=1)             # [B, d_model]
+                class_representations.append(pooled_c)
+
+        # Stack into [B, 3, d_model]
+        return torch.stack(class_representations, dim=1)
 
     def forward(
         self,
@@ -112,13 +219,13 @@ class TaskBClassAwareAttentionModel(nn.Module):
         """
         Args:
             input_ids: [B, S]
-            attention_mask: [B, S] (1 for valid tokens, 0 for pad)
-            role_ids: [B, S] (0: pad, 1: title, 2: desc, 3: comment)
-            return_attention_map: Whether to return the [B, 3, S] attention interpretability map
+            attention_mask: [B, S]
+            role_ids: [B, S]
+            return_attention_map: Whether to return the attention map [B, K, S]
         Returns:
-            logits: [B, 3] (raw classification scores s for [no, yes_implicit, yes_explicit])
+            logits: [B, 3] (Classification scores for [no, yes_implicit, yes_explicit])
             h_B: [B, d_model] (Hate-Type-Aware Representation for Task C bridge)
-            attn_weights: [B, 3, S] if return_attention_map else None
+            attn_weights: [B, K, S] if return_attention_map else None
         """
         B, S = input_ids.shape
 
@@ -128,20 +235,16 @@ class TaskBClassAwareAttentionModel(nn.Module):
         backbone_trainable = any(p.requires_grad for p in self.mmbert.parameters())
         with torch.set_grad_enabled(backbone_trainable):
             h_mmbert = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        h_mmbert = h_mmbert.to(torch.float32)  # [B, S, d_model]
+        h_mmbert = h_mmbert.to(torch.float32)
 
-        # Role embeddings
-        e_role = self.role_embeddings(role_ids)  # [B, S, d_model]
+        e_role = self.role_embeddings(role_ids)
         h_final = self.layer_norm_input(h_mmbert + e_role)
-        h_final = self.dropout_input(h_final)    # [B, S, d_model]
+        h_final = self.dropout_input(h_final) # [B, S, d_model]
 
         # ---------------------------------------------------------------------
-        # LAYER 1: Class-Aware Multi-Head Cross-Attention (MHCA)
+        # LAYER 1: Multi-Query Cross-Attention (MHCA)
         # ---------------------------------------------------------------------
-        # Expand learned queries for batch: Q_base [3, d_model] -> Q [B, 3, d_model]
-        q = self.query_embeddings.unsqueeze(0).expand(B, -1, -1)  # [B, 3, d_model]
-
-        # PyTorch MultiheadAttention key_padding_mask: True indicates tokens to ignore
+        q = self.query_embeddings.unsqueeze(0).expand(B, -1, -1) # [B, K, d_model]
         key_padding_mask = (attention_mask == 0)
 
         z_attn, attn_weights = self.cross_attention(
@@ -150,12 +253,12 @@ class TaskBClassAwareAttentionModel(nn.Module):
             value=h_final,
             key_padding_mask=key_padding_mask,
             need_weights=True,
-            average_attn_weights=True  # Average across heads: [B, 3, S]
+            average_attn_weights=True # [B, K, S]
         )
-        z = self.layer_norm_cross(q + self.dropout_cross(z_attn))  # [B, 3, d_model]
+        z = self.layer_norm_cross(q + self.dropout_cross(z_attn)) # [B, K, d_model]
 
         # ---------------------------------------------------------------------
-        # LAYER 2: Query Interaction Layer (MHSA) [Ablation Hypothesis H2]
+        # LAYER 2: Inter-Query Interaction Layer (MHSA)
         # ---------------------------------------------------------------------
         if self.use_query_interaction:
             z_self, _ = self.self_attention(
@@ -164,22 +267,25 @@ class TaskBClassAwareAttentionModel(nn.Module):
                 value=z,
                 need_weights=False
             )
-            z_prime = self.layer_norm_self(z + self.dropout_self(z_self))  # [B, 3, d_model]
+            z_prime = self.layer_norm_self(z + self.dropout_self(z_self)) # [B, K, d_model]
         else:
-            z_prime = z  # [B, 3, d_model]
+            z_prime = z # [B, K, d_model]
+
+        # ---------------------------------------------------------------------
+        # Query-to-Class Aggregation: [B, K, d_model] -> [B, 3, d_model]
+        # ---------------------------------------------------------------------
+        z_classes = self.pool_class_queries(z_prime) # [B, 3, d_model]
 
         # ---------------------------------------------------------------------
         # LAYER 3: Joint Cross-Class Classification Head
-        # Concatenate 3 class representations: [B, 3, d_model] -> [B, 3 * d_model]
         # ---------------------------------------------------------------------
-        z_flat = z_prime.reshape(B, NUM_CLASSES * self.d_model)  # [B, 3 * d_model]
-        s = self.classifier(z_flat)                              # [B, 3] (raw logits)
+        z_flat = z_classes.reshape(B, NUM_CLASSES * self.d_model) # [B, 3 * d_model]
+        s = self.classifier(z_flat)                              # [B, 3]
 
         # ---------------------------------------------------------------------
         # TASK C BRIDGE: Hate-Type-Aware Representation h_B
-        # h_B = ∑_c (p_c · z'_c) ∈ [B, d_model]
         # ---------------------------------------------------------------------
-        probs = F.softmax(s, dim=-1).unsqueeze(-1)  # [B, 3, 1]
-        h_B = (probs * z_prime).sum(dim=1)          # [B, d_model]
+        probs = F.softmax(s, dim=-1).unsqueeze(-1) # [B, 3, 1]
+        h_B = (probs * z_classes).sum(dim=1)       # [B, d_model]
 
         return s, h_B, (attn_weights if return_attention_map else None)
