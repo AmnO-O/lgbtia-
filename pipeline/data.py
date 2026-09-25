@@ -201,7 +201,8 @@ class DataPipeline:
 
         return self.df_all
 
-    def split_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def split_data(self, test_size: Optional[float] = None,
+                   random_state: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
         GroupShuffleSplit by video title (`yt_title`) to prevent data leakage.
         Since video title and description are part of the input, the model must not
@@ -210,10 +211,13 @@ class DataPipeline:
         if self.df_all is None:
             self.load_data()
 
+        split_ratio = test_size if test_size is not None else self.config.val_split_ratio
+        seed = random_state if random_state is not None else self.config.random_seed
+
         gss = GroupShuffleSplit(
             n_splits=1,
-            test_size=self.config.val_split_ratio,
-            random_state=self.config.random_seed
+            test_size=split_ratio,
+            random_state=seed
         )
         train_idx, val_idx = next(gss.split(self.df_all, groups=self.df_all['yt_title']))
         self.df_train = self.df_all.iloc[train_idx].reset_index(drop=True)
