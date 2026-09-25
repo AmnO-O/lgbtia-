@@ -1,0 +1,6 @@
+{
+  "name": "StereoQueer & Toxic NLP Training Pipeline Studio",
+  "description": "Comprehensive Python training pipeline, modular architecture, and interactive visual workbench for multi-task stereotype, hate speech, and toxic comment classification models.",
+  "permissions": [],
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
