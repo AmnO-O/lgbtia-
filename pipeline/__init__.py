@@ -8,7 +8,7 @@ from .config import PipelineConfig, HATE_CLASSES, HATE2IDX, IDX2HATE
 from .data import StereoQueerDataset, MMBertSeqDataset, DataPipeline, safe_clean, encode_target, decode_target
 from .task_b_data import TaskBRoleDataset
 from .models.task_b_class_aware import TaskBClassAwareAttentionModel
-from .losses import MultiTaskLoss
+from .losses import MultiTaskLoss, FocalLoss
 from .metrics import evaluate_stereoqueer, print_metrics
 from .trainer import StereoQueerTrainer
 from .task_b_trainer import TaskBTrainer
@@ -28,6 +28,7 @@ __all__ = [
     "encode_target",
     "decode_target",
     "MultiTaskLoss",
+    "FocalLoss",
     "evaluate_stereoqueer",
     "print_metrics",
     "StereoQueerTrainer",

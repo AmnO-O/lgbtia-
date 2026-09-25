@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Union, List
+from typing import Optional, Union, List, Dict, Any
+from .config import PipelineConfig
 
 
 class FocalLoss(nn.Module):
@@ -52,8 +53,8 @@ class FocalLoss(nn.Module):
         p = torch.exp(log_p)                  # [B, C]
 
         # Gather target probabilities and log probabilities: [B]
-        target_p = p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)       # [B]
-        target_log_p = log_p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1) # [B]
+        target_p = p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)          # [B]
+        target_log_p = log_p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)    # [B]
 
         # Focal modulating factor: (1 - p_t)^gamma
         focal_weight = torch.pow(1.0 - target_p, self.gamma) # [B]
@@ -63,7 +64,6 @@ class FocalLoss(nn.Module):
 
         # Apply label smoothing if requested
         if self.label_smoothing > 0.0:
-            # smoothed CE = (1 - eps) * CE(target) + eps * (- mean(log_p))
             smooth_loss = - log_p.mean(dim=-1) # [B]
             ce_loss = (1.0 - self.label_smoothing) * ce_loss + self.label_smoothing * smooth_loss
 
@@ -81,3 +81,53 @@ class FocalLoss(nn.Module):
         elif self.reduction == "sum":
             return focal_loss.sum()
         return focal_loss
+
+
+class MultiTaskLoss(nn.Module):
+    """
+    Weighted Multi-Task Loss for StereoQueer:
+      - Stereotype Presence (ST): BCEWithLogitsLoss (or Focal)
+      - Hate Speech Type (HS): CrossEntropyLoss (or FocalLoss)
+      - Stereotype Target Group (TG): BCEWithLogitsLoss
+    """
+    def __init__(self, config: PipelineConfig):
+        super().__init__()
+        self.w_st = config.loss_st_weight
+        self.w_hs = config.loss_hs_weight
+        self.w_tg = config.loss_tg_weight
+        
+        self.loss_st = nn.BCEWithLogitsLoss()
+        
+        # Check if focal loss is configured for HS
+        if getattr(config, 'loss_type', 'focal') == 'focal':
+            class_weights = getattr(config, 'class_weights', None)
+            focal_gamma = getattr(config, 'focal_gamma', 2.0)
+            label_smoothing = getattr(config, 'label_smoothing', 0.05)
+            self.loss_hs = FocalLoss(
+                gamma=focal_gamma,
+                alpha=class_weights,
+                label_smoothing=label_smoothing
+            )
+        else:
+            class_weights = getattr(config, 'class_weights', None)
+            weight_tensor = torch.tensor(class_weights, dtype=torch.float32) if class_weights else None
+            self.loss_hs = nn.CrossEntropyLoss(weight=weight_tensor)
+            
+        self.loss_tg = nn.BCEWithLogitsLoss()
+
+    def forward(
+        self,
+        preds: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        l_st = self.loss_st(preds['st'], targets['st'])
+        l_hs = self.loss_hs(preds['hs'], targets['hs'])
+        l_tg = self.loss_tg(preds['tg'], targets['tg'])
+
+        total = self.w_st * l_st + self.w_hs * l_hs + self.w_tg * l_tg
+        return {
+            'total': total,
+            'st': l_st,
+            'hs': l_hs,
+            'tg': l_tg,
+        }
