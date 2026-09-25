@@ -233,6 +233,28 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32)
     # ... executes pipeline
 `
+  },
+  'notebook/task_b_class_aware_train.ipynb': {
+    desc: 'End-to-End Jupyter Notebook for Task B: Git clone, 2-phase training, ablation study H2, and attention map interpretability.',
+    code: `# notebook/task_b_class_aware_train.ipynb
+# 1. Clone repository:
+!git clone https://github.com/your-username/stereoqueer-pipeline.git
+%cd stereoqueer-pipeline
+
+# 2. Install dependencies:
+!pip install -q torch transformers datasets accelerate scikit-learn pandas numpy matplotlib seaborn
+
+# 3. Initialize Task B Class-Aware Model with Explicit Role Embeddings:
+from pipeline.models.task_b_class_aware import TaskBClassAwareAttentionModel
+from pipeline.task_b_data import TaskBRoleDataset
+from pipeline.task_b_trainer import TaskBTrainer
+
+# 4. Train End-to-End (Phase 1: Frozen Backbone -> Phase 2: Unfreeze last N layers):
+trainer = TaskBTrainer(model, config, train_loader, val_loader, df_val)
+results = trainer.train()
+
+# 5. Extract Task C Bridge representations h_B = sum_c (p_c * z'_c)
+`
   }
 };
 

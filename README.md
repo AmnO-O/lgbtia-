@@ -148,6 +148,11 @@ python train.py --embed_source scratch \
                 --output_dir checkpoints
 ```
 
+### 📓 Interactive Jupyter Notebooks (`notebook/`)
+- `notebook/task_b_class_aware_train.ipynb`: **End-to-End Task B** training with git clone, role injection, 2-phase learning, ablation study H2, attention map interpretability, and Task C bridge extraction.
+- `notebook/model-stereoqueer.ipynb`: Multi-task baseline for all 3 tasks (ST, HS, TG).
+- `notebook/model-toxic.ipynb`: Adapted toxic comment challenge baseline.
+
 ### 4. Evaluate Checkpoints
 ```bash
 python evaluate.py --checkpoint checkpoints/best_model.pt \
