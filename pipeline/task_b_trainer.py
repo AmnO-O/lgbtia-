@@ -1,9 +1,11 @@
 """
-Task B Specialized Trainer with Fast Gradient Method (FGM) Adversarial Regularization & Multi-Sample Dropout.
+Task B Specialized Trainer with Fast Gradient Method (FGM) Adversarial Regularization,
+Multi-Sample Dropout, Layer Unfreezing, and Gradient Checkpointing for low VRAM consumption.
 """
 
 import os
 import time
+import gc
 import numpy as np
 import pandas as pd
 import torch
@@ -16,6 +18,7 @@ from .config import PipelineConfig
 from .losses import build_loss_fn
 from .metrics import compute_classification_metrics
 from .models.task_b_class_aware import TaskBClassAwareAttentionModel
+from .models.mmbert import unfreeze_last_n
 
 
 class FGM:
@@ -50,7 +53,8 @@ class FGM:
 class TaskBTrainer:
     """
     Trainer for Task B Hate Speech Classification with:
-      - 2-Phase Backbone Fine-Tuning (Frozen -> Layer-Unfrozen)
+      - 2-Phase Backbone Fine-Tuning (Frozen -> Layer-Unfrozen: top N layers)
+      - Gradient Checkpointing for ultra-low VRAM footprints (< 4-6 GB)
       - Cosine Annealing with Warmup
       - Multi-Sample Dropout Loss Averaging
       - Fast Gradient Method (FGM) Adversarial Regularization
@@ -104,6 +108,15 @@ class TaskBTrainer:
         self.best_macro_f1 = -1.0
         self.best_checkpoint_path = ""
         self.history: List[Dict[str, Any]] = []
+
+    def enable_gradient_checkpointing(self):
+        """Reduces activation memory by ~60% during unfrozen backprop."""
+        try:
+            if hasattr(self.model.mmbert, "gradient_checkpointing_enable"):
+                self.model.mmbert.gradient_checkpointing_enable()
+                print("  [Memory Optimization] Gradient checkpointing successfully enabled for mmBERT backbone.")
+        except Exception as e:
+            print(f"  [Memory Optimization] Gradient checkpointing skipped: {e}")
 
     def build_optimizer(self, lr: float, backbone_lr: Optional[float] = None) -> torch.optim.Optimizer:
         """
@@ -289,7 +302,7 @@ class TaskBTrainer:
         """
         Executes complete training:
           Phase 1: Frozen backbone (Head warmup + MSD)
-          Phase 2: Unfrozen backbone (End-to-end + MSD + FGM Adversarial Regularization)
+          Phase 2: Unfrozen backbone top N layers (End-to-end + MSD + FGM Adversarial Regularization + Gradient Checkpointing)
         """
         os.makedirs(self.config.output_dir, exist_ok=True)
         self.best_checkpoint_path = os.path.join(self.config.output_dir, "task_b_best_model.pt")
@@ -335,7 +348,7 @@ class TaskBTrainer:
                 print(f"  --> Saved Best Checkpoint (Macro-F1: {macro_f1:.4f}): {self.best_checkpoint_path}")
 
         # -----------------------------------------------------------------
-        # PHASE 2: Unfreeze Backbone Layers + FGM Adversarial Training
+        # PHASE 2: Unfreeze Backbone Top N Layers + FGM Adversarial Training
         # -----------------------------------------------------------------
         if self.config.two_phase and self.config.unfreeze_phase_epochs > 0:
             print(f"\n--- PHASE 2: End-to-End Fine-Tuning + FGM Adversarial Training ({self.config.unfreeze_phase_epochs} Epochs) ---")
@@ -345,9 +358,23 @@ class TaskBTrainer:
                 self.model.load_state_dict(torch.load(self.best_checkpoint_path, map_location=self.device))
                 print(f"  Loaded Phase 1 Best Weights (Macro-F1: {self.best_macro_f1:.4f})")
 
-            # Unfreeze top N layers
-            for p in self.model.mmbert.parameters():
-                p.requires_grad = True
+            # Enable gradient checkpointing to keep VRAM usage minimal
+            self.enable_gradient_checkpointing()
+
+            # Clean cache before unfreezing
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
+
+            # Selectively unfreeze only the configured number of top encoder layers
+            unfreeze_layers = getattr(self.config, 'unfreeze_layers', 3)
+            if unfreeze_layers is None or unfreeze_layers <= 0:
+                for p in self.model.mmbert.parameters():
+                    p.requires_grad = True
+                print("  [Discriminative Fine-Tuning] Unfroze ALL backbone layers.")
+            else:
+                total_blocks = unfreeze_last_n(self.model.mmbert, unfreeze_layers)
+                print(f"  [Discriminative Fine-Tuning] Unfroze top {unfreeze_layers} encoder layers (out of {total_blocks}). Lower layers remain frozen.")
 
             opt_p2 = self.build_optimizer(
                 lr=self.config.head_unfreeze_lr,
@@ -369,8 +396,8 @@ class TaskBTrainer:
                 f1_exp = metrics.get('hs_f1_explicit', 0.0)
 
                 print(f"Epoch {epoch:02d}/{self.config.unfreeze_phase_epochs:02d} | "
-                  f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                  f"Macro F1: {macro_f1:.4f} (No: {f1_no:.3f}, Imp: {f1_imp:.3f}, Exp: {f1_exp:.3f}) | {elapsed:.1f}s")
+                      f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+                      f"Macro F1: {macro_f1:.4f} (No: {f1_no:.3f}, Imp: {f1_imp:.3f}, Exp: {f1_exp:.3f}) | {elapsed:.1f}s")
 
                 if macro_f1 > self.best_macro_f1:
                     self.best_macro_f1 = macro_f1
