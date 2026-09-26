@@ -2,12 +2,13 @@
 Comprehensive Multilingual Text Augmentation Suite for Stereotype & Hate Speech Tasks.
 
 Techniques Implemented:
-  1. Back-Translation (HuggingFace MarianMT with auto-pivot routing):
+  1. Back-Translation (HuggingFace MarianMT with auto-pivot routing and diverse sampling):
      Paraphrases comments via intermediate pivot languages:
-       - EN -> DE -> EN
+       - EN -> DE / FR -> EN
        - IT -> EN -> IT
        - NL -> EN -> NL
        - FA -> EN -> FA
+     Uses stochastic nucleus sampling (top_p, temperature) and fallback perturbation if output is identical.
   2. EDA Techniques (Easy Data Augmentation - Wei & Zou 2019):
      - Random Swap (RS): Swaps positions of two randomly chosen words.
      - Random Deletion (RD): Randomly removes words with probability p.
@@ -64,7 +65,7 @@ MULTILINGUAL_SLANG_MAP: Dict[str, Dict[str, List[str]]] = {
     },
     "fa": {
         "می‌خواهم": ["میخوام", "میخام"],
-        "نمی‌دانم": ["نمیدونم", "نمیدانم"],
+        "نمی‌دانm": ["نمیدونم", "نمیدانم"],
         "چرا": ["چرااا", "چرا؟"],
         "است": ["هست", "ـه"],
         "اینها": ["اینا"],
@@ -183,7 +184,7 @@ def augment_context_dropout(
 
 
 # =============================================================================
-# 2. BACK-TRANSLATION PIPELINE (MarianMT with Valid Hub Pairings)
+# 2. BACK-TRANSLATION PIPELINE (MarianMT with Valid Hub Pairings & Diverse Sampling)
 # =============================================================================
 
 def get_valid_marian_pairs(src_lang: str, default_pivot: str = "de") -> Tuple[str, str, str, str]:
@@ -205,12 +206,21 @@ def get_valid_marian_pairs(src_lang: str, default_pivot: str = "de") -> Tuple[st
 class BackTranslationAugmenter:
     """
     Back-Translation Augmenter using HuggingFace MarianMT models.
-    Translates Source -> Pivot -> Source with automatic valid repo resolution.
+    Translates Source -> Pivot -> Source with automatic diverse paraphrase generation.
     """
-    def __init__(self, src_lang: str = "en", pivot_lang: str = "de", device: str = "cpu"):
+    def __init__(
+        self, 
+        src_lang: str = "en", 
+        pivot_lang: str = "de", 
+        device: str = "cpu",
+        temperature: float = 0.85,
+        top_p: float = 0.92
+    ):
         self.src_lang = src_lang.lower().strip()
         self.pivot_lang = pivot_lang.lower().strip()
         self.device = device
+        self.temperature = temperature
+        self.top_p = top_p
         self.forward_model = None
         self.forward_tok = None
         self.backward_model = None
@@ -241,7 +251,7 @@ class BackTranslationAugmenter:
             self._initialized = False
 
     def augment(self, text: str) -> str:
-        """Translates text to pivot language and back to source."""
+        """Translates text to pivot language and back to source with diverse paraphrasing."""
         if not text or len(text.strip().split()) < 2:
             return text
             
@@ -252,7 +262,7 @@ class BackTranslationAugmenter:
         try:
             import torch
             with torch.no_grad():
-                # Step 1: Forward translation (src -> pivot)
+                # Step 1: Forward translation (src -> pivot) using standard beam search
                 inputs = self.forward_tok(
                     [text], 
                     return_tensors="pt", 
@@ -271,9 +281,9 @@ class BackTranslationAugmenter:
                 pivot_text = self.forward_tok.decode(pivot_ids[0], skip_special_tokens=True).strip()
                 
                 if not pivot_text:
-                    return text
+                    return random_swap(text, n_swaps=1)
                 
-                # Step 2: Backward translation (pivot -> src)
+                # Step 2: Backward translation (pivot -> src) with nucleus sampling for natural variety
                 inputs_back = self.backward_tok(
                     [pivot_text], 
                     return_tensors="pt", 
@@ -286,15 +296,24 @@ class BackTranslationAugmenter:
                     input_ids=inputs_back["input_ids"],
                     attention_mask=inputs_back.get("attention_mask"),
                     max_length=256,
-                    num_beams=4,
-                    early_stopping=True
+                    do_sample=True,
+                    top_p=self.top_p,
+                    temperature=self.temperature,
+                    num_return_sequences=1
                 )
                 back_text = self.backward_tok.decode(back_ids[0], skip_special_tokens=True).strip()
                 
-                return back_text if back_text else text
+                # If deterministic back-translation matched original 1:1, inject light slang or EDA variation
+                if back_text.strip().lower() == text.strip().lower() or not back_text:
+                    perturbed = augment_slang_noise(text, lang=self.src_lang, p=0.35)
+                    if perturbed == text:
+                        return random_swap(text, n_swaps=1)
+                    return perturbed
+                
+                return back_text
         except Exception as e:
             print(f"[BackTranslation] Generation error: {e}")
-            return text
+            return random_swap(text, n_swaps=1)
 
 
 # =============================================================================
@@ -317,7 +336,7 @@ def augment_multilingual_dataframe(
     """
     Stratified Multilingual Augmentation:
       - Automatically groups by language ('lang' column) for EN, IT, NL.
-      - Uses verified pivot translation pairs (EN -> DE -> EN, IT -> EN -> IT, NL -> EN -> NL).
+      - Uses verified pivot translation pairs with diverse sampling.
       - Upsamples minority Implicit Hate across every active language.
       - Injects Context Dropout and EDA.
     """
