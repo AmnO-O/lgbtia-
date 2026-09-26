@@ -26,7 +26,7 @@ from pipeline.models.transformer import PytorchTransformerModel
 from pipeline.models.lstm import PytorchRNNLSTM
 from pipeline.models.rnn import VanillaRNNModel
 from pipeline.models.mmbert import MMBertTransformerModel
-from pipeline.models.classifier import FeatureClassifier
+from pipeline.models.classifier import FeatureClassifier, MMBertFeatureClassifier
 from pipeline.models.task_b_class_aware import TaskBClassAwareAttentionModel
 from pipeline.task_b_data import TaskBRoleDataset
 from pipeline.task_b_trainer import TaskBTrainer
@@ -58,9 +58,11 @@ def parse_args():
     parser.add_argument("--patience", type=int, default=7, help="Early stopping patience")
     parser.add_argument("--max_length", type=int, default=256, help="Maximum token/word sequence length")
     
-    # 2-Phase settings
-    parser.add_argument("--two_phase", action="store_true", default=True,
+    # 2-Phase settings (BUG-14 fix: support both --two_phase and --no_two_phase)
+    parser.add_argument("--two_phase", dest="two_phase", action="store_true", default=True,
                         help="Enable 2-phase training (frozen phase then unfreeze last N layers)")
+    parser.add_argument("--no_two_phase", dest="two_phase", action="store_false",
+                        help="Disable 2-phase training and train end-to-end in single phase")
     parser.add_argument("--freeze_epochs", type=int, default=15, help="Max epochs for phase 1 (frozen backbone)")
     parser.add_argument("--unfreeze_epochs", type=int, default=15, help="Max epochs for phase 2 (unfrozen backbone)")
     parser.add_argument("--unfreeze_layers", type=int, default=2, help="Number of last encoder blocks to unfreeze")
@@ -158,9 +160,9 @@ def main():
             is_mmbert_tf = False
         elif config.model_type == "feature_mlp":
             train_loader, val_loader = data_pipeline.create_dataloaders(tokenizer=tokenizer)
-            model = FeatureClassifier(in_dim=config.mmbert_dim)
+            model = MMBertFeatureClassifier(backbone, d_model=config.mmbert_dim, target_dim=config.target_dim)
             is_task_b = False
-            is_mmbert_tf = False
+            is_mmbert_tf = True
         else:
             train_loader, val_loader = data_pipeline.create_dataloaders(tokenizer=tokenizer)
             model = MMBertTransformerModel(
@@ -195,6 +197,12 @@ def main():
                 embedding_dim=config.embedding_dim,
                 hidden_dim=config.hidden_dim,
                 target_dim=config.target_dim
+            )
+        elif config.model_type == "feature_mlp":
+            model = FeatureClassifier(
+                in_dim=config.embedding_dim,
+                target_dim=config.target_dim,
+                vocab_size=vocab_size
             )
         else:
             model = PytorchTransformerModel(

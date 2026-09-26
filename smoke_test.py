@@ -139,7 +139,7 @@ class TestPipelineSmoke(unittest.TestCase):
         logits, h_B, attn = model(dummy_ids, dummy_mask, dummy_roles, return_attention_map=True)
         self.assertEqual(logits.shape, (B, 3))
         self.assertEqual(h_B.shape, (B, 64))
-        self.assertEqual(attn.shape, (B, 3, S))
+        self.assertEqual(attn.shape, (B, model.num_queries, S))
 
         loss = nn.CrossEntropyLoss()(logits, labels)
         loss.backward()

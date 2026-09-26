@@ -226,7 +226,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
                     if not text.strip():
                         continue
                     tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=64)
-                    tokens = {k: v.to(dev) for k, v in tokens.items()}
+                    tokens = {k: v.to(dev) for k, v in tokens.items() if k in ('input_ids', 'attention_mask')}
                     
                     outputs = self.mmbert(**tokens)
                     mask = tokens["attention_mask"].unsqueeze(-1)

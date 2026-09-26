@@ -43,6 +43,7 @@ class StereoQueerTrainer:
 
         self.model.to(self.device)
         self.loss_fn = MultiTaskLoss(config)
+        self.loss_fn.to(self.device) # BUG-04 fix: move loss buffers/weights to device
         self.history = []
 
         os.makedirs(self.config.output_dir, exist_ok=True)
@@ -69,22 +70,36 @@ class StereoQueerTrainer:
             weight_decay=self.config.weight_decay
         )
 
+    def _forward_batch(self, batch) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Helper to unpack batches and forward model across mmbert and scratch baselines."""
+        if len(batch) == 5:
+            ids, mask, st, hs, tg = batch
+            ids, mask = ids.to(self.device), mask.to(self.device)
+            st, hs, tg = st.to(self.device), hs.to(self.device), tg.to(self.device)
+            if self.is_mmbert_tf:
+                st_logits, hs_logits, tg_logits = self.model(ids, mask)
+            else:
+                try:
+                    st_logits, hs_logits, tg_logits = self.model(ids, mask)
+                except TypeError:
+                    st_logits, hs_logits, tg_logits = self.model(ids)
+        elif len(batch) == 4:
+            inputs, st, hs, tg = batch
+            inputs = inputs.to(self.device)
+            st, hs, tg = st.to(self.device), hs.to(self.device), tg.to(self.device)
+            st_logits, hs_logits, tg_logits = self.model(inputs)
+        else:
+            raise ValueError(f"Unexpected batch length {len(batch)} in DataLoader.")
+
+        return st_logits, hs_logits, tg_logits, st, hs, tg
+
     def train_epoch(self, optimizer: torch.optim.Optimizer) -> float:
         self.model.train()
         total_loss = 0.0
 
         for batch in self.train_loader:
             optimizer.zero_grad()
-            if self.is_mmbert_tf:
-                ids, mask, st, hs, tg = batch
-                ids, mask = ids.to(self.device), mask.to(self.device)
-                st_logits, hs_logits, tg_logits = self.model(ids, mask)
-            else:
-                inputs, st, hs, tg = batch
-                inputs = inputs.to(self.device)
-                st_logits, hs_logits, tg_logits = self.model(inputs)
-
-            st, hs, tg = st.to(self.device), hs.to(self.device), tg.to(self.device)
+            st_logits, hs_logits, tg_logits, st, hs, tg = self._forward_batch(batch)
             loss, _ = self.loss_fn(st_logits, hs_logits, tg_logits, st, hs, tg)
             loss.backward()
 
@@ -94,7 +109,7 @@ class StereoQueerTrainer:
             optimizer.step()
             total_loss += loss.item()
 
-        return total_loss / len(self.train_loader)
+        return total_loss / max(len(self.train_loader), 1)
 
     @torch.no_grad()
     def eval_epoch(self) -> Tuple[float, Dict[str, float], Dict[str, Any]]:
@@ -108,16 +123,7 @@ class StereoQueerTrainer:
         st_list, hs_list, tg_list = [], [], []
 
         for batch in self.val_loader:
-            if self.is_mmbert_tf:
-                ids, mask, st, hs, tg = batch
-                ids, mask = ids.to(self.device), mask.to(self.device)
-                st_logits, hs_logits, tg_logits = self.model(ids, mask)
-            else:
-                inputs, st, hs, tg = batch
-                inputs = inputs.to(self.device)
-                st_logits, hs_logits, tg_logits = self.model(inputs)
-
-            st, hs, tg = st.to(self.device), hs.to(self.device), tg.to(self.device)
+            st_logits, hs_logits, tg_logits, st, hs, tg = self._forward_batch(batch)
             loss, _ = self.loss_fn(st_logits, hs_logits, tg_logits, st, hs, tg)
             total_val_loss += loss.item()
 
@@ -125,7 +131,7 @@ class StereoQueerTrainer:
             hs_list.append(torch.argmax(hs_logits, dim=1).cpu().numpy())
             tg_list.append(torch.sigmoid(tg_logits).cpu().numpy())
 
-        avg_val_loss = total_val_loss / len(self.val_loader)
+        avg_val_loss = total_val_loss / max(len(self.val_loader), 1)
         st_probs = np.concatenate(st_list).ravel()
         hs_preds = np.concatenate(hs_list)
         tg_probs = np.concatenate(tg_list, axis=0)

@@ -65,7 +65,7 @@ MULTILINGUAL_SLANG_MAP: Dict[str, Dict[str, List[str]]] = {
     },
     "fa": {
         "می‌خواهم": ["میخوام", "میخام"],
-        "نمی‌دانm": ["نمیدونم", "نمیدانم"],
+        "نمی‌دانم": ["نمیدونم", "نمیدانم"],
         "چرا": ["چرااا", "چرا؟"],
         "است": ["هست", "ـه"],
         "اینها": ["اینا"],
@@ -457,6 +457,13 @@ def _augment_single_lang_df(
                 new_row[title_col] = aug_t
             if desc_col in new_row:
                 new_row[desc_col] = aug_d
+
+            # Re-synthesize compound 'text' field if present
+            if 'text' in new_row:
+                from .data import safe_clean
+                new_row['text'] = safe_clean(
+                    f"comment: {new_row[comment_col]} [SEP] title: {new_row.get(title_col, '')} [SEP] desc: {new_row.get(desc_col, '')}"
+                )
             
             augmented_rows.append(new_row)
             

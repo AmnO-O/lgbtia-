@@ -10,6 +10,7 @@ from .models.mmbert import MMBertTransformerModel
 from .models.transformer import PytorchTransformerModel
 from .models.lstm import PytorchRNNLSTM
 from .models.rnn import VanillaRNNModel
+from .models.classifier import FeatureClassifier, MMBertFeatureClassifier
 
 
 class StereoQueerPredictor:
@@ -42,11 +43,28 @@ class StereoQueerPredictor:
             from transformers import AutoTokenizer, AutoModel
             self.tokenizer = AutoTokenizer.from_pretrained(self.config.mmbert_model_name)
             backbone = AutoModel.from_pretrained(self.config.mmbert_model_name)
-            model = MMBertTransformerModel(
-                backbone,
-                d_model=self.config.mmbert_dim,
-                target_dim=self.config.target_dim
-            )
+
+            if self.config.model_type == 'task_b_class_aware':
+                from .models.task_b_class_aware import TaskBClassAwareAttentionModel
+                model = TaskBClassAwareAttentionModel(
+                    mmbert_model=backbone,
+                    d_model=self.config.mmbert_dim,
+                    num_heads=self.config.num_heads,
+                    dropout=self.config.dropout,
+                    use_query_interaction=self.config.use_query_interaction
+                )
+            elif self.config.model_type == 'feature_mlp':
+                model = MMBertFeatureClassifier(
+                    backbone,
+                    d_model=self.config.mmbert_dim,
+                    target_dim=self.config.target_dim
+                )
+            else:
+                model = MMBertTransformerModel(
+                    backbone,
+                    d_model=self.config.mmbert_dim,
+                    target_dim=self.config.target_dim
+                )
         else:
             if vocab_path and os.path.exists(vocab_path):
                 with open(vocab_path, "r", encoding="utf-8") as f:
@@ -69,6 +87,12 @@ class StereoQueerPredictor:
                     hidden_dim=self.config.hidden_dim,
                     target_dim=self.config.target_dim
                 )
+            elif self.config.model_type == 'feature_mlp':
+                model = FeatureClassifier(
+                    in_dim=self.config.embedding_dim,
+                    target_dim=self.config.target_dim,
+                    vocab_size=vocab_size
+                )
             else:
                 model = PytorchTransformerModel(
                     vocab_size=vocab_size,
@@ -90,8 +114,89 @@ class StereoQueerPredictor:
 
     @torch.no_grad()
     def predict_one(self, comment: str, title: str = "", description: str = "") -> Dict[str, Any]:
-        """Runs multi-task prediction on a single text triplet."""
-        compound_text = safe_clean(f"{comment} [SEP] {title} [SEP] {description}")
+        """Runs multi-task or Task B prediction on a single text triplet."""
+        clean_c = safe_clean(comment)
+        clean_t = safe_clean(title)
+        clean_d = safe_clean(description)
+        compound_text = f"comment: {clean_c} [SEP] title: {clean_t} [SEP] desc: {clean_d}"
+
+        if self.config.model_type == 'task_b_class_aware':
+            from .models.task_b_class_aware import ROLE_PAD, ROLE_TITLE, ROLE_DESC, ROLE_COMMENT
+            comm_ids = self.tokenizer.encode(f"comment: {clean_c}", add_special_tokens=False) if clean_c else []
+            title_ids = self.tokenizer.encode(f"title: {clean_t}", add_special_tokens=False) if clean_t else []
+            desc_ids = self.tokenizer.encode(f"desc: {clean_d}", add_special_tokens=False) if clean_d else []
+
+            cls_id = getattr(self.tokenizer, 'cls_token_id', 101) or 101
+            sep_id = getattr(self.tokenizer, 'sep_token_id', 102) or 102
+            pad_id = getattr(self.tokenizer, 'pad_token_id', 0) or 0
+
+            max_len = self.config.max_length
+            overhead = 4
+            available = max(10, max_len - overhead)
+
+            c_budget = int(available * 0.70)
+            t_budget = int(available * 0.18)
+            d_budget = available - c_budget - t_budget
+
+            comm_ids = comm_ids[:c_budget]
+            title_ids = title_ids[:t_budget]
+            desc_ids = desc_ids[:d_budget]
+
+            all_ids = [cls_id]
+            all_roles = [ROLE_PAD]
+
+            # 1. Comment
+            if comm_ids:
+                all_ids.extend(comm_ids)
+                all_roles.extend([ROLE_COMMENT] * len(comm_ids))
+            all_ids.append(sep_id)
+            all_roles.append(ROLE_PAD)
+
+            # 2. Title
+            if title_ids:
+                all_ids.extend(title_ids)
+                all_roles.extend([ROLE_TITLE] * len(title_ids))
+            all_ids.append(sep_id)
+            all_roles.append(ROLE_PAD)
+
+            # 3. Description
+            if desc_ids:
+                all_ids.extend(desc_ids)
+                all_roles.extend([ROLE_DESC] * len(desc_ids))
+            all_ids.append(sep_id)
+            all_roles.append(ROLE_PAD)
+
+            max_len = self.config.max_length
+            if len(all_ids) < max_len:
+                pad_len = max_len - len(all_ids)
+                all_ids += [pad_id] * pad_len
+                all_roles += [ROLE_PAD] * pad_len
+                mask = [1] * (max_len - pad_len) + [0] * pad_len
+            else:
+                all_ids = all_ids[:max_len]
+                all_roles = all_roles[:max_len]
+                mask = [1] * max_len
+
+            inp_ids = torch.tensor([all_ids], dtype=torch.long, device=self.device)
+            att_mask = torch.tensor([mask], dtype=torch.long, device=self.device)
+            role_ids = torch.tensor([all_roles], dtype=torch.long, device=self.device)
+
+            logits, _, attn = self.model(inp_ids, att_mask, role_ids, return_attention_map=True)
+            hs_probs = torch.softmax(logits[0], dim=-1).cpu().numpy()
+            hs_idx = int(np.argmax(hs_probs))
+            hs_label = IDX2HATE.get(hs_idx, "no")
+
+            return {
+                "input_text": compound_text,
+                "hate_speech": {
+                    "label": hs_label,
+                    "probabilities": {
+                        "no": float(hs_probs[0]),
+                        "yes_implicit": float(hs_probs[1]),
+                        "yes_explicit": float(hs_probs[2]),
+                    }
+                }
+            }
 
         if self.config.embed_source == 'mmbert' and self.tokenizer is not None:
             sep = getattr(self.tokenizer, 'sep_token', '[SEP]') or '[SEP]'

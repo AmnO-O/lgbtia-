@@ -13,7 +13,7 @@ class TaskBRoleDataset(Dataset):
     """
     Dataset tailored for Task B Architecture with Explicit Role Injection:
       [INPUT SEQUENCE]
-      Title: <T> ... </T> | Description: <D> ... </D> | Comment: <C> ... </C>
+      [CLS] comment: <C> ... </C> [SEP] title: <T> ... </T> [SEP] desc: <D> ... </D> [SEP]
       
       Produces:
         input_ids: [S]
@@ -33,9 +33,9 @@ class TaskBRoleDataset(Dataset):
         self.max_len = max_len
         self.tokenizer = tokenizer
         
-        self.st_labels = df['st_y'].values.astype(np.float32)
-        self.hs_labels = df['hs_y'].values.astype(np.int64)
-        self.tg_labels = np.stack(df['tg_y'].values).astype(np.float32)
+        self.st_labels = df['st_y'].values.astype(np.float32) if 'st_y' in df.columns else np.zeros(len(df), dtype=np.float32)
+        self.hs_labels = df['hs_y'].values.astype(np.int64) if 'hs_y' in df.columns else np.zeros(len(df), dtype=np.int64)
+        self.tg_labels = np.stack(df['tg_y'].values).astype(np.float32) if 'tg_y' in df.columns else np.zeros((len(df), 10), dtype=np.float32)
         
         # Tokenize and build aligned role IDs
         self.input_ids, self.attention_mask, self.role_ids = self._tokenize_with_roles(
@@ -69,23 +69,22 @@ class TaskBRoleDataset(Dataset):
         pad_id = getattr(tokenizer, 'pad_token_id', 0) or 0
 
         for title, desc, comment in zip(titles, descriptions, comments):
+            clean_c = safe_clean(comment)
             clean_t = safe_clean(title)
             clean_d = safe_clean(desc)
-            clean_c = safe_clean(comment)
 
-            # Tokenize segments individually without special tokens
-            t_ids = tokenizer.encode(f"title: {clean_t}", add_special_tokens=False) if clean_t else []
-            d_ids = tokenizer.encode(f"description: {clean_d}", add_special_tokens=False) if clean_d else []
+            # Tokenize segments individually with prompt role tags without special tokens
             c_ids = tokenizer.encode(f"comment: {clean_c}", add_special_tokens=False) if clean_c else []
+            t_ids = tokenizer.encode(f"title: {clean_t}", add_special_tokens=False) if clean_t else []
+            d_ids = tokenizer.encode(f"desc: {clean_d}", add_special_tokens=False) if clean_d else []
 
-            # Structure: [CLS] Title [SEP] Description [SEP] Comment [SEP]
-            # Budget tokens keeping priority for Comment
+            # Structure: [CLS] comment: <comment> [SEP] title: <title> [SEP] desc: <description> [SEP]
+            # Budget tokens prioritizing comment (up to 70%), title (up to 18%), desc (remainder)
             overhead = 4  # [CLS], 3x [SEP]
             available = max(10, max_len - overhead)
             
-            # Allocate budget: comment up to 60%, title up to 20%, desc up to 20%
-            c_budget = int(available * 0.60)
-            t_budget = int(available * 0.20)
+            c_budget = int(available * 0.70)
+            t_budget = int(available * 0.18)
             d_budget = available - c_budget - t_budget
 
             c_ids = c_ids[:c_budget]
@@ -95,24 +94,24 @@ class TaskBRoleDataset(Dataset):
             seq_ids = [cls_id]
             seq_roles = [ROLE_PAD]
 
-            # Title
+            # 1. Comment (Primary Target)
+            if c_ids:
+                seq_ids.extend(c_ids)
+                seq_roles.extend([ROLE_COMMENT] * len(c_ids))
+            seq_ids.append(sep_id)
+            seq_roles.append(ROLE_PAD)
+
+            # 2. Title (Video Context)
             if t_ids:
                 seq_ids.extend(t_ids)
                 seq_roles.extend([ROLE_TITLE] * len(t_ids))
             seq_ids.append(sep_id)
             seq_roles.append(ROLE_PAD)
 
-            # Description
+            # 3. Description (Background Context)
             if d_ids:
                 seq_ids.extend(d_ids)
                 seq_roles.extend([ROLE_DESC] * len(d_ids))
-            seq_ids.append(sep_id)
-            seq_roles.append(ROLE_PAD)
-
-            # Comment
-            if c_ids:
-                seq_ids.extend(c_ids)
-                seq_roles.extend([ROLE_COMMENT] * len(c_ids))
             seq_ids.append(sep_id)
             seq_roles.append(ROLE_PAD)
 

@@ -36,7 +36,7 @@ class FGM:
 
     def attack(self):
         for name, param in self.model.named_parameters():
-            if param.requires_grad and self.emb_name in name and param.grad is not None:
+            if param.requires_grad and (self.emb_name in name or "tok_embeddings" in name or "word_embeddings" in name) and param.grad is not None:
                 self.backup[name] = param.data.clone()
                 norm = torch.norm(param.grad)
                 if norm != 0 and not torch.isnan(norm):
@@ -45,7 +45,7 @@ class FGM:
 
     def restore(self):
         for name, param in self.model.named_parameters():
-            if param.requires_grad and self.emb_name in name and name in self.backup:
+            if param.requires_grad and (self.emb_name in name or "tok_embeddings" in name or "word_embeddings" in name) and name in self.backup:
                 param.data.copy_(self.backup[name])
         self.backup = {}
 
@@ -418,16 +418,22 @@ class TaskBTrainer:
         print("=" * 62)
 
         if self.config.save_predictions:
+            from .config import IDX2HATE
             pred_df = pd.DataFrame({
                 'pred_class': final_preds,
+                'pred_hate_speech': [IDX2HATE.get(int(p), 'no') for p in final_preds],
                 'prob_no': final_probs[:, 0],
                 'prob_implicit': final_probs[:, 1],
                 'prob_explicit': final_probs[:, 2]
             })
             if self.df_val is not None:
+                if 'hate_speech' in self.df_val.columns:
+                    pred_df['hate_speech'] = self.df_val['hate_speech'].values
+                elif 'hs_y' in self.df_val.columns:
+                    pred_df['hate_speech'] = [IDX2HATE.get(int(y), 'no') for y in self.df_val['hs_y'].values]
                 # Merge with metadata if available
-                for col in ['lang', 'yt_comment', 'yt_title']:
-                    if col in self.df_val.columns:
+                for col in ['lang', 'yt_comment', 'yt_title', 'yt_description', 'stereotype', 'target']:
+                    if col in self.df_val.columns and col not in pred_df.columns:
                         pred_df[col] = self.df_val[col].values
             pred_csv = os.path.join(self.config.output_dir, "task_b_val_predictions.csv")
             pred_df.to_csv(pred_csv, index=False)

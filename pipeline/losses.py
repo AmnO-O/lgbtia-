@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Union, List, Dict, Any
+from typing import Optional, Union, List, Dict, Any, Tuple
 from .config import PipelineConfig
 
 
@@ -52,9 +52,13 @@ class FocalLoss(nn.Module):
         log_p = F.log_softmax(inputs, dim=-1) # [B, C]
         p = torch.exp(log_p)                  # [B, C]
 
+        # Numerical stability clamp (BUG-15 fix) to avoid 0 * inf = NaN under AMP/float16
+        p = torch.clamp(p, min=1e-7, max=1.0 - 1e-7)
+
         # Gather target probabilities and log probabilities: [B]
-        target_p = p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)          # [B]
-        target_log_p = log_p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)    # [B]
+        target_p = p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+        target_p = torch.clamp(target_p, min=1e-7, max=1.0 - 1e-7)
+        target_log_p = log_p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
 
         # Focal modulating factor: (1 - p_t)^gamma
         focal_weight = torch.pow(1.0 - target_p, self.gamma) # [B]
@@ -70,9 +74,10 @@ class FocalLoss(nn.Module):
         # Apply focal modulation
         focal_loss = focal_weight * ce_loss # [B]
 
-        # Apply alpha class weights if provided
+        # Apply alpha class weights if provided (BUG-04 device-safe)
         if self.alpha is not None:
-            alpha_t = self.alpha[targets] # [B]
+            alpha = self.alpha.to(targets.device)
+            alpha_t = alpha[targets] # [B]
             focal_loss = alpha_t * focal_loss
 
         # Reduction
@@ -122,6 +127,11 @@ class MultiTaskLoss(nn.Module):
       - Stereotype Presence (ST): BCEWithLogitsLoss (or Focal)
       - Hate Speech Type (HS): CrossEntropyLoss (or FocalLoss)
       - Stereotype Target Group (TG): BCEWithLogitsLoss
+
+    Supports both dictionary inputs: forward(preds_dict, targets_dict)
+    and 6 positional arguments: forward(st_logits, hs_logits, tg_logits, st_tgt, hs_tgt, tg_tgt).
+    Returns a MultiTaskLossResult object that can be unpacked as `loss, loss_dict`
+    or indexed as a dictionary `loss['total']`.
     """
     def __init__(self, config: PipelineConfig):
         super().__init__()
@@ -150,17 +160,43 @@ class MultiTaskLoss(nn.Module):
 
     def forward(
         self,
-        preds: Dict[str, torch.Tensor],
-        targets: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        l_st = self.loss_st(preds['st'], targets['st'])
-        l_hs = self.loss_hs(preds['hs'], targets['hs'])
-        l_tg = self.loss_tg(preds['tg'], targets['tg'])
+        *args,
+        **kwargs
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Accepts:
+          - (preds_dict, targets_dict)
+          - (st_logits, hs_logits, tg_logits, st_tgt, hs_tgt, tg_tgt)
+        Returns:
+          - (total_loss, {'total': total_loss, 'st': l_st, 'hs': l_hs, 'tg': l_tg})
+        """
+        if len(args) == 2 and isinstance(args[0], dict) and isinstance(args[1], dict):
+            preds, targets = args[0], args[1]
+            st_pred, hs_pred, tg_pred = preds['st'], preds['hs'], preds['tg']
+            st_tgt, hs_tgt, tg_tgt = targets['st'], targets['hs'], targets['tg']
+        elif len(args) == 6:
+            st_pred, hs_pred, tg_pred, st_tgt, hs_tgt, tg_tgt = args
+        elif 'preds' in kwargs and 'targets' in kwargs:
+            preds, targets = kwargs['preds'], kwargs['targets']
+            st_pred, hs_pred, tg_pred = preds['st'], preds['hs'], preds['tg']
+            st_tgt, hs_tgt, tg_tgt = targets['st'], targets['hs'], targets['tg']
+        else:
+            raise ValueError("MultiTaskLoss expects either 2 dicts (preds, targets) or 6 positional tensors.")
+
+        # Ensure matching shapes for ST (BUG-02 fix)
+        st_pred = st_pred.squeeze(-1) if st_pred.ndim > 1 and st_pred.shape[-1] == 1 else st_pred
+        st_tgt = st_tgt.view_as(st_pred)
+
+        l_st = self.loss_st(st_pred, st_tgt)
+        l_hs = self.loss_hs(hs_pred, hs_tgt)
+        l_tg = self.loss_tg(tg_pred, tg_tgt)
 
         total = self.w_st * l_st + self.w_hs * l_hs + self.w_tg * l_tg
-        return {
+        loss_dict = {
             'total': total,
             'st': l_st,
             'hs': l_hs,
             'tg': l_tg,
         }
+
+        return total, loss_dict

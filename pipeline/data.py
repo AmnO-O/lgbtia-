@@ -80,7 +80,7 @@ class StereoQueerDataset(Dataset):
         self.texts = list(texts)
         self.st_labels = np.asarray(st_labels, dtype=np.float32)
         self.hs_labels = np.asarray(hs_labels, dtype=np.int64)
-        self.tg_labels = np.asarray(tg_labels, dtype=np.float32)
+        self.tg_labels = np.stack(list(tg_labels)).astype(np.float32)
         self.word_to_idx = word_to_idx
         self.max_len = max_len
 
@@ -183,15 +183,15 @@ class DataPipeline:
 
         self.df_all = pd.concat(dfs, ignore_index=True)
 
-        # Build compound text: comment [SEP] title [SEP] description
+        # Build compound text: comment: <comment> [SEP] title: <title> [SEP] desc: <description>
         self.df_all['yt_title'] = self.df_all['yt_title'].fillna('')
         self.df_all['yt_description'] = self.df_all['yt_description'].fillna('')
         self.df_all['yt_comment'] = self.df_all['yt_comment'].fillna('')
 
         self.df_all['text'] = (
-            self.df_all['yt_comment'] + ' [SEP] ' +
-            self.df_all['yt_title'] + ' [SEP] ' +
-            self.df_all['yt_description']
+            'comment: ' + self.df_all['yt_comment'] + ' [SEP] ' +
+            'title: ' + self.df_all['yt_title'] + ' [SEP] ' +
+            'desc: ' + self.df_all['yt_description']
         ).map(safe_clean)
 
         # Labels
