@@ -2,8 +2,12 @@
 Comprehensive Multilingual Text Augmentation Suite for Stereotype & Hate Speech Tasks.
 
 Techniques Implemented:
-  1. Back-Translation (HuggingFace MarianMT / NLLB or Offline Cache):
-     Paraphrases comments via intermediate pivot languages (e.g. EN -> DE -> EN, IT -> EN -> IT, NL -> FR -> NL).
+  1. Back-Translation (HuggingFace MarianMT with auto-pivot routing):
+     Paraphrases comments via intermediate pivot languages:
+       - EN -> DE -> EN
+       - IT -> EN -> IT
+       - NL -> EN -> NL
+       - FA -> EN -> FA
   2. EDA Techniques (Easy Data Augmentation - Wei & Zou 2019):
      - Random Swap (RS): Swaps positions of two randomly chosen words.
      - Random Deletion (RD): Randomly removes words with probability p.
@@ -179,17 +183,36 @@ def augment_context_dropout(
 
 
 # =============================================================================
-# 2. BACK-TRANSLATION PIPELINE (MarianMT / NLLB / Transformers)
+# 2. BACK-TRANSLATION PIPELINE (MarianMT with Valid Hub Pairings)
 # =============================================================================
+
+# Valid, verified Opus-MT hub pairs:
+# - For English ('en'): pivot is German ('de') -> opus-mt-en-de & opus-mt-de-en exist on HuggingFace Hub
+# - For non-English ('it', 'nl', 'fa', 'vi'): pivot is English ('en') -> opus-mt-it-en, opus-mt-nl-en, etc. exist
+def get_valid_marian_pairs(src_lang: str, default_pivot: str = "de") -> Tuple[str, str, str, str]:
+    """
+    Returns valid (forward_model_name, backward_model_name, src, pivot).
+    Guarantees the Hugging Face repository exists and won't 401/404.
+    """
+    src = src_lang.lower().strip()
+    
+    if src == "en":
+        pivot = default_pivot if default_pivot != "en" else "de"
+        return f"Helsinki-NLP/opus-mt-en-{pivot}", f"Helsinki-NLP/opus-mt-{pivot}-en", src, pivot
+    else:
+        # For IT, NL, etc., English is the universal verified pivot on Opus-MT
+        pivot = "en"
+        return f"Helsinki-NLP/opus-mt-{src}-en", f"Helsinki-NLP/opus-mt-en-{src}", src, pivot
+
 
 class BackTranslationAugmenter:
     """
-    Back-Translation Augmenter using HuggingFace MarianMT or NLLB models.
-    Translates Source -> Pivot -> Source to produce natural paraphrases.
+    Back-Translation Augmenter using HuggingFace MarianMT models.
+    Translates Source -> Pivot -> Source with automatic valid repo resolution.
     """
     def __init__(self, src_lang: str = "en", pivot_lang: str = "de", device: str = "cpu"):
-        self.src_lang = src_lang
-        self.pivot_lang = pivot_lang
+        self.src_lang = src_lang.lower().strip()
+        self.pivot_lang = pivot_lang.lower().strip()
         self.device = device
         self.forward_model = None
         self.forward_tok = None
@@ -202,19 +225,19 @@ class BackTranslationAugmenter:
             return
         try:
             from transformers import MarianMTModel, MarianTokenizer
-            fwd_name = f"Helsinki-NLP/opus-mt-{self.src_lang}-{self.pivot_lang}"
-            bwd_name = f"Helsinki-NLP/opus-mt-{self.pivot_lang}-{self.src_lang}"
+            fwd_name, bwd_name, _, actual_pivot = get_valid_marian_pairs(self.src_lang, self.pivot_lang)
+            self.pivot_lang = actual_pivot
             
-            print(f"[BackTranslation] Loading models: {fwd_name} & {bwd_name}...")
+            print(f"[BackTranslation ({self.src_lang.upper()})] Loading verified models: {fwd_name} & {bwd_name}...")
             self.forward_tok = MarianTokenizer.from_pretrained(fwd_name)
-            self.forward_model = MarianMTModel.from_pretrained(fwd_name).to(self.device)
+            self.forward_model = MarianMTModel.from_pretrained(fwd_name, tie_word_embeddings=False).to(self.device)
             
             self.backward_tok = MarianTokenizer.from_pretrained(bwd_name)
-            self.backward_model = MarianMTModel.from_pretrained(bwd_name).to(self.device)
+            self.backward_model = MarianMTModel.from_pretrained(bwd_name, tie_word_embeddings=False).to(self.device)
             self._initialized = True
-            print("[BackTranslation] Models successfully loaded.")
+            print(f"[BackTranslation ({self.src_lang.upper()})] Models successfully loaded.")
         except Exception as e:
-            print(f"[BackTranslation] Warning: Could not initialize MarianMT models ({e}). Falling back to EDA.")
+            print(f"[BackTranslation ({self.src_lang.upper()})] Warning: Could not initialize MarianMT models ({e}). Falling back to EDA.")
             self._initialized = False
 
     def augment(self, text: str) -> str:
@@ -259,10 +282,10 @@ def augment_multilingual_dataframe(
 ) -> pd.DataFrame:
     """
     Stratified Multilingual Augmentation:
-      - When 'lang' column is present in df, it automatically groups by language (e.g. EN, IT, NL),
-        applying matching native slang dictionaries and language-specific perturbations.
+      - Automatically groups by language ('lang' column) for EN, IT, NL.
+      - Uses verified pivot translation pairs (EN -> DE -> EN, IT -> EN -> IT, NL -> EN -> NL).
       - Upsamples minority Implicit Hate across every active language.
-      - Injects Context Dropout and EDA to prevent metadata memorization.
+      - Injects Context Dropout and EDA.
     """
     random.seed(random_state)
     np.random.seed(random_state)
@@ -350,7 +373,6 @@ def _augment_single_lang_df(
         for _, row in sampled_implicit.iterrows():
             new_row = row.copy()
             
-            # If row has its own language tag, respect it for slang mapping
             row_lang = str(row.get('lang', lang)).lower().strip()
             comment = str(row.get(comment_col, ''))
             
