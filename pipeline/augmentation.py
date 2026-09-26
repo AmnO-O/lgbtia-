@@ -186,13 +186,10 @@ def augment_context_dropout(
 # 2. BACK-TRANSLATION PIPELINE (MarianMT with Valid Hub Pairings)
 # =============================================================================
 
-# Valid, verified Opus-MT hub pairs:
-# - For English ('en'): pivot is German ('de') -> opus-mt-en-de & opus-mt-de-en exist on HuggingFace Hub
-# - For non-English ('it', 'nl', 'fa', 'vi'): pivot is English ('en') -> opus-mt-it-en, opus-mt-nl-en, etc. exist
 def get_valid_marian_pairs(src_lang: str, default_pivot: str = "de") -> Tuple[str, str, str, str]:
     """
     Returns valid (forward_model_name, backward_model_name, src, pivot).
-    Guarantees the Hugging Face repository exists and won't 401/404.
+    Guarantees the Hugging Face repository exists.
     """
     src = src_lang.lower().strip()
     
@@ -230,10 +227,13 @@ class BackTranslationAugmenter:
             
             print(f"[BackTranslation ({self.src_lang.upper()})] Loading verified models: {fwd_name} & {bwd_name}...")
             self.forward_tok = MarianTokenizer.from_pretrained(fwd_name)
-            self.forward_model = MarianMTModel.from_pretrained(fwd_name, tie_word_embeddings=False).to(self.device)
+            self.forward_model = MarianMTModel.from_pretrained(fwd_name).to(self.device)
+            self.forward_model.eval()
             
             self.backward_tok = MarianTokenizer.from_pretrained(bwd_name)
-            self.backward_model = MarianMTModel.from_pretrained(bwd_name, tie_word_embeddings=False).to(self.device)
+            self.backward_model = MarianMTModel.from_pretrained(bwd_name).to(self.device)
+            self.backward_model.eval()
+            
             self._initialized = True
             print(f"[BackTranslation ({self.src_lang.upper()})] Models successfully loaded.")
         except Exception as e:
@@ -242,7 +242,7 @@ class BackTranslationAugmenter:
 
     def augment(self, text: str) -> str:
         """Translates text to pivot language and back to source."""
-        if not text or len(text.split()) < 3:
+        if not text or len(text.strip().split()) < 2:
             return text
             
         self._lazy_init()
@@ -252,14 +252,48 @@ class BackTranslationAugmenter:
         try:
             import torch
             with torch.no_grad():
-                inputs = self.forward_tok(text, return_tensors="pt", truncation=True, max_length=128).to(self.device)
-                pivot_ids = self.forward_model.generate(**inputs, max_length=128)
-                pivot_text = self.forward_tok.decode(pivot_ids[0], skip_special_tokens=True)
+                # Step 1: Forward translation (src -> pivot)
+                inputs = self.forward_tok(
+                    [text], 
+                    return_tensors="pt", 
+                    padding=True, 
+                    truncation=True, 
+                    max_length=256
+                ).to(self.device)
                 
-                inputs_back = self.backward_tok(pivot_text, return_tensors="pt", truncation=True, max_length=128).to(self.device)
-                back_ids = self.backward_model.generate(**inputs_back, max_length=128)
-                return self.backward_tok.decode(back_ids[0], skip_special_tokens=True)
-        except Exception:
+                pivot_ids = self.forward_model.generate(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask"),
+                    max_length=256,
+                    num_beams=4,
+                    early_stopping=True
+                )
+                pivot_text = self.forward_tok.decode(pivot_ids[0], skip_special_tokens=True).strip()
+                
+                if not pivot_text:
+                    return text
+                
+                # Step 2: Backward translation (pivot -> src)
+                inputs_back = self.backward_tok(
+                    [pivot_text], 
+                    return_tensors="pt", 
+                    padding=True, 
+                    truncation=True, 
+                    max_length=256
+                ).to(self.device)
+                
+                back_ids = self.backward_model.generate(
+                    input_ids=inputs_back["input_ids"],
+                    attention_mask=inputs_back.get("attention_mask"),
+                    max_length=256,
+                    num_beams=4,
+                    early_stopping=True
+                )
+                back_text = self.backward_tok.decode(back_ids[0], skip_special_tokens=True).strip()
+                
+                return back_text if back_text else text
+        except Exception as e:
+            print(f"[BackTranslation] Generation error: {e}")
             return text
 
 
