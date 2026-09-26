@@ -20,7 +20,7 @@ from .augmentation import (
 from .models.task_b_questions import QueryProbe, DEFAULT_TASK_B_PROBES, get_default_probes, get_probes_for_language
 from .models.task_b_class_aware import TaskBClassAwareAttentionModel, RMSNorm
 from .losses import MultiTaskLoss, FocalLoss, build_loss_fn
-from .metrics import evaluate_stereoqueer, print_metrics
+from .metrics import evaluate_stereoqueer, print_metrics, compute_classification_metrics
 from .trainer import StereoQueerTrainer
 from .task_b_trainer import TaskBTrainer, FGM
 from .inference import StereoQueerPredictor
@@ -56,6 +56,7 @@ __all__ = [
     "build_loss_fn",
     "evaluate_stereoqueer",
     "print_metrics",
+    "compute_classification_metrics",
     "StereoQueerTrainer",
     "TaskBTrainer",
     "FGM",

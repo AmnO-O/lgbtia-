@@ -1,8 +1,8 @@
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, Optional
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
 from .data import decode_target
 
 @torch.no_grad()
@@ -29,6 +29,41 @@ def run_model_inference(model: torch.nn.Module, loader: torch.utils.data.DataLoa
     tg_probs = np.concatenate(tg_list, axis=0)
 
     return st_probs, hs_preds, tg_probs
+
+
+def compute_classification_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_prob: Optional[np.ndarray] = None,
+    task: str = "hs"
+) -> Dict[str, float]:
+    """
+    Computes detailed per-class and macro classification metrics.
+    For Task B (Hate Speech):
+      - hs_acc: Overall Accuracy
+      - hs_macro_f1: Macro-Averaged F1 across (no, implicit, explicit)
+      - hs_f1_no: F1 score for class 0 (no hate)
+      - hs_f1_implicit: F1 score for class 1 (implicit hate)
+      - hs_f1_explicit: F1 score for class 2 (explicit hate)
+    """
+    acc = float(accuracy_score(y_true, y_pred))
+    macro_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+    
+    # Compute per-class precision, recall, f1
+    precisions, recalls, f1s, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=[0, 1, 2], zero_division=0
+    )
+
+    metrics = {
+        f"{task}_acc": acc,
+        f"{task}_macro_f1": macro_f1,
+        f"{task}_f1_no": float(f1s[0]),
+        f"{task}_f1_implicit": float(f1s[1]),
+        f"{task}_f1_explicit": float(f1s[2]),
+        f"{task}_prec_implicit": float(precisions[1]),
+        f"{task}_recall_implicit": float(recalls[1]),
+    }
+    return metrics
 
 
 def evaluate_stereoqueer(
