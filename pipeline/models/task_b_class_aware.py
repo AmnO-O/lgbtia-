@@ -57,9 +57,9 @@ class TaskBClassAwareAttentionModel(nn.Module):
          Uses RMSNorm by default for tighter gradient variance bounds and faster GPU computation.
       3. PyTorch SDPA / FlashAttention Enablement:
          `need_weights=return_attention_map` allows PyTorch to execute fast FlashAttention kernels.
-      4. Dynamic Multi-Query Probing with Aspect Pooling:
-         Probes fine-grained semantic angles (sarcasm, dogwhistle, slurs, support) and aggregates
-         them into the 3 target classes using learnable attention pooling.
+      4. Dual-Stream Aspect Pooling [Mean || Max] with LayerNorm Projection:
+         Preserves peak diagnostic trigger signals (Max) while maintaining smooth gradient flow (Mean),
+         projecting [B, 2*d_model] -> [B, d_model] cleanly per class.
       5. Task C Gradient Isolation (`detach_bridge=True`).
     """
     def __init__(
@@ -72,8 +72,8 @@ class TaskBClassAwareAttentionModel(nn.Module):
         hidden_dim: Optional[int] = None,
         probes: Optional[List[QueryProbe]] = None,
         num_queries_per_class: Optional[int] = None,
-        pooling_mode: str = "attention", # 'attention', 'mean', or 'max'
-        use_rmsnorm: bool = True,        # Toggle RMSNorm vs standard LayerNorm
+        pooling_mode: str = "cat_mean_max", # 'cat_mean_max', 'attention', 'mean', or 'max'
+        use_rmsnorm: bool = True,           # Toggle RMSNorm vs standard LayerNorm
     ):
         super(TaskBClassAwareAttentionModel, self).__init__()
         self.mmbert = mmbert_model
@@ -156,9 +156,19 @@ class TaskBClassAwareAttentionModel(nn.Module):
             self.dropout_self = nn.Dropout(dropout)
 
         # ---------------------------------------------------------------------
-        # Aspect-to-Class Aggregation (Soft-Attention Pooling Heads)
+        # Aspect-to-Class Aggregation Layer
         # ---------------------------------------------------------------------
-        if self.pooling_mode == "attention":
+        if self.pooling_mode == "cat_mean_max":
+            # Per-class projection from 2*d_model -> d_model with normalization
+            self.query_proj_layers = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(2 * d_model, d_model),
+                    NormClass(d_model),
+                    nn.GELU(),
+                    nn.Dropout(dropout)
+                ) for _ in range(NUM_CLASSES)
+            ])
+        elif self.pooling_mode == "attention":
             self.query_att_scorers = nn.ModuleList([
                 nn.Sequential(
                     nn.Linear(d_model, d_model // 4),
@@ -223,16 +233,24 @@ class TaskBClassAwareAttentionModel(nn.Module):
     def pool_class_queries(self, z_queries: torch.Tensor) -> torch.Tensor:
         """
         Pools [B, K, d_model] query representations into [B, 3, d_model] class representations.
+        Uses dual-stream [Mean || Max] with non-linear projection and LayerNorm by default.
         """
         B, K, D = z_queries.shape
         class_representations = []
 
         for c in range(NUM_CLASSES):
             indices = self.class_to_query_indices[c]
-            sub_z = z_queries[:, indices, :]
+            sub_z = z_queries[:, indices, :] # [B, num_sub_queries, d_model]
 
             if len(indices) == 1:
                 class_representations.append(sub_z.squeeze(1))
+            elif self.pooling_mode == "cat_mean_max":
+                # Dual-stream: global density (mean) + peak diagnostic trigger (max)
+                mean_p = torch.mean(sub_z, dim=1)           # [B, d_model]
+                max_p, _ = torch.max(sub_z, dim=1)          # [B, d_model]
+                cat_p = torch.cat([mean_p, max_p], dim=-1)   # [B, 2 * d_model]
+                pooled_c = self.query_proj_layers[c](cat_p)  # [B, d_model]
+                class_representations.append(pooled_c)
             elif self.pooling_mode == "attention":
                 scores = self.query_att_scorers[c](sub_z)       # [B, num_sub_queries, 1]
                 weights = F.softmax(scores, dim=1)              # [B, num_sub_queries, 1]
