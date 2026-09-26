@@ -55,6 +55,7 @@ class TaskBTrainer:
       - Multi-Sample Dropout Loss Averaging
       - Fast Gradient Method (FGM) Adversarial Regularization
       - Mixed Precision (AMP)
+      - Per-Language Validation Metric Tracking & Optional df_val integration
     """
     def __init__(
         self,
@@ -62,6 +63,7 @@ class TaskBTrainer:
         config: PipelineConfig,
         train_loader: DataLoader,
         val_loader: DataLoader,
+        df_val: Optional[pd.DataFrame] = None,
         device: Optional[torch.device] = None,
         use_amp: bool = True
     ):
@@ -69,6 +71,7 @@ class TaskBTrainer:
         self.config = config
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.df_val = df_val
 
         if device is not None:
             self.device = device
@@ -266,6 +269,16 @@ class TaskBTrainer:
         y_prob = np.array(all_probs)
 
         metrics = compute_classification_metrics(y_true, y_pred, y_prob, task="hs")
+
+        # Per-language breakdown if df_val is provided and contains 'lang'
+        if self.df_val is not None and 'lang' in self.df_val.columns and len(self.df_val) == len(y_true):
+            langs = self.df_val['lang'].values
+            for l in np.unique(langs):
+                idx = (langs == l)
+                if idx.sum() > 0:
+                    sub_m = compute_classification_metrics(y_true[idx], y_pred[idx], y_prob[idx], task=f"hs_{l}")
+                    metrics[f"hs_macro_f1_{l}"] = sub_m[f"hs_{l}_macro_f1"]
+
         return avg_loss, metrics, y_pred, y_prob
 
     def train_pipeline(self) -> Dict[str, Any]:
@@ -380,6 +393,11 @@ class TaskBTrainer:
                 'prob_implicit': final_probs[:, 1],
                 'prob_explicit': final_probs[:, 2]
             })
+            if self.df_val is not None:
+                # Merge with metadata if available
+                for col in ['lang', 'yt_comment', 'yt_title']:
+                    if col in self.df_val.columns:
+                        pred_df[col] = self.df_val[col].values
             pred_csv = os.path.join(self.config.output_dir, "task_b_val_predictions.csv")
             pred_df.to_csv(pred_csv, index=False)
             print(f"\nPredictions saved to: {pred_csv}")
