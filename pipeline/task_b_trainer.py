@@ -1,92 +1,110 @@
+"""
+Task B Specialized Trainer with Fast Gradient Method (FGM) Adversarial Regularization & Multi-Sample Dropout.
+"""
+
 import os
 import time
-import json
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from sklearn.metrics import f1_score, accuracy_score
-from typing import Optional, Dict, Any, Tuple, List, Union
+from typing import Dict, Any, Optional, Tuple, List, Union
 
-from .config import PipelineConfig, HATE_CLASSES, HATE2IDX, IDX2HATE
-from .losses import FocalLoss
-from .models.mmbert import unfreeze_last_n
+from .config import PipelineConfig
+from .losses import build_loss_fn
+from .metrics import compute_classification_metrics
 from .models.task_b_class_aware import TaskBClassAwareAttentionModel
+
+
+class FGM:
+    """
+    Fast Gradient Method (FGM) for Adversarial Training on Transformer Word Embeddings.
+    Perturbs token embeddings in the direction of the loss gradient by scale epsilon:
+        delta = epsilon * (grad / ||grad||_2)
+    Forces the loss landscape around subtle phrases to remain smooth and prevents overfitting.
+    """
+    def __init__(self, model: nn.Module, epsilon: float = 1.0, emb_name: str = "word_embeddings"):
+        self.model = model
+        self.epsilon = epsilon
+        self.emb_name = emb_name
+        self.backup = {}
+
+    def attack(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and self.emb_name in name and param.grad is not None:
+                self.backup[name] = param.data.clone()
+                norm = torch.norm(param.grad)
+                if norm != 0 and not torch.isnan(norm):
+                    r_at = self.epsilon * param.grad / norm
+                    param.data.add_(r_at)
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and self.emb_name in name and name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
 
 
 class TaskBTrainer:
     """
-    Dedicated Trainer for Task B (Class-Aware Multi-Query Cross-Attention Model)
-    Features:
-      - Two-Phase Transfer Learning (Phase 1: Frozen Backbone Warmup -> Phase 2: Joint Backbone Fine-Tuning)
-      - Integrated Linear Warmup + Cosine Annealing Learning Rate Scheduler
-      - Differential Layer Learning Rates (Separate Backbone LR and Head LR)
-      - Automatic Mixed Precision (AMP) with FP16/BF16 on CUDA / CPU Fallback
-      - Class-Balanced Multi-Class Focal Loss with Label Smoothing
-      - Dynamic Early Stopping and Macro-F1 Checkpoint Serialization
+    Trainer for Task B Hate Speech Classification with:
+      - 2-Phase Backbone Fine-Tuning (Frozen -> Layer-Unfrozen)
+      - Cosine Annealing with Warmup
+      - Multi-Sample Dropout Loss Averaging
+      - Fast Gradient Method (FGM) Adversarial Regularization
+      - Mixed Precision (AMP)
     """
     def __init__(
         self,
-        config: PipelineConfig,
         model: TaskBClassAwareAttentionModel,
+        config: PipelineConfig,
         train_loader: DataLoader,
         val_loader: DataLoader,
-        df_val: pd.DataFrame,
-        class_weights: Optional[List[float]] = None,
         device: Optional[torch.device] = None,
         use_amp: bool = True
     ):
-        self.config = config
         self.model = model
+        self.config = config
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.df_val = df_val
-        self.class_weights = class_weights
 
-        # Hardware Setup
         if device is not None:
             self.device = device
+        elif config.device:
+            self.device = torch.device(config.device)
         else:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         self.model.to(self.device)
         self.use_amp = use_amp and (self.device.type == 'cuda')
-        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
         self.device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
+        self.scaler = torch.amp.GradScaler(self.device_type, enabled=self.use_amp)
 
-        # Loss Function Setup
-        label_smoothing = getattr(config, 'label_smoothing', 0.05)
-        loss_type = getattr(config, 'loss_type', 'focal')
-        focal_gamma = getattr(config, 'focal_gamma', 1.0)
-        
-        weights_tensor = None
-        if class_weights is not None:
-            weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(self.device)
+        # Loss function
+        self.criterion = build_loss_fn(
+            loss_type=config.loss_type,
+            class_weights=config.class_weights,
+            gamma=config.focal_gamma,
+            label_smoothing=config.label_smoothing,
+            device=self.device
+        )
 
-        if loss_type == "focal":
-            self.criterion = FocalLoss(
-                gamma=focal_gamma,
-                alpha=weights_tensor,
-                label_smoothing=label_smoothing,
-                reduction="mean"
-            )
-            print(f"[TaskBTrainer] Loss: Multi-Class Focal Loss (gamma={focal_gamma}, alpha={class_weights}, label_smoothing={label_smoothing})")
-        else:
-            if weights_tensor is not None:
-                self.criterion = nn.CrossEntropyLoss(weight=weights_tensor, label_smoothing=label_smoothing)
-                print(f"[TaskBTrainer] Loss: Weighted CrossEntropyLoss (weights={class_weights}, label_smoothing={label_smoothing})")
-            else:
-                self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-                print(f"[TaskBTrainer] Loss: Standard CrossEntropyLoss (label_smoothing={label_smoothing})")
-            
-        self.history = []
-        os.makedirs(self.config.output_dir, exist_ok=True)
+        # Adversarial Trainer
+        self.fgm = FGM(
+            model=self.model,
+            epsilon=config.fgm_epsilon,
+            emb_name=config.fgm_emb_name
+        ) if getattr(config, 'use_fgm', True) else None
+
+        self.best_macro_f1 = -1.0
+        self.best_checkpoint_path = ""
+        self.history: List[Dict[str, Any]] = []
 
     def build_optimizer(self, lr: float, backbone_lr: Optional[float] = None) -> torch.optim.Optimizer:
         """
-        Builds AdamW optimizer with distinct learning rate parameter groups.
+        Builds an AdamW optimizer with differential learning rates for backbone vs heads.
         """
         backbone_prms = [p for n, p in self.model.named_parameters()
                          if p.requires_grad and n.startswith('mmbert.')]
@@ -122,14 +140,25 @@ class TaskBTrainer:
                 min_lr_ratio=0.01
             )
         except Exception:
-            # Fallback to PyTorch native CosineAnnealingLR if transformers helper is not available
             return torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
                 T_max=total_steps,
                 eta_min=1e-7
             )
 
-    def train_epoch(self, optimizer: torch.optim.Optimizer, scheduler: Optional[Any] = None) -> float:
+    def _compute_loss(self, logits: Union[torch.Tensor, List[torch.Tensor]], targets: torch.Tensor) -> torch.Tensor:
+        """Handles single logits tensor or list of Multi-Sample Dropout branch logits."""
+        if isinstance(logits, list):
+            branch_losses = [self.criterion(branch_logit, targets) for branch_logit in logits]
+            return torch.mean(torch.stack(branch_losses))
+        return self.criterion(logits, targets)
+
+    def train_epoch(
+        self,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[Any] = None,
+        apply_fgm: bool = True
+    ) -> float:
         self.model.train()
         total_loss = 0.0
 
@@ -141,23 +170,53 @@ class TaskBTrainer:
             hs_labels = hs_labels.to(self.device, non_blocking=True)
 
             optimizer.zero_grad()
+            
+            # Forward 1: Clean pass
             with torch.amp.autocast(self.device_type, enabled=self.use_amp):
                 logits, _, _ = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    role_ids=role_ids
+                    role_ids=role_ids,
+                    return_all_msd_logits=True
                 )
-                loss = self.criterion(logits, hs_labels)
+                loss = self._compute_loss(logits, hs_labels)
 
             if self.use_amp:
                 self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            # Forward 2: Fast Gradient Method (Adversarial perturbation)
+            if apply_fgm and self.fgm is not None:
+                if self.use_amp:
+                    self.scaler.unscale_(optimizer)
+                
+                self.fgm.attack() # Inject epsilon * grad into word embeddings
+                
+                with torch.amp.autocast(self.device_type, enabled=self.use_amp):
+                    adv_logits, _, _ = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        role_ids=role_ids,
+                        return_all_msd_logits=False
+                    )
+                    adv_loss = self._compute_loss(adv_logits, hs_labels)
+                
+                if self.use_amp:
+                    self.scaler.scale(adv_loss).backward()
+                else:
+                    adv_loss.backward()
+                    
+                self.fgm.restore() # Restore original unperturbed weights
+
+            # Step optimizer & scaler
+            if self.use_amp:
                 if self.config.clip_grad_norm > 0:
                     self.scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.clip_grad_norm)
                 self.scaler.step(optimizer)
                 self.scaler.update()
             else:
-                loss.backward()
                 if self.config.clip_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.clip_grad_norm)
                 optimizer.step()
@@ -188,7 +247,8 @@ class TaskBTrainer:
                 logits, _, _ = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    role_ids=role_ids
+                    role_ids=role_ids,
+                    return_all_msd_logits=False
                 )
                 loss = self.criterion(logits, hs_labels)
 
@@ -198,145 +258,134 @@ class TaskBTrainer:
 
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(hs_labels.cpu().numpy())
-            all_probs.append(probs.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
 
         avg_loss = total_loss / max(len(self.val_loader), 1)
         y_true = np.array(all_labels)
         y_pred = np.array(all_preds)
-        y_prob = np.concatenate(all_probs, axis=0) if len(all_probs) > 0 else np.zeros((0, 3))
+        y_prob = np.array(all_probs)
 
-        macro_f1 = float(f1_score(y_true, y_pred, average='macro', zero_division=0))
-        acc = float(accuracy_score(y_true, y_pred))
-        f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
-
-        metrics = {
-            'hs_macro_f1': macro_f1,
-            'hs_acc': acc,
-            'hs_f1_no': float(f1_per_class[0]) if len(f1_per_class) > 0 else 0.0,
-            'hs_f1_implicit': float(f1_per_class[1]) if len(f1_per_class) > 1 else 0.0,
-            'hs_f1_explicit': float(f1_per_class[2]) if len(f1_per_class) > 2 else 0.0,
-        }
+        metrics = compute_classification_metrics(y_true, y_pred, y_prob, task="hs")
         return avg_loss, metrics, y_pred, y_prob
 
-    def run_training_loop(self, tag: str, num_epochs: int, lr: float,
-                          backbone_lr: Optional[float] = None) -> str:
-        optimizer = self.build_optimizer(lr=lr, backbone_lr=backbone_lr)
-        scheduler = self.build_scheduler(optimizer, num_epochs=num_epochs)
+    def train_pipeline(self) -> Dict[str, Any]:
+        """
+        Executes complete training:
+          Phase 1: Frozen backbone (Head warmup + MSD)
+          Phase 2: Unfrozen backbone (End-to-end + MSD + FGM Adversarial Regularization)
+        """
+        os.makedirs(self.config.output_dir, exist_ok=True)
+        self.best_checkpoint_path = os.path.join(self.config.output_dir, "task_b_best_model.pt")
+
+        print("=" * 70)
+        print("STARTING TASK B CLASS-AWARE MULTI-QUERY TRAINING PIPELINE")
+        print(f"  Device:         {self.device}")
+        print(f"  Mixed Precision: {self.use_amp}")
+        print(f"  Loss Function:  {self.config.loss_type} (gamma={self.config.focal_gamma})")
+        print(f"  Multi-Sample Dropout: {getattr(self.config, 'use_msd', True)}")
+        print(f"  Fast Gradient Method (FGM): {getattr(self.config, 'use_fgm', True)} (eps={self.config.fgm_epsilon})")
+        print("=" * 70)
+
+        # -----------------------------------------------------------------
+        # PHASE 1: Frozen Backbone
+        # -----------------------------------------------------------------
+        print(f"\n--- PHASE 1: Training Classification Heads ({self.config.freeze_phase_epochs} Epochs) ---")
+        for p in self.model.mmbert.parameters():
+            p.requires_grad = False
+
+        opt_p1 = self.build_optimizer(lr=self.config.learning_rate)
+        sched_p1 = self.build_scheduler(opt_p1, self.config.freeze_phase_epochs)
         
-        best_metric = -1.0
-        best_val_loss = float('inf')
-        counter = 0
-        best_checkpoint_path = os.path.join(self.config.output_dir, f"{tag}.pt")
-
-        print(f"\n--- [Task B Class-Aware] Starting {tag} (Max Epochs: {num_epochs}, Patience: {self.config.patience}, Head LR: {lr:.2e}, Backbone LR: {backbone_lr}) ---")
-
-        for epoch in range(num_epochs):
+        # In phase 1, FGM is inactive on frozen backbone embeddings
+        for epoch in range(1, self.config.freeze_phase_epochs + 1):
             t0 = time.time()
-            train_loss = self.train_epoch(optimizer, scheduler=scheduler)
+            train_loss = self.train_epoch(opt_p1, sched_p1, apply_fgm=False)
             val_loss, metrics, _, _ = self.eval_epoch()
             elapsed = time.time() - t0
 
-            epoch_record = {
-                'epoch': epoch + 1,
-                'tag': tag,
-                'train_loss': train_loss,
-                'val_loss': val_loss,
-                'time_s': elapsed,
-                **metrics
-            }
-            self.history.append(epoch_record)
+            macro_f1 = metrics.get('hs_macro_f1', 0.0)
+            f1_no = metrics.get('hs_f1_no', 0.0)
+            f1_imp = metrics.get('hs_f1_implicit', 0.0)
+            f1_exp = metrics.get('hs_f1_explicit', 0.0)
 
-            print(
-                f"Epoch {epoch+1:02d}/{num_epochs:02d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                f"Macro F1: {metrics['hs_macro_f1']:.4f} (No: {metrics['hs_f1_no']:.3f}, Imp: {metrics['hs_f1_implicit']:.3f}, Exp: {metrics['hs_f1_explicit']:.3f}) | {elapsed:.1f}s"
-            )
+            print(f"Epoch {epoch:02d}/{self.config.freeze_phase_epochs:02d} | "
+                  f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+                  f"Macro F1: {macro_f1:.4f} (No: {f1_no:.3f}, Imp: {f1_imp:.3f}, Exp: {f1_exp:.3f}) | {elapsed:.1f}s")
 
-            # Checkpoint based on highest Macro-F1 (or lower val_loss if F1 tied)
-            current_f1 = metrics['hs_macro_f1']
-            is_better = (current_f1 > best_metric + 1e-4) or (abs(current_f1 - best_metric) <= 1e-4 and val_loss < best_val_loss)
+            if macro_f1 > self.best_macro_f1:
+                self.best_macro_f1 = macro_f1
+                torch.save(self.model.state_dict(), self.best_checkpoint_path)
+                print(f"  --> Saved Best Checkpoint (Macro-F1: {macro_f1:.4f}): {self.best_checkpoint_path}")
+
+        # -----------------------------------------------------------------
+        # PHASE 2: Unfreeze Backbone Layers + FGM Adversarial Training
+        # -----------------------------------------------------------------
+        if self.config.two_phase and self.config.unfreeze_phase_epochs > 0:
+            print(f"\n--- PHASE 2: End-to-End Fine-Tuning + FGM Adversarial Training ({self.config.unfreeze_phase_epochs} Epochs) ---")
             
-            if is_better:
-                best_metric = current_f1
-                best_val_loss = val_loss
-                counter = 0
-                torch.save(self.model.state_dict(), best_checkpoint_path)
-                print(f"  --> Saved Best Checkpoint (Macro-F1: {current_f1:.4f}): {best_checkpoint_path}")
-            else:
-                counter += 1
-                if counter >= self.config.patience:
-                    print(f"  --> Early stopping triggered at epoch {epoch+1} (patience reached).")
-                    break
+            # Load best checkpoint from Phase 1 before unfreezing
+            if os.path.exists(self.best_checkpoint_path):
+                self.model.load_state_dict(torch.load(self.best_checkpoint_path, map_location=self.device))
+                print(f"  Loaded Phase 1 Best Weights (Macro-F1: {self.best_macro_f1:.4f})")
 
-        return best_checkpoint_path
-
-    def train(self) -> Dict[str, Any]:
-        print(f"[Task B Class-Aware Attention Model] Device: {self.device}")
-        print(f"Query Interaction Layer (MHSA) Enabled: {self.model.use_query_interaction}")
-
-        if self.config.two_phase:
-            # PHASE 1: Frozen Backbone
-            print("\n>>> PHASE 1/2: Frozen mmBERT Backbone -> Learning Role Embeddings, Class Queries & MHCA")
+            # Unfreeze top N layers
             for p in self.model.mmbert.parameters():
-                p.requires_grad = False
+                p.requires_grad = True
 
-            phase1_tag = "task_b_phase1_frozen"
-            best_p1 = self.run_training_loop(
-                tag=phase1_tag,
-                num_epochs=self.config.freeze_phase_epochs,
-                lr=self.config.learning_rate
-            )
-
-            # PHASE 2: Load Phase 1, unfreeze last N layers
-            print(f"\n>>> Loading Best Phase 1 Weights: {best_p1}")
-            self.model.load_state_dict(torch.load(best_p1, map_location=self.device))
-
-            n_unfrozen = unfreeze_last_n(self.model.mmbert, self.config.unfreeze_layers)
-            print(f">>> PHASE 2/2: Fine-Tuning Last {self.config.unfreeze_layers} Encoder Blocks (Found {n_unfrozen})")
-
-            phase2_tag = "task_b_best_model"
-            best_final = self.run_training_loop(
-                tag=phase2_tag,
-                num_epochs=self.config.unfreeze_phase_epochs,
+            opt_p2 = self.build_optimizer(
                 lr=self.config.head_unfreeze_lr,
                 backbone_lr=self.config.unfreeze_lr
             )
-        else:
-            best_final = self.run_training_loop(
-                tag="task_b_best_model",
-                num_epochs=self.config.epochs,
-                lr=self.config.learning_rate
-            )
+            sched_p2 = self.build_scheduler(opt_p2, self.config.unfreeze_phase_epochs)
 
-        # Load best weights
-        self.model.load_state_dict(torch.load(best_final, map_location=self.device))
-        _, final_metrics, y_pred, y_prob = self.eval_epoch()
+            use_fgm_p2 = getattr(self.config, 'use_fgm', True)
 
-        print("\n==================== FINAL TASK B METRICS ====================")
-        print(f"  Overall Accuracy:  {final_metrics['hs_acc']:.4f}")
-        print(f"  Macro-F1:          {final_metrics['hs_macro_f1']:.4f}")
-        print(f"  F1 (No Hate):      {final_metrics['hs_f1_no']:.4f}")
-        print(f"  F1 (Implicit):     {final_metrics['hs_f1_implicit']:.4f}")
-        print(f"  F1 (Explicit):     {final_metrics['hs_f1_explicit']:.4f}")
-        print("==============================================================\n")
+            for epoch in range(1, self.config.unfreeze_phase_epochs + 1):
+                t0 = time.time()
+                train_loss = self.train_epoch(opt_p2, sched_p2, apply_fgm=use_fgm_p2)
+                val_loss, metrics, _, _ = self.eval_epoch()
+                elapsed = time.time() - t0
 
-        # Save predictions CSV
-        if self.config.save_predictions and 'StereoQueerEval_id' in self.df_val.columns:
-            res_df = self.df_val[['StereoQueerEval_id', 'lang', 'yt_title', 'yt_comment', 'hate_speech']].copy()
-            res_df['pred_hate_speech'] = [IDX2HATE.get(int(p), 'no') for p in y_pred]
-            res_df['prob_no'] = y_prob[:, 0]
-            res_df['prob_implicit'] = y_prob[:, 1]
-            res_df['prob_explicit'] = y_prob[:, 2]
-            pred_file = os.path.join(self.config.output_dir, "task_b_val_predictions.csv")
-            res_df.to_csv(pred_file, index=False)
-            print(f"Predictions saved to: {pred_file}")
+                macro_f1 = metrics.get('hs_macro_f1', 0.0)
+                f1_no = metrics.get('hs_f1_no', 0.0)
+                f1_imp = metrics.get('hs_f1_implicit', 0.0)
+                f1_exp = metrics.get('hs_f1_explicit', 0.0)
 
-        # Save history
-        hist_path = os.path.join(self.config.output_dir, "task_b_training_history.json")
-        with open(hist_path, "w", encoding="utf-8") as f:
-            json.dump(self.history, f, indent=2)
+                print(f"Epoch {epoch:02d}/{self.config.unfreeze_phase_epochs:02d} | "
+                      f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+                      f"Macro F1: {macro_f1:.4f} (No: {f1_no:.3f}, Imp: {f1_imp:.3f}, Exp: {f1_exp:.3f}) | {elapsed:.1f}s")
+
+                if macro_f1 > self.best_macro_f1:
+                    self.best_macro_f1 = macro_f1
+                    torch.save(self.model.state_dict(), self.best_checkpoint_path)
+                    print(f"  --> Saved Best Checkpoint (Macro-F1: {macro_f1:.4f}): {self.best_checkpoint_path}")
+
+        # Final Evaluation on Best Model
+        if os.path.exists(self.best_checkpoint_path):
+            self.model.load_state_dict(torch.load(self.best_checkpoint_path, map_location=self.device))
+            
+        final_loss, final_metrics, final_preds, final_probs = self.eval_epoch()
+        print("\n" + "=" * 20 + " FINAL TASK B METRICS " + "=" * 20)
+        print(f"  Overall Accuracy:  {final_metrics.get('hs_acc', 0.0):.4f}")
+        print(f"  Macro-F1:          {final_metrics.get('hs_macro_f1', 0.0):.4f}")
+        print(f"  F1 (No Hate):      {final_metrics.get('hs_f1_no', 0.0):.4f}")
+        print(f"  F1 (Implicit):     {final_metrics.get('hs_f1_implicit', 0.0):.4f}")
+        print(f"  F1 (Explicit):     {final_metrics.get('hs_f1_explicit', 0.0):.4f}")
+        print("=" * 62)
+
+        if self.config.save_predictions:
+            pred_df = pd.DataFrame({
+                'pred_class': final_preds,
+                'prob_no': final_probs[:, 0],
+                'prob_implicit': final_probs[:, 1],
+                'prob_explicit': final_probs[:, 2]
+            })
+            pred_csv = os.path.join(self.config.output_dir, "task_b_val_predictions.csv")
+            pred_df.to_csv(pred_csv, index=False)
+            print(f"\nPredictions saved to: {pred_csv}")
 
         return {
-            'checkpoint_path': best_final,
+            'best_macro_f1': self.best_macro_f1,
             'final_metrics': final_metrics,
-            'history': self.history
+            'checkpoint_path': self.best_checkpoint_path
         }

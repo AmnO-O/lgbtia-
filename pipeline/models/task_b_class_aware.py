@@ -38,7 +38,6 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # RMSNorm(x) = (x / sqrt(mean(x^2) + eps)) * weight
         variance = x.pow(2).mean(-1, keepdim=True)
         x_normed = x * torch.rsqrt(variance + self.eps)
         return self.weight * x_normed
@@ -53,14 +52,13 @@ class TaskBClassAwareAttentionModel(nn.Module):
          Normalizes inputs *before* Attention and Interaction sub-layers (x + Sublayer(Norm(x))).
          This provides an unobstructed residual highway, preventing gradient vanishing or exploding
          during backbone fine-tuning.
-      2. RMSNorm vs LayerNorm:
-         Uses RMSNorm by default for tighter gradient variance bounds and faster GPU computation.
-      3. PyTorch SDPA / FlashAttention Enablement:
-         `need_weights=return_attention_map` allows PyTorch to execute fast FlashAttention kernels.
-      4. Dual-Stream Aspect Pooling [Mean || Max] with LayerNorm Projection:
+      2. Multi-Sample Dropout (MSD) Classification Head:
+         Applies multiple parallel stochastic dropout masks to pooled features to reduce variance,
+         accelerate convergence, and prevent overfitting on surface keywords.
+      3. Dual-Stream Aspect Pooling [Mean || Max] with LayerNorm Projection:
          Preserves peak diagnostic trigger signals (Max) while maintaining smooth gradient flow (Mean),
          projecting [B, 2*d_model] -> [B, d_model] cleanly per class.
-      5. Task C Gradient Isolation (`detach_bridge=True`).
+      4. Task C Gradient Isolation (`detach_bridge=True`).
     """
     def __init__(
         self,
@@ -74,6 +72,8 @@ class TaskBClassAwareAttentionModel(nn.Module):
         num_queries_per_class: Optional[int] = None,
         pooling_mode: str = "cat_mean_max", # 'cat_mean_max', 'attention', 'mean', or 'max'
         use_rmsnorm: bool = True,           # Toggle RMSNorm vs standard LayerNorm
+        use_msd: bool = True,               # Enable Multi-Sample Dropout
+        msd_dropout_rates: Optional[List[float]] = None
     ):
         super(TaskBClassAwareAttentionModel, self).__init__()
         self.mmbert = mmbert_model
@@ -82,6 +82,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
         self.use_query_interaction = use_query_interaction
         self.pooling_mode = pooling_mode
         self.use_rmsnorm = use_rmsnorm
+        self.use_msd = use_msd
         hidden_dim = hidden_dim or d_model // 2
 
         NormClass = RMSNorm if use_rmsnorm else nn.LayerNorm
@@ -178,17 +179,22 @@ class TaskBClassAwareAttentionModel(nn.Module):
             ])
 
         # ---------------------------------------------------------------------
-        # LAYER 3: Joint Comparative Classification Head
+        # LAYER 3: Joint Comparative Classification Head with Multi-Sample Dropout (MSD)
         # ---------------------------------------------------------------------
         self.norm_head_in = NormClass(NUM_CLASSES * d_model)
-        self.classifier = nn.Sequential(
-            self.norm_head_in,
+        self.dense_intermediate = nn.Sequential(
             nn.Linear(NUM_CLASSES * d_model, hidden_dim),
             NormClass(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, NUM_CLASSES)
+            nn.GELU()
         )
+        
+        rates = msd_dropout_rates or [0.10, 0.15, 0.20, 0.25, 0.30]
+        if self.use_msd:
+            self.msd_dropouts = nn.ModuleList([nn.Dropout(p) for p in rates])
+        else:
+            self.msd_dropouts = nn.ModuleList([nn.Dropout(dropout)])
+            
+        self.out_proj = nn.Linear(hidden_dim, NUM_CLASSES)
 
     def init_queries_from_text(self, tokenizer: Any, lang: str = "en", device: Optional[torch.device] = None):
         """
@@ -271,8 +277,9 @@ class TaskBClassAwareAttentionModel(nn.Module):
         attention_mask: torch.Tensor,
         role_ids: torch.Tensor,
         return_attention_map: bool = False,
-        detach_bridge: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        detach_bridge: bool = False,
+        return_all_msd_logits: bool = False
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], Tuple[List[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]]:
         """
         Args:
             input_ids: [B, S]
@@ -280,8 +287,9 @@ class TaskBClassAwareAttentionModel(nn.Module):
             role_ids: [B, S]
             return_attention_map: Whether to compute & return the attention map [B, K, S]
             detach_bridge: Whether to detach h_B gradient to prevent Task C backward interference
+            return_all_msd_logits: If True during training, returns list of logits from each MSD branch
         Returns:
-            logits: [B, 3] (Classification scores for [no, yes_implicit, yes_explicit])
+            logits: [B, 3] (or list of [B, 3] if return_all_msd_logits=True)
             h_B: [B, d_model] (Hate-Type-Aware Representation for Task C bridge)
             attn_weights: [B, K, S] if return_attention_map else None
         """
@@ -359,10 +367,23 @@ class TaskBClassAwareAttentionModel(nn.Module):
         z_classes = self.pool_class_queries(z_prime) # [B, 3, d_model]
 
         # ---------------------------------------------------------------------
-        # LAYER 3: Joint Comparative Classification Head
+        # LAYER 3: Joint Classification Head with Multi-Sample Dropout (MSD)
         # ---------------------------------------------------------------------
         z_flat = z_classes.reshape(B, NUM_CLASSES * self.d_model) # [B, 3 * d_model]
-        s = self.classifier(z_flat)                              # [B, 3]
+        h_dense = self.dense_intermediate(self.norm_head_in(z_flat)) # [B, hidden_dim]
+
+        if self.training and return_all_msd_logits:
+            msd_logits = [self.out_proj(drop(h_dense)) for drop in self.msd_dropouts]
+            s = torch.mean(torch.stack(msd_logits, dim=0), dim=0) # [B, 3]
+            out_logits = msd_logits
+        elif self.training:
+            msd_logits = [self.out_proj(drop(h_dense)) for drop in self.msd_dropouts]
+            s = torch.mean(torch.stack(msd_logits, dim=0), dim=0) # [B, 3]
+            out_logits = s
+        else:
+            # Eval mode: zero dropout, direct projection
+            s = self.out_proj(h_dense) # [B, 3]
+            out_logits = s
 
         # ---------------------------------------------------------------------
         # TASK C BRIDGE: Hate-Type-Aware Representation h_B
@@ -373,4 +394,4 @@ class TaskBClassAwareAttentionModel(nn.Module):
         if detach_bridge:
             h_B = h_B.detach()
 
-        return s, h_B, attn_weights
+        return out_logits, h_B, attn_weights

@@ -34,6 +34,14 @@ class PipelineConfig:
     num_layers: int = 2
     dropout: float = 0.3
     
+    # Advanced Regularization & Adversarial Training
+    use_msd: bool = True                        # Multi-Sample Dropout in classification head
+    msd_num_samples: int = 5                    # Number of parallel dropout masks in MSD
+    msd_dropout_rates: List[float] = field(default_factory=lambda: [0.10, 0.15, 0.20, 0.25, 0.30])
+    use_fgm: bool = True                        # Fast Gradient Method (Adversarial Training on embeddings)
+    fgm_epsilon: float = 1.0                    # FGM perturbation scale epsilon
+    fgm_emb_name: str = "word_embeddings"       # Name substring of embedding layer to perturb
+    
     # Training hyperparameters
     batch_size: int = 32
     learning_rate: float = 1e-4
