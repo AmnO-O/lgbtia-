@@ -83,6 +83,39 @@ class FocalLoss(nn.Module):
         return focal_loss
 
 
+def build_loss_fn(
+    loss_type: str = "focal",
+    class_weights: Optional[List[float]] = None,
+    gamma: float = 2.0,
+    label_smoothing: float = 0.05,
+    device: Optional[torch.device] = None
+) -> nn.Module:
+    """
+    Factory builder for Task B loss functions (Focal Loss or CrossEntropyLoss).
+    """
+    if loss_type == "focal":
+        alpha = None
+        if class_weights is not None:
+            alpha = torch.tensor(class_weights, dtype=torch.float32)
+            if device is not None:
+                alpha = alpha.to(device)
+        return FocalLoss(
+            gamma=gamma,
+            alpha=alpha,
+            label_smoothing=label_smoothing
+        )
+    else:
+        weight_tensor = None
+        if class_weights is not None:
+            weight_tensor = torch.tensor(class_weights, dtype=torch.float32)
+            if device is not None:
+                weight_tensor = weight_tensor.to(device)
+        return nn.CrossEntropyLoss(
+            weight=weight_tensor,
+            label_smoothing=label_smoothing
+        )
+
+
 class MultiTaskLoss(nn.Module):
     """
     Weighted Multi-Task Loss for StereoQueer:
