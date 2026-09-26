@@ -342,6 +342,16 @@ class TaskBTrainer:
                   f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
                   f"Macro F1: {macro_f1:.4f} (No: {f1_no:.3f}, Imp: {f1_imp:.3f}, Exp: {f1_exp:.3f}) | {elapsed:.1f}s")
 
+            epoch_record = {
+                'epoch': epoch,
+                'phase': 1,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'time_s': elapsed,
+                **metrics
+            }
+            self.history.append(epoch_record)
+
             if macro_f1 > self.best_macro_f1:
                 self.best_macro_f1 = macro_f1
                 torch.save(self.model.state_dict(), self.best_checkpoint_path)
@@ -399,6 +409,16 @@ class TaskBTrainer:
                       f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
                       f"Macro F1: {macro_f1:.4f} (No: {f1_no:.3f}, Imp: {f1_imp:.3f}, Exp: {f1_exp:.3f}) | {elapsed:.1f}s")
 
+                epoch_record = {
+                    'epoch': epoch,
+                    'phase': 2,
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'time_s': elapsed,
+                    **metrics
+                }
+                self.history.append(epoch_record)
+
                 if macro_f1 > self.best_macro_f1:
                     self.best_macro_f1 = macro_f1
                     torch.save(self.model.state_dict(), self.best_checkpoint_path)
@@ -442,7 +462,8 @@ class TaskBTrainer:
         return {
             'best_macro_f1': self.best_macro_f1,
             'final_metrics': final_metrics,
-            'checkpoint_path': self.best_checkpoint_path
+            'checkpoint_path': self.best_checkpoint_path,
+            'history': self.history
         }
 
     def train(self) -> Dict[str, Any]:
