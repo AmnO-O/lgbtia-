@@ -184,6 +184,8 @@ class TaskBTrainer:
                 )
                 loss = self._compute_loss(logits, hs_labels)
 
+            is_unscaled = False
+
             if self.use_amp:
                 self.scaler.scale(loss).backward()
             else:
@@ -193,6 +195,7 @@ class TaskBTrainer:
             if apply_fgm and self.fgm is not None:
                 if self.use_amp:
                     self.scaler.unscale_(optimizer)
+                    is_unscaled = True
                 
                 self.fgm.attack() # Inject epsilon * grad into word embeddings
                 
@@ -215,7 +218,8 @@ class TaskBTrainer:
             # Step optimizer & scaler
             if self.use_amp:
                 if self.config.clip_grad_norm > 0:
-                    self.scaler.unscale_(optimizer)
+                    if not is_unscaled:
+                        self.scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.clip_grad_norm)
                 self.scaler.step(optimizer)
                 self.scaler.update()
@@ -365,8 +369,8 @@ class TaskBTrainer:
                 f1_exp = metrics.get('hs_f1_explicit', 0.0)
 
                 print(f"Epoch {epoch:02d}/{self.config.unfreeze_phase_epochs:02d} | "
-                      f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                      f"Macro F1: {macro_f1:.4f} (No: {f1_no:.3f}, Imp: {f1_imp:.3f}, Exp: {f1_exp:.3f}) | {elapsed:.1f}s")
+                  f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+                  f"Macro F1: {macro_f1:.4f} (No: {f1_no:.3f}, Imp: {f1_imp:.3f}, Exp: {f1_exp:.3f}) | {elapsed:.1f}s")
 
                 if macro_f1 > self.best_macro_f1:
                     self.best_macro_f1 = macro_f1
@@ -411,4 +415,3 @@ class TaskBTrainer:
     def train(self) -> Dict[str, Any]:
         """Standard entrypoint alias matching StereoQueerTrainer interface."""
         return self.train_pipeline()
-
