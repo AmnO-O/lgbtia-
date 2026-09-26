@@ -407,3 +407,8 @@ class TaskBTrainer:
             'final_metrics': final_metrics,
             'checkpoint_path': self.best_checkpoint_path
         }
+
+    def train(self) -> Dict[str, Any]:
+        """Standard entrypoint alias matching StereoQueerTrainer interface."""
+        return self.train_pipeline()
+
