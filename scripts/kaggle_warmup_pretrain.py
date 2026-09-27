@@ -163,8 +163,49 @@ data_collator = DataCollatorForLanguageModeling(
 )
 
 # ---------------------------------------------------------------------------
-# 3. TRAINING ARGUMENTS & MLM LOOP
+# 3. TRAINING ARGUMENTS & MLM LOOP WITH REAL-TIME LOSS LOGGING
 # ---------------------------------------------------------------------------
+import math
+import time
+from transformers import TrainerCallback
+
+class MLMLoggingCallback(TrainerCallback):
+    def __init__(self):
+        self.start_time = None
+        
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.start_time = time.time()
+        print("\n" + "="*82)
+        print(f"🚀 [MLM WARMUP TRAINING STARTED] Epochs: {args.num_train_epochs} | Total Steps: {state.max_steps}")
+        print("="*82)
+        print(f"{'Step':<11} | {'Epoch':<7} | {'MLM Loss':<10} | {'Perplexity':<12} | {'LR':<10} | {'GPU Mem':<9} | {'Elapsed':<8}")
+        print("-" * 82)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+        loss = logs.get("loss", None)
+        lr = logs.get("learning_rate", None)
+        epoch = logs.get("epoch", state.epoch if state else 0.0)
+        step = state.global_step
+        max_step = state.max_steps
+        
+        if loss is not None:
+            ppl = math.exp(min(loss, 20.0))
+            mem = f"{torch.cuda.memory_allocated()/1e9:.1f}GB" if torch.cuda.is_available() else "CPU"
+            elapsed = f"{time.time() - self.start_time:.0f}s" if self.start_time else "0s"
+            lr_str = f"{lr:.2e}" if lr is not None else "N/A"
+            print(f"[{step:04d}/{max_step:04d}] | {epoch:5.2f}  | {loss:8.4f}   | {ppl:10.2f}   | {lr_str:<10} | {mem:<9} | {elapsed:<8}")
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        print(f"✨ --- [EPOCH {int(state.epoch)} COMPLETE] ---")
+
+    def on_train_end(self, args, state, control, **kwargs):
+        total_time = (time.time() - self.start_time) if self.start_time else 0
+        print("="*82)
+        print(f"🎉 [WARMUP TRAINING FINISHED] Total Time: {total_time/60:.2f} mins")
+        print("="*82 + "\n")
+
 print("\n>>> [3/4] Configuring Trainer & Starting MLM Pretraining...")
 output_dir = "./mmbert-queer-hate-adapted"
 
@@ -179,10 +220,11 @@ training_args = TrainingArguments(
     lr_scheduler_type="cosine",
     fp16=torch.cuda.is_available(),
     gradient_checkpointing=True,
-    logging_steps=50,
+    logging_steps=10,             # Log every 10 steps for instant feedback
     save_strategy="epoch",
     save_total_limit=1,
     dataloader_num_workers=2,
+    disable_tqdm=False,
     report_to="none"
 )
 
@@ -191,6 +233,7 @@ trainer = Trainer(
     args=training_args,
     data_collator=data_collator,
     train_dataset=tokenized_ds,
+    callbacks=[MLMLoggingCallback()]
 )
 
 trainer.train()
