@@ -3,18 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any, List, Union
 
-from .task_b_questions import (
-    QueryProbe,
-    DEFAULT_TASK_B_PROBES,
-    get_default_probes,
-    get_queries_per_class,
-    CLASS_NO_HATE,
-    CLASS_IMPLICIT_HATE,
-    CLASS_EXPLICIT_HATE,
-    NUM_CLASSES,
-)
+CLASS_NO_HATE = 0
+CLASS_IMPLICIT_HATE = 1
+CLASS_EXPLICIT_HATE = 2
+NUM_CLASSES = 3
 
-# Role IDs for explicit role injection
+# Role IDs for structured YouTube context
 # 0: Pad / Special tokens
 # 1: Title (<T>...</T>)
 # 2: Description (<D>...</D>)
@@ -29,8 +23,7 @@ NUM_ROLES = 4
 class RMSNorm(nn.Module):
     """
     Root Mean Square Normalization (RMSNorm) - Zhang & Sennrich (2019).
-    Scales inputs by the root mean square of activation values, providing superior
-    gradient stabilization, faster CUDA execution, and strict invariance to activation scaling.
+    Scales inputs by the root mean square of activations for faster execution and stable gradients.
     """
     def __init__(self, dim: int, eps: float = 1e-6):
         super(RMSNorm, self).__init__()
@@ -45,20 +38,15 @@ class RMSNorm(nn.Module):
 
 class TaskBClassAwareAttentionModel(nn.Module):
     """
-    Enhanced Multi-Query Class-Aware Cross-Attention (MHCA) Architecture for Task B.
+    Pure Data-Driven Learnable Latent Query Cross-Attention Architecture for Task B.
     
-    Architectural Highlights:
-      1. Pre-LN / Pre-RMSNorm Residual Connections:
-         Normalizes inputs *before* Attention and Interaction sub-layers (x + Sublayer(Norm(x))).
-         This provides an unobstructed residual highway, preventing gradient vanishing or exploding
-         during backbone fine-tuning.
-      2. Multi-Sample Dropout (MSD) Classification Head:
-         Applies multiple parallel stochastic dropout masks to pooled features to reduce variance,
-         accelerate convergence, and prevent overfitting on surface keywords.
-      3. Dual-Stream Aspect Pooling [Mean || Max] with LayerNorm Projection:
-         Preserves peak diagnostic trigger signals (Max) while maintaining smooth gradient flow (Mean),
-         projecting [B, 2*d_model] -> [B, d_model] cleanly per class.
-      4. Task C Gradient Isolation (`detach_bridge=True`).
+    Architecture:
+      1. Role Embeddings: Distinguishes Comment from Video Title and Description context.
+      2. Learnable Latent Class Queries: Pure data-driven prototype tokens [No-Hate, Implicit, Explicit]
+         trained end-to-end via gradient descent without hardcoded string dependencies.
+      3. Cross-Attention: Latent class queries attend across the input sequence tokens.
+      4. Multi-Sample Dropout (MSD): 5 parallel dropout paths for stable, low-variance classification.
+      5. Task C Bridge: Hate-type-conditioned latent representation h_B for downstream target prediction.
     """
     def __init__(
         self,
@@ -66,56 +54,26 @@ class TaskBClassAwareAttentionModel(nn.Module):
         d_model: int = 768,
         num_heads: int = 8,
         dropout: float = 0.20,
-        use_query_interaction: bool = True,
+        num_slots_per_class: int = 1,
+        use_query_interaction: bool = False,
         hidden_dim: Optional[int] = None,
-        probes: Optional[List[QueryProbe]] = None,
-        num_queries_per_class: Optional[int] = None,
-        pooling_mode: str = "cat_mean_max", # 'cat_mean_max', 'attention', 'mean', or 'max'
-        use_rmsnorm: bool = True,           # Toggle RMSNorm vs standard LayerNorm
-        use_msd: bool = True,               # Enable Multi-Sample Dropout
-        msd_dropout_rates: Optional[List[float]] = None
+        use_rmsnorm: bool = True,
+        use_msd: bool = True,
+        msd_dropout_rates: Optional[List[float]] = None,
+        **kwargs
     ):
         super(TaskBClassAwareAttentionModel, self).__init__()
         self.mmbert = mmbert_model
         self.d_model = d_model
         self.num_heads = num_heads
+        self.num_slots_per_class = num_slots_per_class
+        self.total_queries = NUM_CLASSES * num_slots_per_class
         self.use_query_interaction = use_query_interaction
-        self.pooling_mode = pooling_mode
         self.use_rmsnorm = use_rmsnorm
         self.use_msd = use_msd
-        hidden_dim = hidden_dim or d_model // 2
+        hidden_dim = hidden_dim or (d_model // 2)
 
         NormClass = RMSNorm if use_rmsnorm else nn.LayerNorm
-
-        # ---------------------------------------------------------------------
-        # 1. Setup Query Probes & Mapping
-        # ---------------------------------------------------------------------
-        if probes is not None:
-            self.probes = list(probes)
-        elif num_queries_per_class is not None:
-            self.probes = []
-            for c_idx in range(NUM_CLASSES):
-                for q_i in range(num_queries_per_class):
-                    self.probes.append(QueryProbe(
-                        id=f"class_{c_idx}_slot_{q_i}",
-                        class_idx=c_idx,
-                        aspect=f"slot_{q_i}",
-                        question_vi="",
-                        question_en=""
-                    ))
-        else:
-            self.probes = get_default_probes()
-
-        self.num_queries = len(self.probes)
-        
-        self.class_to_query_indices: Dict[int, List[int]] = {0: [], 1: [], 2: []}
-        for idx, probe in enumerate(self.probes):
-            if probe.class_idx in self.class_to_query_indices:
-                self.class_to_query_indices[probe.class_idx].append(idx)
-
-        for c in range(NUM_CLASSES):
-            if len(self.class_to_query_indices[c]) == 0:
-                raise ValueError(f"Task B Class {c} has no query probes assigned! Ensure at least 1 probe per class.")
 
         # ---------------------------------------------------------------------
         # LAYER 0: Role Embeddings (Title vs Description vs Comment)
@@ -126,12 +84,11 @@ class TaskBClassAwareAttentionModel(nn.Module):
         self.dropout_input = nn.Dropout(dropout)
 
         # ---------------------------------------------------------------------
-        # LAYER 1: Multi-Query Cross-Attention (Pre-Norm MHCA)
+        # LAYER 1: Pure Learnable Class Queries & Cross-Attention (Pre-Norm MHCA)
         # ---------------------------------------------------------------------
-        self.query_embeddings = nn.Parameter(torch.empty(self.num_queries, d_model))
+        self.query_embeddings = nn.Parameter(torch.empty(self.total_queries, d_model))
         nn.init.normal_(self.query_embeddings, mean=0.0, std=0.02)
 
-        # Pre-Norm for Queries & Context
         self.norm_q_cross = NormClass(d_model)
         self.norm_kv_cross = NormClass(d_model)
 
@@ -143,10 +100,8 @@ class TaskBClassAwareAttentionModel(nn.Module):
         )
         self.dropout_cross = nn.Dropout(dropout)
 
-        # ---------------------------------------------------------------------
-        # LAYER 2: Inter-Query Interaction Layer (Pre-Norm MHSA)
-        # ---------------------------------------------------------------------
-        if self.use_query_interaction:
+        # Optional Inter-Query Interaction
+        if self.use_query_interaction and self.total_queries > 1:
             self.norm_self = NormClass(d_model)
             self.self_attention = nn.MultiheadAttention(
                 embed_dim=d_model,
@@ -157,119 +112,23 @@ class TaskBClassAwareAttentionModel(nn.Module):
             self.dropout_self = nn.Dropout(dropout)
 
         # ---------------------------------------------------------------------
-        # Aspect-to-Class Aggregation Layer
+        # LAYER 2: Classification Head with Multi-Sample Dropout (MSD)
         # ---------------------------------------------------------------------
-        if self.pooling_mode == "cat_mean_max":
-            # Per-class projection from 2*d_model -> d_model with normalization
-            self.query_proj_layers = nn.ModuleList([
-                nn.Sequential(
-                    nn.Linear(2 * d_model, d_model),
-                    NormClass(d_model),
-                    nn.GELU(),
-                    nn.Dropout(dropout)
-                ) for _ in range(NUM_CLASSES)
-            ])
-        elif self.pooling_mode == "attention":
-            self.query_att_scorers = nn.ModuleList([
-                nn.Sequential(
-                    nn.Linear(d_model, d_model // 4),
-                    nn.Tanh(),
-                    nn.Linear(d_model // 4, 1)
-                ) for _ in range(NUM_CLASSES)
-            ])
-
-        # ---------------------------------------------------------------------
-        # LAYER 3: Joint Comparative Classification Head with Multi-Sample Dropout (MSD)
-        # ---------------------------------------------------------------------
-        self.norm_head_in = NormClass(NUM_CLASSES * d_model)
+        feat_dim = self.total_queries * d_model
+        self.norm_head_in = NormClass(feat_dim)
         self.dense_intermediate = nn.Sequential(
-            nn.Linear(NUM_CLASSES * d_model, hidden_dim),
+            nn.Linear(feat_dim, hidden_dim),
             NormClass(hidden_dim),
             nn.GELU()
         )
-        
+
         rates = msd_dropout_rates or [0.10, 0.15, 0.20, 0.25, 0.30]
         if self.use_msd:
             self.msd_dropouts = nn.ModuleList([nn.Dropout(p) for p in rates])
         else:
             self.msd_dropouts = nn.ModuleList([nn.Dropout(dropout)])
-            
+
         self.out_proj = nn.Linear(hidden_dim, NUM_CLASSES)
-
-    def init_queries_from_text(self, tokenizer: Any, lang: str = "en", device: Optional[torch.device] = None):
-        """
-        Semantically initialize query_embeddings by encoding
-        the natural language question strings across English, Italian, Dutch, Persian, or Vietnamese.
-        Safely restores model training mode upon completion.
-        """
-        was_training = self.training
-        self.eval()
-        dev = device or self.query_embeddings.device
-        lang_key = lang.lower().strip()
-        
-        try:
-            with torch.no_grad():
-                for i, probe in enumerate(self.probes):
-                    # Select target language text with English fallback
-                    text = ""
-                    if lang_key == "it" and getattr(probe, "question_it", ""):
-                        text = probe.question_it
-                    elif lang_key == "nl" and getattr(probe, "question_nl", ""):
-                        text = probe.question_nl
-                    elif lang_key == "fa" and getattr(probe, "question_fa", ""):
-                        text = probe.question_fa
-                    elif lang_key == "vi" and getattr(probe, "question_vi", ""):
-                        text = probe.question_vi
-                    else:
-                        text = probe.question_en
-
-                    if not text.strip():
-                        continue
-                    tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=64)
-                    tokens = {k: v.to(dev) for k, v in tokens.items() if k in ('input_ids', 'attention_mask')}
-                    
-                    outputs = self.mmbert(**tokens)
-                    mask = tokens["attention_mask"].unsqueeze(-1)
-                    emb = (outputs.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-                    self.query_embeddings.data[i].copy_(emb.squeeze(0).to(self.query_embeddings.dtype))
-            print(f"[TaskBClassAwareAttentionModel] Initialized {self.num_queries} queries using mmBERT embeddings for language: [{lang_key.upper()}].")
-        finally:
-            self.train(was_training)
-
-    def pool_class_queries(self, z_queries: torch.Tensor) -> torch.Tensor:
-        """
-        Pools [B, K, d_model] query representations into [B, 3, d_model] class representations.
-        Uses dual-stream [Mean || Max] with non-linear projection and LayerNorm by default.
-        """
-        B, K, D = z_queries.shape
-        class_representations = []
-
-        for c in range(NUM_CLASSES):
-            indices = self.class_to_query_indices[c]
-            sub_z = z_queries[:, indices, :] # [B, num_sub_queries, d_model]
-
-            if len(indices) == 1:
-                class_representations.append(sub_z.squeeze(1))
-            elif self.pooling_mode == "cat_mean_max":
-                # Dual-stream: global density (mean) + peak diagnostic trigger (max)
-                mean_p = torch.mean(sub_z, dim=1)           # [B, d_model]
-                max_p, _ = torch.max(sub_z, dim=1)          # [B, d_model]
-                cat_p = torch.cat([mean_p, max_p], dim=-1)   # [B, 2 * d_model]
-                pooled_c = self.query_proj_layers[c](cat_p)  # [B, d_model]
-                class_representations.append(pooled_c)
-            elif self.pooling_mode == "attention":
-                scores = self.query_att_scorers[c](sub_z)       # [B, num_sub_queries, 1]
-                weights = F.softmax(scores, dim=1)              # [B, num_sub_queries, 1]
-                pooled_c = (weights * sub_z).sum(dim=1)         # [B, d_model]
-                class_representations.append(pooled_c)
-            elif self.pooling_mode == "max":
-                pooled_c, _ = torch.max(sub_z, dim=1)           # [B, d_model]
-                class_representations.append(pooled_c)
-            else: # 'mean'
-                pooled_c = torch.mean(sub_z, dim=1)             # [B, d_model]
-                class_representations.append(pooled_c)
-
-        return torch.stack(class_representations, dim=1)
 
     def forward(
         self,
@@ -286,18 +145,12 @@ class TaskBClassAwareAttentionModel(nn.Module):
             attention_mask: [B, S]
             role_ids: [B, S]
             return_attention_map: Whether to compute & return the attention map [B, K, S]
-            detach_bridge: Whether to detach h_B gradient to prevent Task C backward interference
+            detach_bridge: Whether to detach h_B gradient for Task C pipeline
             return_all_msd_logits: If True during training, returns list of logits from each MSD branch
-        Returns:
-            logits: [B, 3] (or list of [B, 3] if return_all_msd_logits=True)
-            h_B: [B, d_model] (Hate-Type-Aware Representation for Task C bridge)
-            attn_weights: [B, K, S] if return_attention_map else None
         """
         B, S = input_ids.shape
 
-        # ---------------------------------------------------------------------
-        # LAYER 0: Encoder & Role Injection
-        # ---------------------------------------------------------------------
+        # 1. Backbone + Role Injection
         backbone_trainable = any(p.requires_grad for p in self.mmbert.parameters())
         with torch.set_grad_enabled(backbone_trainable):
             h_mmbert = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
@@ -305,21 +158,16 @@ class TaskBClassAwareAttentionModel(nn.Module):
         e_role = self.role_embeddings(role_ids)
         if e_role.dtype != h_mmbert.dtype:
             e_role = e_role.to(h_mmbert.dtype)
-            
+
         h_final = self.norm_input(h_mmbert + e_role)
         h_final = self.dropout_input(h_final) # [B, S, d_model]
 
-        # ---------------------------------------------------------------------
-        # LAYER 1: Multi-Query Cross-Attention (Pre-Norm Architecture)
-        # Residual Highway: z = q + CrossAttn(Norm(q), Norm(h_final), Norm(h_final))
-        # ---------------------------------------------------------------------
-        q_raw = self.query_embeddings.unsqueeze(0).expand(B, -1, -1) # [B, K, d_model]
+        # 2. Cross-Attention with Learnable Class Queries
+        q_raw = self.query_embeddings.unsqueeze(0).expand(B, -1, -1) # [B, total_queries, d_model]
         if q_raw.dtype != h_final.dtype:
             q_raw = q_raw.to(h_final.dtype)
-            
-        key_padding_mask = (attention_mask == 0)
 
-        # Pre-normalization on query and context inputs
+        key_padding_mask = (attention_mask == 0)
         q_normed = self.norm_q_cross(q_raw)
         kv_normed = self.norm_kv_cross(h_final)
 
@@ -330,7 +178,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
                 value=kv_normed,
                 key_padding_mask=key_padding_mask,
                 need_weights=True,
-                average_attn_weights=True # [B, K, S]
+                average_attn_weights=True # [B, total_queries, S]
             )
         else:
             z_attn, _ = self.cross_attention(
@@ -342,14 +190,10 @@ class TaskBClassAwareAttentionModel(nn.Module):
             )
             attn_weights = None
 
-        # Clean Pre-LN residual addition
-        z = q_raw + self.dropout_cross(z_attn) # [B, K, d_model]
+        z = q_raw + self.dropout_cross(z_attn) # [B, total_queries, d_model]
 
-        # ---------------------------------------------------------------------
-        # LAYER 2: Inter-Query Interaction Layer (Pre-Norm MHSA)
-        # Residual Highway: z' = z + SelfAttn(Norm(z))
-        # ---------------------------------------------------------------------
-        if self.use_query_interaction:
+        # Optional query self-interaction
+        if self.use_query_interaction and self.total_queries > 1:
             z_normed = self.norm_self(z)
             z_self, _ = self.self_attention(
                 query=z_normed,
@@ -357,37 +201,31 @@ class TaskBClassAwareAttentionModel(nn.Module):
                 value=z_normed,
                 need_weights=False
             )
-            z_prime = z + self.dropout_self(z_self) # [B, K, d_model]
-        else:
-            z_prime = z # [B, K, d_model]
+            z = z + self.dropout_self(z_self)
 
-        # ---------------------------------------------------------------------
-        # Query-to-Class Aggregation: [B, K, d_model] -> [B, 3, d_model]
-        # ---------------------------------------------------------------------
-        z_classes = self.pool_class_queries(z_prime) # [B, 3, d_model]
-
-        # ---------------------------------------------------------------------
-        # LAYER 3: Joint Classification Head with Multi-Sample Dropout (MSD)
-        # ---------------------------------------------------------------------
-        z_flat = z_classes.reshape(B, NUM_CLASSES * self.d_model) # [B, 3 * d_model]
+        # 3. Multi-Sample Dropout (MSD) Classification Head
+        z_flat = z.reshape(B, self.total_queries * self.d_model) # [B, feat_dim]
         h_dense = self.dense_intermediate(self.norm_head_in(z_flat)) # [B, hidden_dim]
 
         if self.training and return_all_msd_logits:
             msd_logits = [self.out_proj(drop(h_dense)) for drop in self.msd_dropouts]
-            s = torch.mean(torch.stack(msd_logits, dim=0), dim=0) # [B, 3]
+            s = torch.mean(torch.stack(msd_logits, dim=0), dim=0)
             out_logits = msd_logits
         elif self.training:
             msd_logits = [self.out_proj(drop(h_dense)) for drop in self.msd_dropouts]
-            s = torch.mean(torch.stack(msd_logits, dim=0), dim=0) # [B, 3]
+            s = torch.mean(torch.stack(msd_logits, dim=0), dim=0)
             out_logits = s
         else:
-            # Eval mode: zero dropout, direct projection
-            s = self.out_proj(h_dense) # [B, 3]
+            s = self.out_proj(h_dense)
             out_logits = s
 
-        # ---------------------------------------------------------------------
-        # TASK C BRIDGE: Hate-Type-Aware Representation h_B
-        # ---------------------------------------------------------------------
+        # 4. Task C Bridge Representation h_B
+        # If 1 slot per class: z is [B, 3, d_model]
+        if self.num_slots_per_class == 1:
+            z_classes = z
+        else:
+            z_classes = z.view(B, NUM_CLASSES, self.num_slots_per_class, self.d_model).mean(dim=2)
+
         probs = F.softmax(s, dim=-1).unsqueeze(-1) # [B, 3, 1]
         h_B = (probs * z_classes).sum(dim=1)       # [B, d_model]
 
