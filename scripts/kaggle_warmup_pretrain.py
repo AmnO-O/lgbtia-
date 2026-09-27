@@ -8,6 +8,10 @@ Output: Hugging Face Model Hub
 """
 
 import os
+# Force single GPU to prevent ModernBERT DataParallel StopIteration bug
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import torch
 import pandas as pd
 import numpy as np
