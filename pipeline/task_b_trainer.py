@@ -11,6 +11,10 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+try:
+    import torch._dynamo
+except ImportError:
+    torch._dynamo = None
 from torch.utils.data import DataLoader
 from typing import Dict, Any, Optional, Tuple, List, Union
 
@@ -376,12 +380,12 @@ class TaskBTrainer:
                 torch.cuda.empty_cache()
                 gc.collect()
 
-            try:
-                import torch._dynamo
-                torch._dynamo.reset()
-                torch._dynamo.config.suppress_errors = True
-            except Exception:
-                pass
+            if torch._dynamo is not None:
+                try:
+                    torch._dynamo.reset()
+                    torch._dynamo.config.suppress_errors = True
+                except Exception:
+                    pass
 
             # Selectively unfreeze only the configured number of top encoder layers
             unfreeze_layers = getattr(self.config, 'unfreeze_layers', 3)
