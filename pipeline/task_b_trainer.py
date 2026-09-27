@@ -329,6 +329,7 @@ class TaskBTrainer:
 
         opt_p1 = self.build_optimizer(lr=self.config.learning_rate)
         sched_p1 = self.build_scheduler(opt_p1, self.config.freeze_phase_epochs)
+        patience_counter_p1 = 0
         
         # In phase 1, FGM is inactive on frozen backbone embeddings
         for epoch in range(1, self.config.freeze_phase_epochs + 1):
@@ -359,7 +360,13 @@ class TaskBTrainer:
             if macro_f1 > self.best_macro_f1:
                 self.best_macro_f1 = macro_f1
                 torch.save(self.model.state_dict(), self.best_checkpoint_path)
+                patience_counter_p1 = 0
                 print(f"  --> Saved Best Checkpoint (Macro-F1: {macro_f1:.4f}): {self.best_checkpoint_path}")
+            else:
+                patience_counter_p1 += 1
+                if patience_counter_p1 >= getattr(self.config, 'patience', 5):
+                    print(f"  🛑 Early stopping triggered in Phase 1 (no improvement for {patience_counter_p1} epochs). Moving to Phase 2.")
+                    break
 
         # -----------------------------------------------------------------
         # PHASE 2: Unfreeze Backbone Top N Layers + FGM Adversarial Training
@@ -404,6 +411,8 @@ class TaskBTrainer:
             sched_p2 = self.build_scheduler(opt_p2, self.config.unfreeze_phase_epochs)
 
             use_fgm_p2 = getattr(self.config, 'use_fgm', True)
+            patience_p2 = getattr(self.config, 'patience', 5)
+            patience_counter_p2 = 0
 
             for epoch in range(1, self.config.unfreeze_phase_epochs + 1):
                 t0 = time.time()
@@ -432,8 +441,14 @@ class TaskBTrainer:
 
                 if macro_f1 > self.best_macro_f1:
                     self.best_macro_f1 = macro_f1
+                    patience_counter_p2 = 0
                     torch.save(self.model.state_dict(), self.best_checkpoint_path)
                     print(f"  --> Saved Best Checkpoint (Macro-F1: {macro_f1:.4f}): {self.best_checkpoint_path}")
+                else:
+                    patience_counter_p2 += 1
+                    if patience_counter_p2 >= patience_p2:
+                        print(f"  🛑 Early stopping triggered in Phase 2 (no improvement for {patience_counter_p2} epochs). Stopping training.")
+                        break
 
         # Final Evaluation on Best Model
         if os.path.exists(self.best_checkpoint_path):
