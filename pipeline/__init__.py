@@ -30,6 +30,12 @@ from .models.task_b_class_aware import (
     ROLE_COMMENT,
     NUM_ROLES,
 )
+from .models.task_b_questions import (
+    QueryProbe,
+    DEFAULT_TASK_B_PROBES,
+    get_default_probes,
+    get_probes_for_language,
+)
 from .losses import MultiTaskLoss, FocalLoss, build_loss_fn
 from .metrics import evaluate_stereoqueer, print_metrics, compute_classification_metrics
 from .trainer import StereoQueerTrainer
@@ -63,6 +69,10 @@ __all__ = [
     "ROLE_DESC",
     "ROLE_COMMENT",
     "NUM_ROLES",
+    "QueryProbe",
+    "DEFAULT_TASK_B_PROBES",
+    "get_default_probes",
+    "get_probes_for_language",
     "DataPipeline",
     "safe_clean",
     "encode_target",

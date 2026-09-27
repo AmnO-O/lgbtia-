@@ -233,3 +233,11 @@ class TaskBClassAwareAttentionModel(nn.Module):
             h_B = h_B.detach()
 
         return out_logits, h_B, attn_weights
+
+    @property
+    def num_queries(self) -> int:
+        return self.total_queries
+
+    def init_queries_from_text(self, tokenizer=None, device=None) -> None:
+        """Compatibility helper - weights are learned end-to-end via gradient descent."""
+        pass
