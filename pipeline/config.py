@@ -21,7 +21,7 @@ class PipelineConfig:
     model_type: str = "mmbert_transformer"      # 'mmbert_transformer', 'feature_mlp', 'transformer', 'bilstm', 'rnn'
     
     # Pretrained Transformer settings
-    mmbert_model_name: str = "jhu-clsp/mmbert-base"
+    mmbert_model_name: str = "AmnO-O/mmbert-queer-hate-adapted"  # Domain-adapted mmBERT (fallback: "jhu-clsp/mmbert-base")
     mmbert_dim: int = 768
     max_length: int = 256
     use_query_interaction: bool = True          # Layer 2 MHSA Ablation Hypothesis H2
