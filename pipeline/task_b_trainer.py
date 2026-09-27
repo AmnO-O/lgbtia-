@@ -371,10 +371,17 @@ class TaskBTrainer:
             # Enable gradient checkpointing to keep VRAM usage minimal
             self.enable_gradient_checkpointing()
 
-            # Clean cache before unfreezing
+            # Clean cache and reset TorchDynamo compilation guards before unfreezing
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 gc.collect()
+
+            try:
+                import torch._dynamo
+                torch._dynamo.reset()
+                torch._dynamo.config.suppress_errors = True
+            except Exception:
+                pass
 
             # Selectively unfreeze only the configured number of top encoder layers
             unfreeze_layers = getattr(self.config, 'unfreeze_layers', 3)

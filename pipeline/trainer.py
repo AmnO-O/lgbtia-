@@ -227,6 +227,13 @@ class StereoQueerTrainer:
             print(f"\n>>> Loading Best Phase 1 Checkpoint: {best_p1}")
             self.model.load_state_dict(torch.load(best_p1, map_location=self.device))
 
+            try:
+                import torch._dynamo
+                torch._dynamo.reset()
+                torch._dynamo.config.suppress_errors = True
+            except Exception:
+                pass
+
             n_unfrozen = unfreeze_last_n(self.model.mmbert, self.config.unfreeze_layers)
             print(f">>> PHASE 2/2: Fine-Tuning Last {self.config.unfreeze_layers} Encoder Blocks (Found {n_unfrozen})")
 
