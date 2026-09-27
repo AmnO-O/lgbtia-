@@ -32,10 +32,12 @@ OUTPUT_REPO_NAME = "your-username/mmbert-queer-hate-adapted"  # Change to your H
 HF_WRITE_TOKEN = "hf_..."  # Set your Hugging Face write token
 
 EPOCHS = 4
-BATCH_SIZE = 32
-MAX_LENGTH = 256
-LEARNING_RATE = 4e-5
+BATCH_SIZE = 16            # Reduced to prevent OOM
+GRAD_ACCUM_STEPS = 2       # Effective batch size = 16 * 2 = 32
+MAX_LENGTH = 128           # Optimal for comments & short context
+LEARNING_RATE = 5e-5
 MLM_PROBABILITY = 0.15
+UNFREEZE_TOP_N_LAYERS = 6  # Train only top 6 layers + MLM head
 
 # Authenticate if token provided
 if HF_WRITE_TOKEN.startswith("hf_"):
@@ -115,6 +117,27 @@ print(f"\n>>> [2/4] Tokenizing with {MODEL_NAME} tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 model = AutoModelForMaskedLM.from_pretrained(MODEL_NAME)
 
+# Freeze lower layers for memory efficiency & multilingual stability
+if UNFREEZE_TOP_N_LAYERS is not None:
+    for param in model.parameters():
+        param.requires_grad = False
+    for head_attr in ['head', 'lm_head', 'cls']:
+        if hasattr(model, head_attr):
+            for p in getattr(model, head_attr).parameters():
+                p.requires_grad = True
+    encoder = getattr(model, 'model', getattr(model, 'modernbert', model))
+    layers = getattr(encoder, 'layers', None)
+    if layers is not None:
+        total_l = len(layers)
+        for layer in layers[max(0, total_l - UNFREEZE_TOP_N_LAYERS):]:
+            for p in layer.parameters():
+                p.requires_grad = True
+        print(f"❄️ Froze {total_l - UNFREEZE_TOP_N_LAYERS} bottom layers. 🔥 Training top {UNFREEZE_TOP_N_LAYERS} layers + MLM Head.")
+
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Trainable Parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.1f}%)")
+
 raw_ds = Dataset.from_dict({"text": collected_texts})
 
 def tokenize_function(examples):
@@ -149,11 +172,13 @@ training_args = TrainingArguments(
     output_dir=output_dir,
     num_train_epochs=EPOCHS,
     per_device_train_batch_size=BATCH_SIZE,
+    gradient_accumulation_steps=GRAD_ACCUM_STEPS,
     learning_rate=LEARNING_RATE,
     weight_decay=0.01,
     warmup_ratio=0.1,
     lr_scheduler_type="cosine",
     fp16=torch.cuda.is_available(),
+    gradient_checkpointing=True,
     logging_steps=50,
     save_strategy="epoch",
     save_total_limit=1,
