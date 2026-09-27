@@ -17,8 +17,19 @@ from .augmentation import (
     augment_multilingual_dataframe,
     augment_task_b_dataframe,
 )
-from .models.task_b_questions import QueryProbe, DEFAULT_TASK_B_PROBES, get_default_probes, get_probes_for_language
-from .models.task_b_class_aware import TaskBClassAwareAttentionModel, RMSNorm
+from .models.task_b_class_aware import (
+    TaskBClassAwareAttentionModel,
+    RMSNorm,
+    CLASS_NO_HATE,
+    CLASS_IMPLICIT_HATE,
+    CLASS_EXPLICIT_HATE,
+    NUM_CLASSES,
+    ROLE_PAD,
+    ROLE_TITLE,
+    ROLE_DESC,
+    ROLE_COMMENT,
+    NUM_ROLES,
+)
 from .losses import MultiTaskLoss, FocalLoss, build_loss_fn
 from .metrics import evaluate_stereoqueer, print_metrics, compute_classification_metrics
 from .trainer import StereoQueerTrainer
@@ -41,12 +52,17 @@ __all__ = [
     "BackTranslationAugmenter",
     "augment_multilingual_dataframe",
     "augment_task_b_dataframe",
-    "QueryProbe",
-    "DEFAULT_TASK_B_PROBES",
-    "get_default_probes",
-    "get_probes_for_language",
     "RMSNorm",
     "TaskBClassAwareAttentionModel",
+    "CLASS_NO_HATE",
+    "CLASS_IMPLICIT_HATE",
+    "CLASS_EXPLICIT_HATE",
+    "NUM_CLASSES",
+    "ROLE_PAD",
+    "ROLE_TITLE",
+    "ROLE_DESC",
+    "ROLE_COMMENT",
+    "NUM_ROLES",
     "DataPipeline",
     "safe_clean",
     "encode_target",
