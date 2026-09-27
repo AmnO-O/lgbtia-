@@ -24,7 +24,9 @@ class PipelineConfig:
     mmbert_model_name: str = "AmnO-O/mmbert-queer-hate-adapted"  # Domain-adapted mmBERT (fallback: "jhu-clsp/mmbert-base")
     mmbert_dim: int = 768
     max_length: int = 256
-    use_query_interaction: bool = True          # Layer 2 MHSA Ablation Hypothesis H2
+    num_slots_per_class: int = 1                # Number of learnable query vectors per class (e.g. 1 -> 3 total, 2 -> 6 total)
+    use_query_interaction: bool = False         # Layer 2 Query-to-Query Self-Attention
+    use_rmsnorm: bool = True                    # Use RMSNorm over LayerNorm for stability & speed
     
     # Scratch model parameters
     vocab_size: int = 30000
