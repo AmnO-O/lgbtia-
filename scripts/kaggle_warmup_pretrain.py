@@ -143,7 +143,6 @@ output_dir = "./mmbert-queer-hate-adapted"
 
 training_args = TrainingArguments(
     output_dir=output_dir,
-    overwrite_output_dir=True,
     num_train_epochs=EPOCHS,
     per_device_train_batch_size=BATCH_SIZE,
     learning_rate=LEARNING_RATE,
