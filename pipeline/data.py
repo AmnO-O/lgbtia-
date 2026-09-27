@@ -177,7 +177,13 @@ class DataPipeline:
             match = re.search(r'_([A-Z]{2})_training\.tsv$', path)
             lang = match.group(1) if match else "EN"
             # Note: quoting=1 is critical as comments/titles contain embedded newlines
-            df = pd.read_csv(path, sep='\t', quoting=1)
+            try:
+                df = pd.read_csv(path, sep='\t', quoting=1, on_bad_lines='skip')
+            except Exception:
+                try:
+                    df = pd.read_csv(path, sep=None, engine='python', on_bad_lines='skip')
+                except Exception:
+                    df = pd.read_csv(path, on_bad_lines='skip')
             df['lang'] = lang
             dfs.append(df)
 
