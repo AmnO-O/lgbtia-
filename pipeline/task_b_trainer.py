@@ -255,34 +255,41 @@ class TaskBTrainer:
     @torch.no_grad()
     def eval_epoch(self) -> Tuple[float, Dict[str, float], np.ndarray, np.ndarray]:
         self.model.eval()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         total_loss = 0.0
         all_preds = []
         all_labels = []
         all_probs = []
 
-        for batch in self.val_loader:
-            input_ids, attention_mask, role_ids, _, hs_labels, _ = batch
-            input_ids = input_ids.to(self.device, non_blocking=True)
-            attention_mask = attention_mask.to(self.device, non_blocking=True)
-            role_ids = role_ids.to(self.device, non_blocking=True)
-            hs_labels = hs_labels.to(self.device, non_blocking=True)
+        with torch.inference_mode():
+            for batch in self.val_loader:
+                input_ids, attention_mask, role_ids, _, hs_labels, _ = batch
+                input_ids = input_ids.to(self.device, non_blocking=True)
+                attention_mask = attention_mask.to(self.device, non_blocking=True)
+                role_ids = role_ids.to(self.device, non_blocking=True)
+                hs_labels = hs_labels.to(self.device, non_blocking=True)
 
-            with torch.amp.autocast(self.device_type, enabled=self.use_amp):
-                logits, _, _ = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    role_ids=role_ids,
-                    return_all_msd_logits=False
-                )
-                loss = self.criterion(logits, hs_labels)
+                with torch.amp.autocast(self.device_type, enabled=self.use_amp):
+                    logits, _, _ = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        role_ids=role_ids,
+                        return_all_msd_logits=False
+                    )
+                    loss = self.criterion(logits, hs_labels)
 
-            total_loss += loss.item()
-            probs = F.softmax(logits, dim=-1)
-            preds = torch.argmax(probs, dim=-1)
+                total_loss += loss.item()
+                probs = F.softmax(logits, dim=-1)
+                preds = torch.argmax(probs, dim=-1)
 
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(hs_labels.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(hs_labels.cpu().numpy())
+                all_probs.extend(probs.cpu().numpy())
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         avg_loss = total_loss / max(len(self.val_loader), 1)
         y_true = np.array(all_labels)
@@ -410,7 +417,7 @@ class TaskBTrainer:
             )
             sched_p2 = self.build_scheduler(opt_p2, self.config.unfreeze_phase_epochs)
 
-            use_fgm_p2 = getattr(self.config, 'use_fgm', True)
+            use_fgm_p2 = getattr(self.config, 'use_fgm', False)
             patience_p2 = getattr(self.config, 'patience', 5)
             patience_counter_p2 = 0
 

@@ -151,7 +151,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
         B, S = input_ids.shape
 
         # 1. Backbone + Role Injection
-        backbone_trainable = any(p.requires_grad for p in self.mmbert.parameters())
+        backbone_trainable = self.training and any(p.requires_grad for p in self.mmbert.parameters())
         with torch.set_grad_enabled(backbone_trainable):
             h_mmbert = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
 
