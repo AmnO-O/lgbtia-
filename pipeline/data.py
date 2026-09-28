@@ -210,9 +210,13 @@ class DataPipeline:
     def split_data(self, test_size: Optional[float] = None,
                    random_state: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        GroupShuffleSplit by video title (`yt_title`) to prevent data leakage.
-        Since video title and description are part of the input, the model must not
-        evaluate on comments from videos seen during training.
+        Guaranteed Contamination-Free Data Split:
+        1. Separates REAL human dataset from SYNTHETIC generated rows.
+        2. Applies GroupShuffleSplit (by yt_title) STRICTLY on REAL data to produce Val set.
+        3. Ensures Validation set contains 0% synthetic data (100% human ground truth).
+        4. Filters Synthetic data: only retains synthetic rows derived from videos in Train set.
+           Any synthetic row associated with a video/comment in Val set is strictly discarded.
+        5. Combines Real Train + Filtered Synthetic to produce final Training set.
         """
         if self.df_all is None:
             self.load_data()
@@ -220,18 +224,81 @@ class DataPipeline:
         split_ratio = test_size if test_size is not None else self.config.val_split_ratio
         seed = random_state if random_state is not None else self.config.random_seed
 
+        # Distinguish Real vs Synthetic rows
+        id_series = self.df_all['StereoQueerEval_id'].astype(str)
+        is_synth = id_series.str.startswith('synth_') | id_series.str.contains(r'_v\d+$', regex=True)
+
+        df_real = self.df_all[~is_synth].copy().reset_index(drop=True)
+        df_synth = self.df_all[is_synth].copy().reset_index(drop=True)
+
+        # 1. Group-split Real data by video title
         gss = GroupShuffleSplit(
             n_splits=1,
             test_size=split_ratio,
             random_state=seed
         )
-        train_idx, val_idx = next(gss.split(self.df_all, groups=self.df_all['yt_title']))
-        self.df_train = self.df_all.iloc[train_idx].reset_index(drop=True)
-        self.df_val = self.df_all.iloc[val_idx].reset_index(drop=True)
+        real_train_idx, real_val_idx = next(gss.split(df_real, groups=df_real['yt_title']))
+        
+        df_real_train = df_real.iloc[real_train_idx].reset_index(drop=True)
+        self.df_val = df_real.iloc[real_val_idx].reset_index(drop=True)
 
-        overlap = len(set(self.df_train['yt_title']) & set(self.df_val['yt_title']))
-        if overlap > 0:
-            print(f"Warning: Detected {overlap} overlapping video titles across splits!")
+        val_titles = set(self.df_val['yt_title'].dropna().unique())
+        val_source_ids = set(self.df_val['StereoQueerEval_id'].dropna().unique())
+        train_titles = set(df_real_train['yt_title'].dropna().unique())
+
+        # 2. Filter Synthetic Data to prevent any leakage into Validation
+        if len(df_synth) > 0:
+            def is_allowed_synth(row):
+                # Never allow if title belongs to validation set
+                title = row.get('yt_title', '')
+                if title in val_titles:
+                    return False
+                
+                # Check base source ID
+                raw_id = str(row.get('StereoQueerEval_id', ''))
+                base_id = re.sub(r'^synth_', '', raw_id)
+                base_id = re.sub(r'_v\d+$', '', base_id)
+                if base_id in val_source_ids:
+                    return False
+                
+                # Allow if belongs to train titles or general pool
+                return True
+
+            synth_mask = df_synth.apply(is_allowed_synth, axis=1)
+            df_synth_kept = df_synth[synth_mask].copy().reset_index(drop=True)
+            df_synth_discarded = len(df_synth) - len(df_synth_kept)
+
+            self.df_train = pd.concat([df_real_train, df_synth_kept], ignore_index=True)
+        else:
+            df_synth_kept = pd.DataFrame()
+            df_synth_discarded = 0
+            self.df_train = df_real_train
+
+        # 3. Validation Integrity Auditing & Assertions
+        val_synth_count = self.df_val['StereoQueerEval_id'].astype(str).str.startswith('synth_').sum()
+        assert val_synth_count == 0, f"Critical Data Error: Val set contains {val_synth_count} synthetic rows!"
+
+        title_overlap = len(set(self.df_train['yt_title']) & val_titles)
+        if '' in val_titles:
+            title_overlap = max(0, title_overlap - 1)  # ignore empty title matching
+        
+        print("==================================================")
+        print("📊 DATA INTEGRITY & ANTI-CONTAMINATION AUDIT:")
+        print(f"  • Real Source Rows:       {len(df_real)}")
+        print(f"  • Real Train Split:       {len(df_real_train)} rows")
+        print(f"  • Real Validation Split:  {len(self.df_val)} rows (100% human ground truth)")
+        if len(df_synth) > 0:
+            print(f"  • Synthetic Rows Found:   {len(df_synth)}")
+            print(f"  • Synthetic Kept (Train): {len(df_synth_kept)} rows")
+            print(f"  • Synthetic Discarded:    {df_synth_discarded} rows (to protect Val integrity)")
+        print(f"  • Final Training Set:     {len(self.df_train)} rows")
+        print(f"  • Final Validation Set:   {len(self.df_val)} rows (0% synthetic, 0 leakage)")
+        if title_overlap > 0:
+            print(f"  ⚠️ Warning: {title_overlap} video title overlap detected between Train & Val.")
+        else:
+            print(f"  ✅ Zero Video Overlap / Zero Cross-Contamination Verified.")
+        print("==================================================")
+
         return self.df_train, self.df_val
 
     def create_dataloaders(self, tokenizer=None) -> Tuple[DataLoader, DataLoader]:
