@@ -40,7 +40,11 @@ from typing import Dict, List, Optional, Set, Tuple, Any
 
 def auto_load_dotenv():
     """Automatically loads .env from current or parent directories without external dependencies."""
-    search_dirs = [os.getcwd(), os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))]
+    search_dirs = [
+        os.getcwd(),
+        os.path.dirname(os.path.abspath(__file__)),
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ]
     for d in search_dirs:
         env_path = os.path.join(d, '.env')
         if os.path.isfile(env_path):
@@ -83,16 +87,15 @@ DEFAULT_INPUT_GLOBS = [
     'StereoQueerEval_*_training.tsv'
 ]
 
+# Targeted AI Refusal Patterns (Avoid false-positives on conversational sarcasm like "I'm sorry, but...")
 REFUSAL_PATTERNS = [
-    r"i cannot fulfill",
-    r"as an ai",
-    r"i am an ai",
-    r"i am unable to",
-    r"i'm sorry",
-    r"i apologize",
-    r"offensive content",
-    r"against my safety guidelines",
-    r"cannot generate hate speech"
+    r"^i cannot (?:fulfill|generate|create|comply|assist)",
+    r"^as an ai\b",
+    r"^i am an ai\b",
+    r"\bagainst my (?:safety|content|usage) (?:guidelines|policies)\b",
+    r"^i am unable to (?:generate|create|comply|assist)",
+    r"cannot generate hate speech",
+    r"^i apologize, but i cannot"
 ]
 
 LANGUAGE_INSTRUCTIONS = {
@@ -101,7 +104,7 @@ LANGUAGE_INSTRUCTIONS = {
     'NL': "Dutch. Use authentic Dutch YouTube comment phrasing (e.g., 'even normaal doen', subtle sarcasm, moral lecturing, rhetorical questions). Do NOT translate into English."
 }
 
-SYSTEM_PROMPT = """You are an expert computational linguist assisting in dataset augmentation for LGBTQ+ hate-speech detection research (SemEval StereoQueerEval).
+SYSTEM_PROMPT_TEMPLATE = """You are an expert computational linguist assisting in dataset augmentation for LGBTQ+ hate-speech detection research (SemEval StereoQueerEval).
 Your task is Counterfactual Tone Perturbation: convert an EXPLICIT hate comment into {n_variants} DISTINCT and DIVERSE IMPLICIT (indirect / veiled) hate comments.
 
 STRICT REQUIREMENTS:
@@ -123,15 +126,6 @@ You MUST reply with ONLY a raw JSON object (no markdown, no backticks, no explan
     "Implicit variation 2"
   ]
 }}"""
-
-USER_TEMPLATE = """Video Context:
-- Title: {title}
-- Description: {description}
-
-Explicit Comment to Rephrase:
-"{text}"
-
-Generate {n_variants} distinct implicit hate variations:"""
 
 
 class RetryableAPIError(Exception):
@@ -204,7 +198,12 @@ def load_existing(out_path: str) -> Dict[str, Dict[str, Any]]:
         with open(out_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         items = data.get('items', [])
-        return {it['source_id']: it for it in items if it.get('source_id') and (it.get('variants') or it.get('rewritten'))}
+        loaded: Dict[str, Dict[str, Any]] = {}
+        for it in items:
+            key = it.get('source_id') or it.get('id')
+            if key and (it.get('variants') or it.get('rewritten')):
+                loaded[key] = it
+        return loaded
     except Exception as e:
         print(f"  [Warning] Could not load resume cache from {out_path}: {e}")
         return {}
@@ -280,7 +279,7 @@ def init_client() -> Tuple[str, Any]:
             from google import genai
             key = os.environ.get('GEMINI_API_KEY')
             if not key:
-                raise SystemExit('Missing GEMINI_API_KEY environment variable. Run: export GEMINI_API_KEY="..." or add to .env')
+                raise SystemExit('Missing GEMINI_API_KEY environment variable. Add it to .env or run: export GEMINI_API_KEY="..."')
             return ('gemini', genai.Client(api_key=key))
         except ImportError:
             raise SystemExit("Please install google-genai: pip install google-genai")
@@ -290,7 +289,7 @@ def init_client() -> Tuple[str, Any]:
             from openai import OpenAI
             key = os.environ.get('GROQ_API_KEY')
             if not key:
-                raise SystemExit('Missing GROQ_API_KEY environment variable. Run: export GROQ_API_KEY="..." or add to .env')
+                raise SystemExit('Missing GROQ_API_KEY environment variable. Add it to .env or run: export GROQ_API_KEY="..."')
             return ('groq', OpenAI(api_key=key, base_url='https://api.groq.com/openai/v1'))
         except ImportError:
             raise SystemExit("Please install openai: pip install openai")
@@ -309,19 +308,42 @@ def get_default_model(api_kind: str) -> str:
     return 'llama-3.3-70b-versatile'
 
 
+def extract_retry_after(err: Any) -> Optional[float]:
+    """Safely extracts server Retry-After header to respect rate limits."""
+    headers = getattr(getattr(err, 'response', None), 'headers', None) or \
+              getattr(getattr(err, 'http_response', None), 'headers', None)
+    if headers:
+        ra = headers.get('retry-after') or headers.get('Retry-After')
+        if ra:
+            try:
+                return max(0.5, float(ra))
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
 # -----------------------------------------------------------------------------
 # API CALL & PARSING
 # -----------------------------------------------------------------------------
 
 def build_prompt_payload(row: Dict[str, Any]) -> Tuple[str, str]:
+    """Constructs prompts safely without brace-formatting crashes on user content."""
     lang = row['lang']
     lang_inst = LANGUAGE_INSTRUCTIONS.get(lang, f"{lang}. Use authentic colloquial YouTube style.")
-    system = SYSTEM_PROMPT.format(lang_instruction=lang_inst, n_variants=ARGS.n_variants)
-    user = USER_TEMPLATE.format(
-        title=row.get('yt_title', '') or '(None)',
-        description=row.get('yt_description', '') or '(None)',
-        text=row['text'],
-        n_variants=ARGS.n_variants
+    system = SYSTEM_PROMPT_TEMPLATE.format(lang_instruction=lang_inst, n_variants=ARGS.n_variants)
+    
+    # Use direct string concatenation / safe f-string to prevent KeyError on braces {} in text/title/desc
+    title_str = row.get('yt_title', '') or '(None)'
+    desc_str = row.get('yt_description', '') or '(None)'
+    comment_str = row.get('text', '')
+
+    user = (
+        f"Video Context:\n"
+        f"- Title: {title_str}\n"
+        f"- Description: {desc_str}\n\n"
+        f"Explicit Comment to Rephrase:\n"
+        f"\"{comment_str}\"\n\n"
+        f"Generate {ARGS.n_variants} distinct implicit hate variations:"
     )
     return system, user
 
@@ -338,7 +360,7 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
             config = types.GenerateContentConfig(
                 system_instruction=system_prompt,
                 temperature=ARGS.temp,
-                max_output_tokens=800,
+                max_output_tokens=1200,
                 response_mime_type="application/json",
             )
             response = cli.models.generate_content(
@@ -349,13 +371,15 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
             return response.text or ""
         except genai_errors.APIError as e:
             code = getattr(e, 'code', None)
+            wait = extract_retry_after(e) or 2.0
             if code in (429, 500, 502, 503, 504):
-                raise RetryableAPIError(wait_hint=2.0) from e
+                raise RetryableAPIError(wait_hint=wait) from e
             raise FatalAPIError(f"Gemini API Error (code {code}): {e}") from e
         except Exception as e:
+            wait = extract_retry_after(e) or 3.0
             err_str = str(e).lower()
             if "429" in err_str or "quota" in err_str or "resource exhausted" in err_str:
-                raise RetryableAPIError(wait_hint=3.0) from e
+                raise RetryableAPIError(wait_hint=wait) from e
             raise
 
     elif kind == 'groq':
@@ -368,15 +392,17 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
                     {'role': 'user', 'content': user_prompt}
                 ],
                 temperature=ARGS.temp,
-                max_tokens=800,
+                max_tokens=1200,
                 response_format={"type": "json_object"}
             )
             return response.choices[0].message.content or ""
         except (RateLimitError, APIConnectionError) as e:
-            raise RetryableAPIError(wait_hint=2.0) from e
+            wait = extract_retry_after(e) or 2.0
+            raise RetryableAPIError(wait_hint=wait) from e
         except APIStatusError as e:
+            wait = extract_retry_after(e) or 2.0
             if e.status_code in (429, 500, 502, 503, 504):
-                raise RetryableAPIError(wait_hint=2.0) from e
+                raise RetryableAPIError(wait_hint=wait) from e
             raise FatalAPIError(f"Groq HTTP Error {e.status_code}: {e}") from e
 
 
@@ -408,14 +434,21 @@ def clean_and_validate_variants(raw_text: str, original_text: str) -> List[str]:
             pass
 
     if not candidate_list:
-        lines = [line.strip().lstrip('0123456789.-*• ') for line in cleaned.split('\n') if line.strip()]
-        candidate_list = [l for l in lines if len(l) > 10 and not l.startswith('{') and not l.endswith('}')]
+        lines = [line.strip() for line in cleaned.split('\n') if line.strip()]
+        for l in lines:
+            # Strip markdown list bullets like "1. ", "- ", "* " safely without eating digits in sentences
+            stripped_line = re.sub(r'^\s*(?:\d+[\.\)]|[-*•])\s*', '', l).strip()
+            if len(stripped_line) > 10 and not stripped_line.startswith('{') and not stripped_line.endswith('}'):
+                candidate_list.append(stripped_line)
 
     valid_variants: List[str] = []
     lower_orig = original_text.lower().strip()
 
     for item in candidate_list:
         item_str = item.strip().strip('"').strip("'")
+        # Sanitize tabs and newlines to keep TSV format clean and unquoted
+        item_str = re.sub(r'[\t\r\n]+', ' ', item_str).strip()
+
         if not item_str or len(item_str) < 5:
             continue
 
@@ -423,7 +456,7 @@ def clean_and_validate_variants(raw_text: str, original_text: str) -> List[str]:
         if lower_item == lower_orig:
             continue
 
-        # Check for refusal patterns
+        # Check for genuine refusal patterns
         is_refusal = any(re.search(pat, lower_item) for pat in REFUSAL_PATTERNS)
         if is_refusal:
             continue
@@ -435,7 +468,11 @@ def clean_and_validate_variants(raw_text: str, original_text: str) -> List[str]:
 
 
 def process_single_row(row: Dict[str, Any]) -> Tuple[str, List[str], str]:
-    system_prompt, user_prompt = build_prompt_payload(row)
+    try:
+        system_prompt, user_prompt = build_prompt_payload(row)
+    except Exception as e:
+        print(f"  [Error building prompt for {row.get('id')}]: {e}", file=sys.stderr)
+        return row['id'], [], 'fatal'
 
     for attempt in range(1, ARGS.max_retries + 1):
         try:
@@ -454,7 +491,7 @@ def process_single_row(row: Dict[str, Any]) -> Tuple[str, List[str], str]:
             return row['id'], [], 'fatal'
         except Exception as e:
             if attempt >= ARGS.max_retries:
-                print(f"  [Error] ID {row['id']} failed after {attempt} retries: {e}", file=sys.stderr)
+                print(f"  [Error] ID {row['id']} failed after {attempt} retries ({type(e).__name__}: {e})", file=sys.stderr)
                 break
             time.sleep(1.5 * attempt)
 
@@ -479,28 +516,37 @@ def atomic_save_json(path: str, data: Any):
 
 
 def write_canonical_tsv(lang: str, items: List[Dict[str, Any]], out_tsv_path: str):
+    """Writes clean, deterministic, unquoted TSV lines conforming to SemEval schema."""
     os.makedirs(os.path.dirname(os.path.abspath(out_tsv_path)) or '.', exist_ok=True)
     with open(out_tsv_path, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f, delimiter='\t', quoting=csv.QUOTE_MINIMAL)
-        writer.writerow(HEADER)
-        row_idx = 1
-        for item in items:
+        f.write('\t'.join(HEADER) + '\n')
+        # Sort items stably by source_id so order is deterministic across snapshots
+        for item in sorted(items, key=lambda x: x.get('source_id') or x.get('id', '')):
+            source_id = item.get('source_id') or item.get('id', '')
             variants = item.get('variants', [])
             if not variants and item.get('rewritten'):
                 variants = [item['rewritten']]
 
             for v_idx, variant_text in enumerate(variants, start=1):
-                synth_id = f"synth_implicit_{lang}_{row_idx:04d}" if len(variants) == 1 else f"synth_implicit_{lang}_{row_idx:04d}_v{v_idx}"
-                writer.writerow([
+                # Clean tabs and newlines to preserve raw TSV structure
+                clean_variant = re.sub(r'[\t\r\n]+', ' ', variant_text).strip()
+                clean_title = re.sub(r'[\t\r\n]+', ' ', item.get('yt_title', '')).strip()
+                clean_desc = re.sub(r'[\t\r\n]+', ' ', item.get('yt_description', '')).strip()
+                clean_stereo = item.get('stereotype', 'no').strip()
+                clean_target = item.get('target', 'none').strip()
+
+                # Stable, deterministic Synthetic ID derived from source_id
+                synth_id = f"synth_{source_id}_v{v_idx}" if len(variants) > 1 else f"synth_{source_id}"
+                row_fields = [
                     synth_id,
-                    item.get('yt_title', ''),
-                    item.get('yt_description', ''),
-                    variant_text,
-                    item.get('stereotype', 'no'),
+                    clean_title,
+                    clean_desc,
+                    clean_variant,
+                    clean_stereo,
                     'yes_implicit',
-                    item.get('target', 'none')
-                ])
-                row_idx += 1
+                    clean_target
+                ]
+                f.write('\t'.join(row_fields) + '\n')
 
 
 # -----------------------------------------------------------------------------
