@@ -365,6 +365,8 @@ class TaskBTrainer:
                 if macro_f1 > self.best_macro_f1:
                     self.best_macro_f1 = macro_f1
                     self.best_checkpoint_path = self.save_checkpoint("best_phase1.pt")
+                    if self.config.save_predictions and self.df_val is not None:
+                        self.save_val_predictions(y_pred, y_prob, y_gates)
                     p1_patience_counter = 0
                 else:
                     p1_patience_counter += 1
@@ -459,6 +461,17 @@ class TaskBTrainer:
                     if patience_counter >= patience_limit:
                         print(f"  [EarlyStopping] Triggered at Epoch {epoch:02d}! Best Val Macro-F1: {self.best_macro_f1:.4f}")
                         break
+
+        # Restore best weights and ensure predictions CSV is saved
+        if self.best_checkpoint_path and os.path.exists(self.best_checkpoint_path):
+            print(f"\n[Trainer] Restoring best checkpoint from: {self.best_checkpoint_path} (Best Val Macro-F1: {self.best_macro_f1:.4f})")
+            checkpoint = torch.load(self.best_checkpoint_path, map_location=self.device)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            
+            if self.df_val is not None:
+                _, best_metrics, y_pred, y_prob, y_gates = self.eval_epoch()
+                self.save_val_predictions(y_pred, y_prob, y_gates)
+                last_metrics = best_metrics
 
         return {
             "best_macro_f1": self.best_macro_f1,
