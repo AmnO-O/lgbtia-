@@ -193,7 +193,7 @@ def parse_args():
                         help='Target maximum Requests Per Minute rate limit (e.g. --rpm 14 for Free Tier)')
     parser.add_argument('--max-concurrency', type=int, default=None,
                         help='Max parallel worker threads (default: 8 for gemini, 4 for groq; use 1-2 if on Free Tier)')
-    parser.add_argument('--max-retries', type=int, default=6,
+    parser.add_argument('--max-retries', type=int, default=10,
                         help='Max retries per sample upon rate limit')
     parser.add_argument('--max-chars', type=int, default=1200,
                         help='Truncate over-length input comments')
@@ -336,8 +336,8 @@ def get_default_model(api_kind: str) -> str:
     if ARGS.model:
         return ARGS.model
     if api_kind == 'gemini':
-        return 'gemini-2.5-flash'
-    return 'llama-3.3-70b-versatile'
+        return 'gemini-3.5-flash-lite'
+    return 'openai/gpt-oss-120b'
 
 
 def extract_retry_after(err: Any) -> Optional[float]:
@@ -446,7 +446,8 @@ def call_llm(system_prompt: str, user_prompt: str, token_budget: int = 1500) -> 
                 ],
                 temperature=ARGS.temp,
                 max_tokens=token_budget,
-                response_format={"type": "json_object"}
+                response_format={"type": "json_object"},
+                timeout=180.0
             )
             return response.choices[0].message.content or ""
         except (RateLimitError, APIConnectionError) as e:
@@ -796,6 +797,9 @@ def main():
                         speed = (processed_batches_count * ARGS.batch_size) / max(elapsed, 0.001)
                         print(f"  Progress: {processed_batches_count}/{len(prompt_batches)} requests ({speed:.1f} comments/s) | "
                               f"Total Synthetic Rows: {total_var_saved} | Ok: {stats['ok']} | Errors: {stats['empty_or_invalid'] + stats['gave_up']}",
+                              flush=True)
+                    else:
+                        print(f"  [{processed_batches_count}/{len(prompt_batches)}] ok={stats['ok']} empty={stats['empty_or_invalid']} gave_up={stats['gave_up']} fatal={stats['fatal']}",
                               flush=True)
 
                 if effective_delay > 0 and (i + concurrency) < len(prompt_batches):
