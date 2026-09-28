@@ -68,8 +68,9 @@ def parse_args():
     parser.add_argument("--unfreeze_layers", type=int, default=2, help="Number of last encoder blocks to unfreeze")
     parser.add_argument("--unfreeze_lr", type=float, default=2e-5, help="Learning rate for unfrozen backbone")
     
-    # Directories
+    # Directories & Files
     parser.add_argument("--data_dir", type=str, default="data", help="Directory containing dataset TSV/CSVs")
+    parser.add_argument("--files", nargs="+", default=None, help="Explicit list of TSV files to train on")
     parser.add_argument("--output_dir", type=str, default="checkpoints", help="Output directory for saved models")
     parser.add_argument("--config_file", type=str, default=None, help="Path to JSON configuration file")
     parser.add_argument("--generate_sample_if_missing", action="store_true", default=True,
@@ -117,7 +118,7 @@ def main():
     print("==================================================")
 
     data_pipeline = DataPipeline(config)
-    found_files = data_pipeline.find_data_files()
+    found_files = args.files if args.files else data_pipeline.find_data_files()
     
     if not found_files and args.generate_sample_if_missing:
         print(f"No TSV files detected in '{config.data_dir}'. Generating synthetic sample data...")

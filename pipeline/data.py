@@ -151,20 +151,35 @@ class DataPipeline:
         self.tokenizer = None
 
     def find_data_files(self) -> List[str]:
-        patterns = [
-            os.path.join(self.config.data_dir, "*_training.tsv"),
-            os.path.join(self.config.data_dir, "**", "*_training.tsv"),
-            "/kaggle/input/**/*_training.tsv",
-            "/kaggle/input/**/**/*_training.tsv",
-            "data/*_training.tsv",
-            "data/**/*_training.tsv",
-            "StereoQueerEval_*_training.tsv",
-            "../LGBT/*_training.tsv",
-            "LGBT/*_training.tsv",
-            "LGBT/**/*_training.tsv",
+        """
+        Scans for dataset files and STRICTLY whitelists only:
+        1. Official training files: StereoQueerEval_{LANG}_training.tsv
+        2. Synthetic augmented files: SynthImplicit_{LANG}_training.tsv (or Synth*.tsv)
+        Explicitly excludes unwanted external benchmarks like HOLD_*, HateAgainstLGBT_*, etc.
+        """
+        candidate_patterns = [
+            os.path.join(self.config.data_dir, "**", "*.tsv"),
+            os.path.join(self.config.data_dir, "*.tsv"),
+            "/kaggle/input/**/*.tsv",
+            "data/**/*.tsv",
+            "data/*.tsv",
+            "LGBT/**/*.tsv",
+            "LGBT/*.tsv",
+            "*.tsv",
         ]
-        found = sorted({p for pat in patterns for p in glob.glob(pat, recursive=True) if os.path.isfile(p)})
-        return found
+        all_found = sorted({p for pat in candidate_patterns for p in glob.glob(pat, recursive=True) if os.path.isfile(p)})
+        
+        # Strict Whitelist Filter: Only allow StereoQueerEval_* and Synth* files
+        whitelisted_files = []
+        for path in all_found:
+            fname = os.path.basename(path)
+            # Accept only official StereoQueerEval training and Synth files
+            if (fname.startswith('StereoQueerEval_') or fname.startswith('Synth')) and fname.endswith('.tsv'):
+                # Exclude any test/dev splits if specifically looking for training
+                if 'training' in fname or 'Synth' in fname:
+                    whitelisted_files.append(path)
+
+        return sorted(set(whitelisted_files))
 
     def load_data(self, file_paths: Optional[List[str]] = None) -> pd.DataFrame:
         if file_paths is None:
