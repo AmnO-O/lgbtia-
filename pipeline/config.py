@@ -18,7 +18,7 @@ class PipelineConfig:
     task: str = "stereoqueer"                   # 'stereoqueer' or 'toxic'
     target_task: str = "all"                    # 'all', 'st' (stereotype), 'hs' (hate_speech), or 'tg' (target)
     embed_source: str = "mmbert"                # 'mmbert' or 'scratch'
-    model_type: str = "task_b_class_aware"      # 'task_b_class_aware', 'mmbert_transformer', 'feature_mlp', 'transformer', 'bilstm', 'rnn'
+    model_type: str = "task_b_class_aware"      # 'task_b_class_aware' (Pure Learnable Class Queries), 'task_b_moe' (4-Expert MoE), 'mmbert_transformer', 'feature_mlp', 'transformer', 'bilstm', 'rnn'
     
     # Pretrained Transformer settings
     mmbert_model_name: str = "AmnO-O/mmbert-queer-hate-adapted"  # Domain-adapted mmBERT (fallback: "jhu-clsp/mmbert-base")

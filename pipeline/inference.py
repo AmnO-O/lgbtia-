@@ -49,9 +49,28 @@ class StereoQueerPredictor:
                 model = TaskBClassAwareAttentionModel(
                     mmbert_model=backbone,
                     d_model=self.config.mmbert_dim,
+                    num_classes=3,
+                    num_slots_per_class=getattr(self.config, 'num_slots_per_class', 1),
                     num_heads=self.config.num_heads,
                     dropout=self.config.dropout,
-                    use_query_interaction=self.config.use_query_interaction
+                    use_query_interaction=self.config.use_query_interaction,
+                    use_rmsnorm=getattr(self.config, 'use_rmsnorm', True),
+                    use_msd=getattr(self.config, 'use_msd', True)
+                )
+            elif self.config.model_type == 'task_b_moe':
+                from .models.task_b_moe import TaskB4ExpertMoEModel
+                model = TaskB4ExpertMoEModel(
+                    mmbert_model=backbone,
+                    d_model=self.config.mmbert_dim,
+                    num_experts=getattr(self.config, 'num_experts', 4),
+                    num_slots_per_expert=getattr(self.config, 'num_slots_per_expert', 1),
+                    num_heads=self.config.num_heads,
+                    dropout=self.config.dropout,
+                    router_hidden_dim=getattr(self.config, 'router_hidden_dim', 256),
+                    router_temperature=getattr(self.config, 'router_temperature', 1.0),
+                    use_query_interaction=self.config.use_query_interaction,
+                    use_rmsnorm=getattr(self.config, 'use_rmsnorm', True),
+                    use_msd=getattr(self.config, 'use_msd', True)
                 )
             elif self.config.model_type == 'feature_mlp':
                 model = MMBertFeatureClassifier(
