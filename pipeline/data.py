@@ -153,13 +153,17 @@ class DataPipeline:
     def find_data_files(self) -> List[str]:
         patterns = [
             os.path.join(self.config.data_dir, "*_training.tsv"),
-            os.path.join(self.config.data_dir, "StereoQueerEval_*_training.tsv"),
+            os.path.join(self.config.data_dir, "**", "*_training.tsv"),
+            "/kaggle/input/**/*_training.tsv",
+            "/kaggle/input/**/**/*_training.tsv",
             "data/*_training.tsv",
+            "data/**/*_training.tsv",
             "StereoQueerEval_*_training.tsv",
             "../LGBT/*_training.tsv",
             "LGBT/*_training.tsv",
+            "LGBT/**/*_training.tsv",
         ]
-        found = sorted({p for pat in patterns for p in glob.glob(pat, recursive=True)})
+        found = sorted({p for pat in patterns for p in glob.glob(pat, recursive=True) if os.path.isfile(p)})
         return found
 
     def load_data(self, file_paths: Optional[List[str]] = None) -> pd.DataFrame:
