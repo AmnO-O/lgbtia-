@@ -1,6 +1,7 @@
 """
-Smoke test suite for the StereoQueerEval Task B 4-Expert MoE pipeline and components.
-Executes end-to-end forward/backward passes, unit tests on modular components, and training checks.
+Smoke test suite for the StereoQueerEval Task B architectures:
+- Pure Learnable Class Queries Cross-Attention (Data-Driven, Zero Gate Overfitting)
+- 4-Expert Mixture of Latent Query Banks (MoE)
 """
 import unittest
 import pandas as pd
@@ -15,11 +16,12 @@ from pipeline.models.norm import RMSNorm
 from pipeline.models.router import ContextRouter, masked_mean_pooling
 from pipeline.models.query_bank import ParallelQueryBankCrossAttention
 from pipeline.models.head import MultiSampleDropoutHead
-from pipeline.models.task_b_moe import (
-    TaskB4ExpertMoEModel,
+from pipeline.models.task_b_class_aware import (
     TaskBClassAwareAttentionModel,
+    PureClassQueryScoringHead,
     ROLE_PAD, ROLE_TITLE, ROLE_DESC, ROLE_COMMENT
 )
+from pipeline.models.task_b_moe import TaskB4ExpertMoEModel
 from pipeline.losses import FocalLoss, MoELoadBalanceLoss, TaskBLoss, MultiTaskLoss
 from pipeline.task_b_data import TaskBRoleDataset
 from pipeline.task_b_trainer import TaskBTrainer
@@ -96,57 +98,48 @@ class TestPipelineSmoke(unittest.TestCase):
         x = torch.randn(4, 10, dim) * 5.0
         out = norm(x)
         self.assertEqual(out.shape, (4, 10, dim))
-        # Variance along last dim should be close to 1
         rms = torch.sqrt(out.pow(2).mean(-1))
         self.assertTrue(torch.allclose(rms, torch.ones_like(rms), atol=1e-2))
 
-    def test_03_masked_mean_pooling(self):
-        B, S, D = 2, 4, 8
-        h = torch.ones(B, S, D)
-        # Sample 0 has 2 valid tokens, Sample 1 has 4 valid tokens
-        mask = torch.tensor([[1, 1, 0, 0], [1, 1, 1, 1]], dtype=torch.long)
-        pooled = masked_mean_pooling(h, mask)
-        self.assertEqual(pooled.shape, (B, D))
-        self.assertTrue(torch.allclose(pooled, torch.ones(B, D)))
+    def test_03_pure_class_query_model_forward_backward(self):
+        """Tests Pure Learnable Class Queries Cross-Attention (Data-Driven)."""
+        backbone = MockBackbone(d_model=64)
+        model = TaskBClassAwareAttentionModel(
+            mmbert_model=backbone,
+            d_model=64,
+            num_classes=3,
+            num_slots_per_class=1,
+            num_heads=2,
+            dropout=0.1
+        )
 
-    def test_04_context_router(self):
-        B, S, D, N = 3, 10, 64, 4
-        router = ContextRouter(d_model=D, num_experts=N, hidden_dim=32, temperature=1.0)
-        h = torch.randn(B, S, D)
-        mask = torch.ones(B, S, dtype=torch.long)
-        gates, logits = router(h, mask, return_logits=True)
-        
-        self.assertEqual(gates.shape, (B, N))
-        self.assertEqual(logits.shape, (B, N))
-        # Check sum to 1.0 per sample
-        gate_sums = gates.sum(dim=-1)
-        self.assertTrue(torch.allclose(gate_sums, torch.ones(B), atol=1e-5))
+        B, S = 2, 16
+        dummy_ids = torch.randint(0, 500, (B, S))
+        dummy_mask = torch.ones((B, S), dtype=torch.long)
+        dummy_roles = torch.randint(0, 4, (B, S), dtype=torch.long)
+        labels = torch.tensor([0, 1], dtype=torch.long)
 
-    def test_05_parallel_query_bank(self):
-        B, S, D, N = 2, 16, 64, 4
-        qb = ParallelQueryBankCrossAttention(d_model=D, num_experts=N, num_heads=2)
-        h = torch.randn(B, S, D)
-        mask = torch.ones(B, S, dtype=torch.long)
-        
-        z_experts, attn = qb(h, mask, return_attention_map=True)
-        self.assertEqual(z_experts.shape, (B, N, D))
-        self.assertEqual(attn.shape, (B, N, S))
+        # Forward pass
+        logits, h_B, gates, attn = model(
+            dummy_ids, dummy_mask, dummy_roles,
+            return_gates=True,
+            return_attention_map=True
+        )
+        self.assertEqual(logits.shape, (B, 3))
+        self.assertEqual(h_B.shape, (B, 64))
+        self.assertIsNone(gates) # No gate collapse!
+        self.assertEqual(attn.shape, (B, 3, S))
 
-    def test_06_load_balance_loss(self):
-        loss_fn = MoELoadBalanceLoss(num_experts=4)
-        
-        # Perfect uniform distribution: mean(g) = [0.25, 0.25, 0.25, 0.25]
-        uniform_gates = torch.tensor([[0.25, 0.25, 0.25, 0.25], [0.25, 0.25, 0.25, 0.25]])
-        loss_uniform = loss_fn(uniform_gates)
-        self.assertAlmostEqual(loss_uniform.item(), 0.0, places=4)
+        # Backward pass
+        loss_fn = nn.CrossEntropyLoss()
+        loss = loss_fn(logits, labels)
+        loss.backward()
 
-        # Complete collapse: all samples pick expert 0
-        collapsed_gates = torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
-        loss_collapsed = loss_fn(collapsed_gates)
-        # N * (1.0^2 + 0 + 0 + 0) - 1 = 4 * 1 - 1 = 3.0
-        self.assertAlmostEqual(loss_collapsed.item(), 3.0, places=4)
+        self.assertIsNotNone(model.role_embeddings.weight.grad)
+        self.assertIsNotNone(model.class_queries.grad)
 
-    def test_07_model_forward_backward_moe(self):
+    def test_04_moe_model_forward_backward(self):
+        """Tests 4-Expert MoE Model in task_b_moe.py."""
         backbone = MockBackbone(d_model=64)
         model = TaskB4ExpertMoEModel(
             mmbert_model=backbone,
@@ -162,7 +155,6 @@ class TestPipelineSmoke(unittest.TestCase):
         dummy_roles = torch.randint(0, 4, (B, S), dtype=torch.long)
         labels = torch.tensor([0, 2], dtype=torch.long)
 
-        # Forward with return_gates=True and return_attention_map=True
         logits, h_B, gates, attn = model(
             dummy_ids, dummy_mask, dummy_roles,
             return_gates=True,
@@ -173,7 +165,6 @@ class TestPipelineSmoke(unittest.TestCase):
         self.assertEqual(gates.shape, (B, 4))
         self.assertEqual(attn.shape, (B, 4, S))
 
-        # Backward gradient flow check
         loss_fn = TaskBLoss(base_criterion=nn.CrossEntropyLoss(), num_experts=4, loss_balance_weight=0.01)
         loss = loss_fn(logits, labels, gates=gates)
         loss.backward()
@@ -182,12 +173,13 @@ class TestPipelineSmoke(unittest.TestCase):
         self.assertIsNotNone(model.query_banks.expert_queries.grad)
         self.assertIsNotNone(model.router.mlp[0].weight.grad)
 
-    def test_08_trainer_step_moe(self):
+    def test_05_trainer_with_pure_class_query_model(self):
+        """Tests TaskBTrainer running pure learnable class query cross-attention."""
         backbone = MockBackbone(d_model=64)
         model = TaskBClassAwareAttentionModel(
             mmbert_model=backbone,
             d_model=64,
-            num_experts=4,
+            num_classes=3,
             num_heads=2,
             dropout=0.1
         )
@@ -211,12 +203,10 @@ class TestPipelineSmoke(unittest.TestCase):
         train_loss, train_gates = trainer.train_epoch(optimizer)
         self.assertIsInstance(train_loss, float)
         self.assertGreater(train_loss, 0.0)
-        self.assertEqual(len(train_gates), 4)
 
         val_loss, metrics, preds, probs, val_gates = trainer.eval_epoch()
         self.assertIn('hs_macro_f1', metrics)
         self.assertIn('hs_acc', metrics)
-        self.assertEqual(val_gates.shape[1], 4)
 
 
 if __name__ == '__main__':

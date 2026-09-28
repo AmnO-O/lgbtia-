@@ -202,7 +202,11 @@ class TaskBTrainer:
                     return_gates=True,
                     return_all_msd_logits=True
                 )
-                logits, _, gates, _ = out
+                if len(out) == 4:
+                    logits, _, gates, _ = out
+                else:
+                    logits, _, _ = out
+                    gates = None
                 loss = self.criterion(logits, hs_labels, gates=gates)
 
             if gates is not None:
@@ -231,7 +235,11 @@ class TaskBTrainer:
                         return_gates=True,
                         return_all_msd_logits=False
                     )
-                    adv_logits, _, adv_gates, _ = adv_out
+                    if len(adv_out) == 4:
+                        adv_logits, _, adv_gates, _ = adv_out
+                    else:
+                        adv_logits, _, _ = adv_out
+                        adv_gates = None
                     adv_loss = self.criterion(adv_logits, hs_labels, gates=adv_gates)
                 
                 if self.use_amp:
@@ -291,7 +299,11 @@ class TaskBTrainer:
                         return_gates=True,
                         return_all_msd_logits=False
                     )
-                    logits, _, gates, _ = out
+                    if len(out) == 4:
+                        logits, _, gates, _ = out
+                    else:
+                        logits, _, _ = out
+                        gates = None
                     loss = self.criterion(logits, hs_labels, gates=gates)
 
                 total_loss += loss.item()
@@ -323,9 +335,10 @@ class TaskBTrainer:
         """
         os.makedirs(self.config.output_dir, exist_ok=True)
         patience_limit = getattr(self.config, 'patience', 5)
+        model_name = self.model.__class__.__name__
         print(f"\n=======================================================")
-        print(f" Task B 4-Expert MoE Training Pipeline")
-        print(f" Device: {self.device} | AMP: {self.use_amp} | Experts: {self.config.num_experts} | Patience: {patience_limit}")
+        print(f" Task B Training Pipeline [{model_name}]")
+        print(f" Device: {self.device} | AMP: {self.use_amp} | Patience: {patience_limit}")
         print(f"=======================================================")
 
         last_metrics: Dict[str, float] = {}
@@ -348,10 +361,10 @@ class TaskBTrainer:
                 last_metrics = metrics
 
                 macro_f1 = metrics.get('hs_macro_f1', 0.0)
-                gate_str = ", ".join([f"E{i}:{g:.2f}" for i, g in enumerate(train_gates)]) if len(train_gates) > 0 else "N/A"
+                gate_str = f" | Gates: [{', '.join([f'E{i}:{g:.2f}' for i, g in enumerate(train_gates)])}]" if len(train_gates) > 0 and not np.all(train_gates == 0) else ""
                 print(f"Epoch {epoch:02d}/{self.config.freeze_phase_epochs:02d} [{elapsed:.1f}s] "
                       f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                      f"Val Macro-F1: {macro_f1:.4f} | Gates: [{gate_str}]")
+                      f"Val Macro-F1: {macro_f1:.4f}{gate_str}")
 
                 self.history.append({
                     'epoch': epoch,
@@ -396,10 +409,10 @@ class TaskBTrainer:
                 last_metrics = metrics
 
                 macro_f1 = metrics.get('hs_macro_f1', 0.0)
-                gate_str = ", ".join([f"E{i}:{g:.2f}" for i, g in enumerate(train_gates)]) if len(train_gates) > 0 else "N/A"
+                gate_str = f" | Gates: [{', '.join([f'E{i}:{g:.2f}' for i, g in enumerate(train_gates)])}]" if len(train_gates) > 0 and not np.all(train_gates == 0) else ""
                 print(f"Epoch {epoch:02d}/{total_p2_epochs:02d} [{elapsed:.1f}s] "
                       f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                      f"Val Macro-F1: {macro_f1:.4f} | Gates: [{gate_str}]")
+                      f"Val Macro-F1: {macro_f1:.4f}{gate_str}")
 
                 self.history.append({
                     'epoch': self.config.freeze_phase_epochs + epoch,

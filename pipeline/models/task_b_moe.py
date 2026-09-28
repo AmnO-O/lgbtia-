@@ -191,6 +191,3 @@ class TaskB4ExpertMoEModel(nn.Module):
         """Compatibility helper - weights are learned end-to-end via gradient descent."""
         pass
 
-
-# Aliased for 100% backward compatibility with existing scripts and checkpoints
-TaskBClassAwareAttentionModel = TaskB4ExpertMoEModel

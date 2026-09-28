@@ -7,9 +7,9 @@ from .norm import RMSNorm
 from .router import ContextRouter, masked_mean_pooling
 from .query_bank import ParallelQueryBankCrossAttention
 from .head import MultiSampleDropoutHead
-from .task_b_moe import (
-    TaskB4ExpertMoEModel,
+from .task_b_class_aware import (
     TaskBClassAwareAttentionModel,
+    PureClassQueryScoringHead,
     CLASS_NO_HATE,
     CLASS_IMPLICIT_HATE,
     CLASS_EXPLICIT_HATE,
@@ -19,6 +19,9 @@ from .task_b_moe import (
     ROLE_DESC,
     ROLE_COMMENT,
     NUM_ROLES,
+)
+from .task_b_moe import (
+    TaskB4ExpertMoEModel,
 )
 
 __all__ = [
@@ -38,8 +41,9 @@ __all__ = [
     "masked_mean_pooling",
     "ParallelQueryBankCrossAttention",
     "MultiSampleDropoutHead",
-    "TaskB4ExpertMoEModel",
+    "PureClassQueryScoringHead",
     "TaskBClassAwareAttentionModel",
+    "TaskB4ExpertMoEModel",
     "CLASS_NO_HATE",
     "CLASS_IMPLICIT_HATE",
     "CLASS_EXPLICIT_HATE",

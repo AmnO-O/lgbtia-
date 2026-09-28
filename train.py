@@ -28,6 +28,7 @@ from pipeline.models.rnn import VanillaRNNModel
 from pipeline.models.mmbert import MMBertTransformerModel
 from pipeline.models.classifier import FeatureClassifier, MMBertFeatureClassifier
 from pipeline.models.task_b_class_aware import TaskBClassAwareAttentionModel
+from pipeline.models.task_b_moe import TaskB4ExpertMoEModel
 from pipeline.task_b_data import TaskBRoleDataset
 from pipeline.task_b_trainer import TaskBTrainer
 
@@ -41,9 +42,9 @@ def parse_args():
                         help="Train a specific subtask ('st'=Stereotype, 'hs'=Hate Speech, 'tg'=Target Identity) or 'all'")
     parser.add_argument("--embed_source", type=str, default="mmbert", choices=["mmbert", "scratch"],
                         help="Embedding source: pretrained mmBERT/ModernBERT or scratch embeddings")
-    parser.add_argument("--model", type=str, default="mmbert_transformer",
-                        choices=["mmbert_transformer", "task_b_class_aware", "feature_mlp", "transformer", "bilstm", "rnn"],
-                        help="Model architecture ('task_b_class_aware' for Class-Aware Attention on Task B)")
+    parser.add_argument("--model", type=str, default="task_b_class_aware",
+                        choices=["task_b_class_aware", "task_b_moe", "mmbert_transformer", "feature_mlp", "transformer", "bilstm", "rnn"],
+                        help="Model architecture ('task_b_class_aware' for Pure Class Queries Cross-Attention, 'task_b_moe' for 4-Expert MoE)")
     parser.add_argument("--use_query_interaction", action="store_true", default=True,
                         help="Enable Layer 2 Multi-Head Self-Attention interaction between label queries (Ablation H2)")
     parser.add_argument("--no_query_interaction", dest="use_query_interaction", action="store_false",
@@ -142,27 +143,41 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(config.mmbert_model_name)
         backbone = AutoModel.from_pretrained(config.mmbert_model_name)
 
-        if config.model_type == "task_b_class_aware":
-            print("Initializing Task B Class-Aware Multi-Head Attention Architecture...")
+        if config.model_type in ("task_b_class_aware", "task_b_moe"):
             from torch.utils.data import DataLoader
             train_ds = TaskBRoleDataset(df_train, tokenizer, max_len=config.max_length)
             val_ds = TaskBRoleDataset(df_val, tokenizer, max_len=config.max_length)
             train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True)
             val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False)
 
-            model = TaskBClassAwareAttentionModel(
-                mmbert_model=backbone,
-                d_model=config.mmbert_dim,
-                num_experts=getattr(config, 'num_experts', 4),
-                num_slots_per_expert=getattr(config, 'num_slots_per_expert', 1),
-                num_heads=config.num_heads,
-                dropout=config.dropout,
-                router_hidden_dim=getattr(config, 'router_hidden_dim', 256),
-                router_temperature=getattr(config, 'router_temperature', 1.0),
-                use_query_interaction=config.use_query_interaction,
-                use_rmsnorm=getattr(config, 'use_rmsnorm', True),
-                use_msd=getattr(config, 'use_msd', True)
-            )
+            if config.model_type == "task_b_moe":
+                print("Initializing Task B 4-Expert Mixture of Latent Query Banks (MoE)...")
+                model = TaskB4ExpertMoEModel(
+                    mmbert_model=backbone,
+                    d_model=config.mmbert_dim,
+                    num_experts=getattr(config, 'num_experts', 4),
+                    num_slots_per_expert=getattr(config, 'num_slots_per_expert', 1),
+                    num_heads=config.num_heads,
+                    dropout=config.dropout,
+                    router_hidden_dim=getattr(config, 'router_hidden_dim', 256),
+                    router_temperature=getattr(config, 'router_temperature', 1.0),
+                    use_query_interaction=config.use_query_interaction,
+                    use_rmsnorm=getattr(config, 'use_rmsnorm', True),
+                    use_msd=getattr(config, 'use_msd', True)
+                )
+            else:
+                print("Initializing Task B Pure Learnable Class Queries Cross-Attention (Data-Driven)...")
+                model = TaskBClassAwareAttentionModel(
+                    mmbert_model=backbone,
+                    d_model=config.mmbert_dim,
+                    num_classes=3,
+                    num_slots_per_class=getattr(config, 'num_slots_per_class', 1),
+                    num_heads=config.num_heads,
+                    dropout=config.dropout,
+                    use_query_interaction=config.use_query_interaction,
+                    use_rmsnorm=getattr(config, 'use_rmsnorm', True),
+                    use_msd=getattr(config, 'use_msd', True)
+                )
             is_task_b = True
             is_mmbert_tf = False
         elif config.model_type == "feature_mlp":

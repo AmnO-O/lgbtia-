@@ -259,70 +259,118 @@ class PipelineConfig:
 `
   },
   'pipeline/models/task_b_class_aware.py': {
-    desc: 'Task B Class-Aware Multi-Head Cross-Attention (MHCA) with Explicit Role Embeddings and Task C Bridge.',
+    desc: 'Pure Learnable Class Queries Cross-Attention (Data-Driven, Zero Gate Overfitting) with Role Embeddings and Task C Bridge.',
     language: 'python',
     code: `# pipeline/models/task_b_class_aware.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from .norm import RMSNorm
 
 class TaskBClassAwareAttentionModel(nn.Module):
     """
-    Class-Aware Multi-Head Cross-Attention model with Explicit Role Embeddings:
-    - Layer 0: Role Embeddings (<T>=1 Title, <D>=2 Description, <C>=3 Comment)
-    - Layer 1: Learned Class Queries [q_NonHate, q_Implicit, q_Explicit] (MHCA)
-    - Layer 2: Query-to-Query Self-Attention Interaction (MHSA)
-    - Layer 3: Multi-Sample Dropout (MSD) Shared Scoring Head
-    - Task C Bridge: Contextual representation h_B = sum_c (p_c * z'_c)
+    Pure Learnable Class Queries Cross-Attention Architecture:
+    - Layer 0: Context Role Embeddings (<T>=1 Title, <D>=2 Description, <C>=3 Comment)
+    - Layer 1: 3 Pure Learnable Class Prototype Queries [q_NoHate, q_Implicit, q_Explicit] (MHCA)
+    - Layer 2: Optional Inter-Query Self-Attention (MHSA)
+    - Layer 3: Shared Projection Scoring Head with Multi-Sample Dropout (MSD)
+    - Task C Bridge: Probability-weighted blend h_B = sum_c (p_c * z_c)
     """
-    def __init__(self, mmbert_model, d_model=768, num_heads=8, dropout=0.2, use_query_interaction=True):
+    def __init__(self, mmbert_model, d_model=768, num_heads=8, dropout=0.2, use_query_interaction=False, use_rmsnorm=True):
         super().__init__()
         self.mmbert = mmbert_model
         self.use_query_interaction = use_query_interaction
+        NormClass = RMSNorm if use_rmsnorm else nn.LayerNorm
         
-        # Layer 0: Role embeddings for context separation
+        # Layer 0: Role Embeddings
         self.role_embeddings = nn.Embedding(4, d_model)
-        self.layer_norm_input = nn.LayerNorm(d_model)
+        self.norm_input = NormClass(d_model)
 
-        # Layer 1: Learned Class Queries
-        self.query_embeddings = nn.Parameter(torch.empty(3, d_model))
-        nn.init.normal_(self.query_embeddings, std=0.02)
+        # Layer 1: 3 Learnable Prototype Class Queries
+        self.class_queries = nn.Parameter(torch.empty(3, d_model))
+        nn.init.normal_(self.class_queries, std=0.02)
+        self.norm_q = NormClass(d_model)
+        self.norm_kv = NormClass(d_model)
         self.cross_attention = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
-        self.layer_norm_cross = nn.LayerNorm(d_model)
+        self.dropout_cross = nn.Dropout(dropout)
 
-        # Layer 2: Query Interaction
+        # Layer 2: Optional Inter-Query Self-Attention
         if self.use_query_interaction:
+            self.norm_self = NormClass(d_model)
             self.self_attention = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
-            self.layer_norm_self = nn.LayerNorm(d_model)
+            self.dropout_self = nn.Dropout(dropout)
 
-        # Layer 3: Multi-Sample Dropout Scoring Head
-        self.dropouts = nn.ModuleList([nn.Dropout(p) for p in [0.1, 0.15, 0.2, 0.25, 0.3]])
-        self.fc = nn.Linear(d_model, 1)
+        # Layer 3: Shared Query Scoring Head + MSD
+        self.norm_head = NormClass(d_model)
+        self.dropouts = nn.ModuleList([nn.Dropout(p) for p in [0.10, 0.15, 0.20, 0.25, 0.30]])
+        self.scorer = nn.Linear(d_model, 1)
 
-    def forward(self, input_ids, attention_mask, role_ids):
-        # Backbone encoding with Role injection
+    def forward(self, input_ids, attention_mask, role_ids, return_attention_map=False):
         h_mmbert = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        h_final = self.layer_norm_input(h_mmbert + self.role_embeddings(role_ids))
+        h_role = self.norm_input(h_mmbert + self.role_embeddings(role_ids))
         
         B = input_ids.shape[0]
-        q = self.query_embeddings.unsqueeze(0).expand(B, -1, -1)
-        z_attn, attn_weights = self.cross_attention(query=q, key=h_final, value=h_final, key_padding_mask=(attention_mask == 0))
-        z = self.layer_norm_cross(q + z_attn)
+        q = self.class_queries.unsqueeze(0).expand(B, -1, -1)
+        z_attn, attn_weights = self.cross_attention(
+            query=self.norm_q(q), key=self.norm_kv(h_role), value=self.norm_kv(h_role),
+            key_padding_mask=(attention_mask == 0), need_weights=return_attention_map
+        )
+        z = q + self.dropout_cross(z_attn)
         
         if self.use_query_interaction:
-            z_self, _ = self.self_attention(query=z, key=z, value=z)
-            z_prime = self.layer_norm_self(z + z_self)
-        else:
-            z_prime = z
+            z_self, _ = self.self_attention(query=self.norm_self(z), key=self.norm_self(z), value=self.norm_self(z))
+            z = z + self.dropout_self(z_self)
             
-        # Multi-Sample Dropout averaging
-        logits_list = [self.fc(drop(z_prime)).squeeze(-1) for drop in self.dropouts]
-        s = torch.stack(logits_list, dim=0).mean(dim=0) # [B, 3]
+        z_norm = self.norm_head(z)
+        logits_list = [self.scorer(drop(z_norm)).squeeze(-1) for drop in self.dropouts]
+        logits = torch.stack(logits_list, dim=0).mean(dim=0) # [B, 3]
         
-        # Task C Bridge Representation
-        probs = F.softmax(s, dim=-1).unsqueeze(-1)
-        h_B = (probs * z_prime).sum(dim=1) # [B, 768]
-        return s, h_B, attn_weights
+        probs = F.softmax(logits, dim=-1).unsqueeze(-1)
+        h_B = (probs * z).sum(dim=1) # [B, 768]
+        return logits, h_B, attn_weights
+`
+  },
+  'pipeline/models/task_b_moe.py': {
+    desc: '4-Expert Mixture of Latent Query Banks (MoE) with Context-Aware Masked Mean Router (Archived in separate file).',
+    language: 'python',
+    code: `# pipeline/models/task_b_moe.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .norm import RMSNorm
+from .router import ContextRouter
+from .query_bank import ParallelQueryBankCrossAttention
+from .head import MultiSampleDropoutHead
+
+class TaskB4ExpertMoEModel(nn.Module):
+    """
+    4-Expert Mixture of Latent Query Banks (MoE) Architecture:
+    - Expert 0: Non-Hate Prototype Bank
+    - Expert 1: Implicit Hate / Sarcasm Bank
+    - Expert 2: Explicit Hate / Slurs Bank
+    - Expert 3: Context Mismatch / Video-Comment Discrepancy Bank
+    - Context Router: Masked Mean Pooling -> MLP -> Softmax Gating
+    """
+    def __init__(self, mmbert_model, d_model=768, num_experts=4, num_heads=8, dropout=0.20):
+        super().__init__()
+        self.mmbert = mmbert_model
+        self.num_experts = num_experts
+        self.role_embeddings = nn.Embedding(4, d_model)
+        self.router = ContextRouter(d_model=d_model, num_experts=num_experts)
+        self.query_banks = ParallelQueryBankCrossAttention(d_model=d_model, num_experts=num_experts, num_heads=num_heads)
+        self.classifier_head = MultiSampleDropoutHead(in_dim=d_model, num_classes=3)
+
+    def forward(self, input_ids, attention_mask, role_ids, return_gates=False):
+        h_mmbert = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        h_role = h_mmbert + self.role_embeddings(role_ids)
+        gates, _ = self.router(h_role, attention_mask) # [B, 4]
+        z_experts, attn_weights = self.query_banks(h_role, attention_mask) # [B, 4, 768]
+        z_final = torch.sum(gates.unsqueeze(-1) * z_experts, dim=1) # [B, 768]
+        logits = self.classifier_head(z_final)
+        h_B = z_final
+        if return_gates:
+            return logits, h_B, gates, attn_weights
+        return logits, h_B, attn_weights
 `
   },
   'pipeline/data.py': {
