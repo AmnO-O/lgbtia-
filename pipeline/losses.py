@@ -52,7 +52,7 @@ class FocalLoss(nn.Module):
         log_p = F.log_softmax(inputs, dim=-1) # [B, C]
         p = torch.exp(log_p)                  # [B, C]
 
-        # Numerical stability clamp (BUG-15 fix) to avoid 0 * inf = NaN under AMP/float16
+        # Numerical stability clamp to avoid 0 * inf = NaN under AMP/float16
         p = torch.clamp(p, min=1e-7, max=1.0 - 1e-7)
 
         # Gather target probabilities and log probabilities: [B]
@@ -74,7 +74,7 @@ class FocalLoss(nn.Module):
         # Apply focal modulation
         focal_loss = focal_weight * ce_loss # [B]
 
-        # Apply alpha class weights if provided (BUG-04 device-safe)
+        # Apply alpha class weights if provided (device-safe buffer)
         if self.alpha is not None:
             alpha = self.alpha.to(targets.device)
             alpha_t = alpha[targets] # [B]
@@ -88,6 +88,79 @@ class FocalLoss(nn.Module):
         return focal_loss
 
 
+class MoELoadBalanceLoss(nn.Module):
+    """
+    Mixture-of-Experts (MoE) Router Load Balancing Loss.
+    
+    Prevents expert collapse where the router overwhelmingly selects only one expert.
+    Computes normalized square-deviation across the batch:
+        L_balance = N * sum_{i=1}^N (mean(g_i)^2) - 1.0
+        
+    When distribution across experts is uniform (mean(g_i) = 1/N), loss is 0.0.
+    """
+    def __init__(self, num_experts: int = 4):
+        super().__init__()
+        self.num_experts = num_experts
+
+    def forward(self, gates: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            gates: Tensor of routing probabilities [B, num_experts]
+        Returns:
+            Scalar load balance regularization loss
+        """
+        if gates is None or gates.shape[0] == 0:
+            return torch.tensor(0.0, device=gates.device if gates is not None else 'cpu')
+        
+        # Batch-average expert utilization: [num_experts]
+        mean_gates = torch.mean(gates, dim=0)
+        
+        # L_balance = N * sum(mean_gates^2) - 1.0
+        loss = self.num_experts * torch.sum(mean_gates ** 2) - 1.0
+        return torch.clamp(loss, min=0.0)
+
+
+class TaskBLoss(nn.Module):
+    """
+    Unified Task B Loss combining multi-class focal loss (with Multi-Sample Dropout averaging)
+    and optional MoE Router Load Balancing regularization.
+    """
+    def __init__(
+        self,
+        base_criterion: nn.Module,
+        num_experts: int = 4,
+        loss_balance_weight: float = 0.01
+    ):
+        super().__init__()
+        self.base_criterion = base_criterion
+        self.load_balance = MoELoadBalanceLoss(num_experts=num_experts)
+        self.loss_balance_weight = loss_balance_weight
+
+    def forward(
+        self,
+        logits: Union[torch.Tensor, List[torch.Tensor]],
+        targets: torch.Tensor,
+        gates: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            logits: Single tensor [B, 3] or list of MSD branch tensors
+            targets: Class target indices [B]
+            gates: Optional router gates [B, num_experts]
+        """
+        if isinstance(logits, list):
+            branch_losses = [self.base_criterion(branch_logit, targets) for branch_logit in logits]
+            cls_loss = torch.mean(torch.stack(branch_losses))
+        else:
+            cls_loss = self.base_criterion(logits, targets)
+
+        if gates is not None and self.loss_balance_weight > 0.0:
+            bal_loss = self.load_balance(gates)
+            return cls_loss + self.loss_balance_weight * bal_loss
+
+        return cls_loss
+
+
 def build_loss_fn(
     loss_type: str = "focal",
     class_weights: Optional[List[float]] = None,
@@ -96,7 +169,7 @@ def build_loss_fn(
     device: Optional[torch.device] = None
 ) -> nn.Module:
     """
-    Factory builder for Task B loss functions (Focal Loss or CrossEntropyLoss).
+    Factory builder for Task B base loss functions (Focal Loss or CrossEntropyLoss).
     """
     if loss_type == "focal":
         alpha = None
@@ -124,14 +197,9 @@ def build_loss_fn(
 class MultiTaskLoss(nn.Module):
     """
     Weighted Multi-Task Loss for StereoQueer:
-      - Stereotype Presence (ST): BCEWithLogitsLoss (or Focal)
-      - Hate Speech Type (HS): CrossEntropyLoss (or FocalLoss)
+      - Stereotype Presence (ST): BCEWithLogitsLoss
+      - Hate Speech Type (HS): CrossEntropyLoss or FocalLoss
       - Stereotype Target Group (TG): BCEWithLogitsLoss
-
-    Supports both dictionary inputs: forward(preds_dict, targets_dict)
-    and 6 positional arguments: forward(st_logits, hs_logits, tg_logits, st_tgt, hs_tgt, tg_tgt).
-    Returns a MultiTaskLossResult object that can be unpacked as `loss, loss_dict`
-    or indexed as a dictionary `loss['total']`.
     """
     def __init__(self, config: PipelineConfig):
         super().__init__()
@@ -141,7 +209,6 @@ class MultiTaskLoss(nn.Module):
         
         self.loss_st = nn.BCEWithLogitsLoss()
         
-        # Check if focal loss is configured for HS
         if getattr(config, 'loss_type', 'focal') == 'focal':
             class_weights = getattr(config, 'class_weights', None)
             focal_gamma = getattr(config, 'focal_gamma', 2.0)
@@ -183,7 +250,7 @@ class MultiTaskLoss(nn.Module):
         else:
             raise ValueError("MultiTaskLoss expects either 2 dicts (preds, targets) or 6 positional tensors.")
 
-        # Ensure matching shapes for ST (BUG-02 fix)
+        # Ensure matching shapes for ST binary classification
         st_pred = st_pred.squeeze(-1) if st_pred.ndim > 1 and st_pred.shape[-1] == 1 else st_pred
         st_tgt = st_tgt.view_as(st_pred)
 

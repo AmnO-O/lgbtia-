@@ -18,14 +18,21 @@ class PipelineConfig:
     task: str = "stereoqueer"                   # 'stereoqueer' or 'toxic'
     target_task: str = "all"                    # 'all', 'st' (stereotype), 'hs' (hate_speech), or 'tg' (target)
     embed_source: str = "mmbert"                # 'mmbert' or 'scratch'
-    model_type: str = "mmbert_transformer"      # 'mmbert_transformer', 'feature_mlp', 'transformer', 'bilstm', 'rnn'
+    model_type: str = "task_b_class_aware"      # 'task_b_class_aware', 'mmbert_transformer', 'feature_mlp', 'transformer', 'bilstm', 'rnn'
     
     # Pretrained Transformer settings
     mmbert_model_name: str = "AmnO-O/mmbert-queer-hate-adapted"  # Domain-adapted mmBERT (fallback: "jhu-clsp/mmbert-base")
     mmbert_dim: int = 768
     max_length: int = 256
-    num_slots_per_class: int = 1                # Number of learnable query vectors per class (e.g. 1 -> 3 total, 2 -> 6 total)
-    use_query_interaction: bool = False         # Layer 2 Query-to-Query Self-Attention
+    
+    # 4-Expert MoE & Query Bank Settings
+    num_experts: int = 4                        # Number of dynamic expert query banks (4: Non-Hate, Implicit, Explicit, Context Mismatch)
+    num_slots_per_expert: int = 1               # Number of learnable query vectors per expert bank
+    num_slots_per_class: int = 1                # Backward compatibility alias
+    router_hidden_dim: int = 256                # Context Router MLP intermediate dimension
+    router_temperature: float = 1.0             # Softmax routing temperature
+    loss_balance_weight: float = 0.01           # Load balancing loss regularizer weight lambda
+    use_query_interaction: bool = False         # Inter-Query Self-Attention
     use_rmsnorm: bool = True                    # Use RMSNorm over LayerNorm for stability & speed
     
     # Scratch model parameters
@@ -65,7 +72,7 @@ class PipelineConfig:
     unfreeze_lr: float = 2e-5                   # Learning rate for unfrozen backbone
     head_unfreeze_lr: float = 1e-5              # Fine-tuning learning rate for heads
     
-    # Multi-task loss weights (CE has higher raw value than BCE, so boost st & tg)
+    # Multi-task loss weights
     loss_st_weight: float = 1.5
     loss_hs_weight: float = 1.0
     loss_tg_weight: float = 1.5

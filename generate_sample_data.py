@@ -159,13 +159,55 @@ SAMPLE_NL = [
     }
 ]
 
+# Persian (FA) - Low-resource Indo-Iranian language released for testing only (zero-shot transfer evaluation)
+SAMPLE_FA = [
+    {
+        "StereoQueerEval_id": "test_FA_0001",
+        "yt_title": "مستند گفتگو درباره حقوق افراد کوییر و اقلیت‌های جنسی",
+        "yt_description": "بررسی چالش‌های اجتماعی و حقوقی اقلیت‌های جنسیتی در جوامع مختلف.",
+        "yt_comment": "این افراد فقط به دنبال جلب توجه هستند و جامعه و خانواده را به انحراف می‌کشانند.",
+        "stereotype": "yes",
+        "hate_speech": "yes_implicit",
+        "target": "group_lgbtqia+"
+    },
+    {
+        "StereoQueerEval_id": "test_FA_0002",
+        "yt_title": "مستند گفتگو درباره حقوق افراد کوییر و اقلیت‌های جنسی",
+        "yt_description": "بررسی چالش‌های اجتماعی و حقوقی اقلیت‌های جنسیتی در جوامع مختلف.",
+        "yt_comment": "گزارش بسیار آموزنده و بی‌طرفانه‌ای بود، سپاس از نگاه انسانی شما.",
+        "stereotype": "no",
+        "hate_speech": "no",
+        "target": "none"
+    },
+    {
+        "StereoQueerEval_id": "test_FA_0003",
+        "yt_title": "گزارش ویژه از رویداد سالانه افتخار و آزادی بیان",
+        "yt_description": "پوشش زنده جشن‌های جامعه رنگین‌کمانی و پیام همبستگی.",
+        "yt_comment": "این موجودات فاسد و نجس باید از جامعه ریشه‌کن و طرد شوند!",
+        "stereotype": "no",
+        "hate_speech": "yes_explicit",
+        "target": "group_lgbtqia+"
+    },
+    {
+        "StereoQueerEval_id": "test_FA_0004",
+        "yt_title": "گزارش ویژه از رویداد سالانه افتخار و آزادی بیان",
+        "yt_description": "پوشش زنده جشن‌های جامعه رنگین‌کمانی و پیام همبستگی.",
+        "yt_comment": "همه افراد ترنس صرفا دچار بحران هویت زودگذر هستند و نباید جدی گرفته شوند.",
+        "stereotype": "yes",
+        "hate_speech": "yes_implicit",
+        "target": "group_t"
+    }
+]
+
 def generate_sample_dataset(data_dir: str = "data", multiplier: int = 15):
-    """Generates synthetic multi-lingual sample TSV datasets with field quoting."""
+    """Generates synthetic multi-lingual sample TSV datasets with field quoting across EN, IT, NL, and FA (test)."""
     os.makedirs(data_dir, exist_ok=True)
     splits = [
         ("StereoQueerEval_EN_training.tsv", SAMPLE_EN),
         ("StereoQueerEval_IT_training.tsv", SAMPLE_IT),
         ("StereoQueerEval_NL_training.tsv", SAMPLE_NL),
+        ("StereoQueerEval_FA_test.tsv", SAMPLE_FA),
+        ("StereoQueerEval_FA_training.tsv", SAMPLE_FA),
     ]
 
     for fname, sample_list in splits:

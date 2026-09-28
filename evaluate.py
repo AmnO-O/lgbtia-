@@ -130,7 +130,7 @@ def main():
             df_val=df_val,
             device=device
         )
-        _, metrics, _, _ = trainer.eval_epoch()
+        _, metrics, _, _, _ = trainer.eval_epoch()
         print_metrics(metrics, "TASK B VALIDATION EVALUATION RESULTS")
     else:
         metrics, preds = evaluate_stereoqueer(model, df_val, val_loader, device, is_mmbert_tf=is_mmbert_tf)
