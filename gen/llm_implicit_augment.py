@@ -159,8 +159,12 @@ def parse_args():
                         help='Maximum number of explicit source rows to process')
     parser.add_argument('--n-variants', type=int, default=3,
                         help='Number of distinct implicit variants to generate per explicit comment in a single prompt (default: 3)')
+    parser.add_argument('--delay', type=float, default=0.0,
+                        help='Pause/cooldown in seconds between each request (e.g. --delay 4.0 for Gemini Free Tier 15 RPM)')
+    parser.add_argument('--rpm', type=int, default=None,
+                        help='Target maximum Requests Per Minute rate limit (e.g. --rpm 14 for Free Tier)')
     parser.add_argument('--max-concurrency', type=int, default=None,
-                        help='Max parallel worker threads (default: 8 for gemini, 4 for groq)')
+                        help='Max parallel worker threads (default: 8 for gemini, 4 for groq; use 1-2 if on Free Tier)')
     parser.add_argument('--max-retries', type=int, default=6,
                         help='Max retries per sample upon rate limit')
     parser.add_argument('--max-chars', type=int, default=1200,
@@ -599,6 +603,13 @@ def main():
     _CTX['model'] = get_default_model(kind)
     concurrency = ARGS.max_concurrency or (8 if kind == 'gemini' else 4)
 
+    # Compute rate pacer delay (cooldown between requests)
+    effective_delay = ARGS.delay
+    if ARGS.rpm and ARGS.rpm > 0:
+        effective_delay = max(effective_delay, 60.0 / ARGS.rpm)
+    if effective_delay > 0:
+        print(f"Rate Limiter Active: {effective_delay:.2f}s cooldown pause between requests (~{60.0/effective_delay:.1f} RPM)")
+
     print(f"API Provider: {kind} | Model: {_CTX['model']} | Parallel Workers: {concurrency}")
 
     results: Dict[str, Dict[str, Any]] = dict(existing_items)
@@ -666,6 +677,9 @@ def main():
                         print(f"  Progress: {processed_count}/{len(todo_rows)} prompts ({speed:.1f} prompts/s) | "
                               f"Total Synthetic Rows: {total_var_saved} | Ok: {stats['ok']} | Errors: {stats['empty_or_invalid'] + stats['gave_up']}",
                               flush=True)
+
+                if effective_delay > 0 and (i + concurrency) < len(todo_rows):
+                    time.sleep(effective_delay * len(chunk))
 
     except KeyboardInterrupt:
         print("\n[Ctrl+C detected] Gracefully saving generated items before exit...", flush=True)
