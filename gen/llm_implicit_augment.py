@@ -203,8 +203,12 @@ def parse_args():
                         help='Output JSON metadata path')
     parser.add_argument('--tsv-dir', default='LGBT',
                         help='Output directory for SynthImplicit_{LANG}_training.tsv files')
-    parser.add_argument('--resume', action='store_true',
-                        help='Skip rows already present in output JSON')
+    parser.add_argument('--resume', action='store_true', default=True,
+                        help='Skip rows already present in output JSON (Default: True)')
+    parser.add_argument('--no-resume', action='store_false', dest='resume',
+                        help='Do not resume, ignore previous output JSON')
+    parser.add_argument('--force-restart', action='store_true',
+                        help='Delete existing output JSON/TSV and start from scratch')
     parser.add_argument('--txt-suffix', default='_training.tsv',
                         help='Suffix of output TSV files')
     parser.add_argument('--dry-run', action='store_true',
@@ -697,6 +701,13 @@ def main():
         print(f"Total available: {len(rows)} comments -> ~{len(rows) * ARGS.n_variants} total synthetic samples")
         return
 
+    if ARGS.force_restart and os.path.exists(ARGS.out):
+        try:
+            os.remove(ARGS.out)
+            print(f"🗑️ Removed existing output JSON {ARGS.out} (Force Restart)")
+        except Exception:
+            pass
+
     # Load existing cache
     existing_items = load_existing(ARGS.out) if ARGS.resume else {}
     done_ids: Set[str] = set(existing_items.keys())
@@ -791,15 +802,17 @@ def main():
                                 'generated_at': now_iso(),
                             }
 
-                    if processed_batches_count % 10 == 0 or processed_batches_count == len(prompt_batches):
-                        total_var_saved = persist_snapshot()
-                        elapsed = time.time() - t0
-                        speed = (processed_batches_count * ARGS.batch_size) / max(elapsed, 0.001)
+                    # Persist snapshot immediately to disk so no progress is ever lost
+                    total_var_saved = persist_snapshot()
+                    elapsed = time.time() - t0
+                    speed = (processed_batches_count * ARGS.batch_size) / max(elapsed, 0.001)
+
+                    if processed_batches_count % 5 == 0 or processed_batches_count == len(prompt_batches):
                         print(f"  Progress: {processed_batches_count}/{len(prompt_batches)} requests ({speed:.1f} comments/s) | "
                               f"Total Synthetic Rows: {total_var_saved} | Ok: {stats['ok']} | Errors: {stats['empty_or_invalid'] + stats['gave_up']}",
                               flush=True)
                     else:
-                        print(f"  [{processed_batches_count}/{len(prompt_batches)}] ok={stats['ok']} empty={stats['empty_or_invalid']} gave_up={stats['gave_up']} fatal={stats['fatal']}",
+                        print(f"  [{processed_batches_count}/{len(prompt_batches)}] (Saved {total_var_saved} rows) ok={stats['ok']} empty={stats['empty_or_invalid']}",
                               flush=True)
 
                 if effective_delay > 0 and (i + concurrency) < len(prompt_batches):

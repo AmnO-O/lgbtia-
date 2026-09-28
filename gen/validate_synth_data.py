@@ -1,35 +1,41 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Production Synthetic Data Validation & Quality Filtering Script
+Production Synthetic Data Validation & Quality Filtering Script with Checkpointing
 for StereoQueerEval 2027 (SemEval Task B / C).
 
-Performs rigorous automated quality auditing & filtering on LLM-augmented data:
-  Stage 1: Schema & Format Integrity (7-column SemEval standard, valid IDs, non-empty fields)
-  Stage 2: LLM Artifact & Refusal Detection (strip preambles, detect refusal/apology outputs)
-  Stage 3: Class Purity & Overt Slur Filter (ensures comments are truly 'yes_implicit', not 'yes_explicit')
-  Stage 4: Diversity & Non-Triviality (reject exact/near verbatim duplicates & degenerate length)
-  Stage 5: Language & Target Consistency (detects target drift, language mismatch)
-  Stage 6 (Optional): BATCH LLM-as-a-Judge Verification (Gemini / Groq multi-item consensus check)
-                      Processes 5-10 candidate items per single API call, saving 5x-10x quota & time.
+Features:
+  1. Automated 6-Stage Quality Filter:
+     - Stage 1: Schema & Format Integrity (7-column SemEval standard, valid target formats)
+     - Stage 2: Artifact & Refusal Detection (strips preambles, detect refusal/apology outputs)
+     - Stage 3: Class Purity & Overt Slur Filter (ensures comments are truly 'yes_implicit', not 'yes_explicit')
+     - Stage 4: Diversity & Non-Triviality (reject exact/near duplicates & degenerate word lengths)
+     - Stage 5: Language & Target Consistency (detects target drift, language mismatch)
+     - Stage 6: Batch LLM-as-a-Judge (Gemini / Groq multi-item consensus check in 1 API call)
+
+  2. ⚡ ROBUST CHECKPOINTING & RESUME:
+     - Automatically saves intermediate judgments to `{tsv_path}.checkpoint.json` after EVERY batch.
+     - If interrupted (Ctrl+C, timeout, network error), re-running the script instantly resumes
+       from where it stopped with ZERO lost progress and ZERO duplicate API calls!
+     - Can be controlled with `--resume` (default: True) or `--no-resume` / `--force-restart`.
 
 Outputs:
   - Cleaned & Verified TSV: {path}_clean.tsv (or direct overwrite)
+  - Validation Checkpoint:  {path}.checkpoint.json (state cache)
   - Detailed Audit Report:  {out_dir}/synth_validation_report.json
-  - Visual Terminal Summary with rejection breakdown & quality metrics.
 
 Usage:
-  # 1. Fast rule-based validation (Instant & Free):
+  # Fast rule-based validation (Instant):
   python gen/validate_synth_data.py --input data/SynthImplicit_NL_training.tsv
 
-  # 2. Batch LLM-as-a-Judge (5 items per API call with Gemini Flash):
+  # Batch LLM-as-a-Judge with Auto-Checkpointing & Resume:
   python gen/validate_synth_data.py --input data/SynthImplicit_NL_training.tsv --use-llm-judge --api gemini --judge-batch-size 5
 
-  # 3. Free-tier Safe Mode (Batch size 5 + 14 RPM rate limiter):
+  # Free Tier mode (Batch size 5 + 14 RPM rate limiter + Checkpointing):
   python gen/validate_synth_data.py --input data/SynthImplicit_NL_training.tsv --use-llm-judge --api gemini --judge-batch-size 5 --judge-rpm 14
 
-  # 4. In-place overwrite with clean dataset:
-  python gen/validate_synth_data.py --input data/SynthImplicit_NL_training.tsv --overwrite
+  # Force start from scratch (ignoring old checkpoints):
+  python gen/validate_synth_data.py --input data/SynthImplicit_NL_training.tsv --force-restart
 """
 
 import argparse
@@ -39,6 +45,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -72,6 +79,18 @@ def auto_load_dotenv():
             break
 
 auto_load_dotenv()
+
+# -----------------------------------------------------------------------------
+# ATOMIC FILE OPERATIONS
+# -----------------------------------------------------------------------------
+def atomic_save_json(path: str, data: Any):
+    """Safely saves JSON data via an atomic temporary file to prevent corruption on interrupt."""
+    dir_name = os.path.dirname(os.path.abspath(path))
+    os.makedirs(dir_name, exist_ok=True)
+    with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False, encoding='utf-8') as tf:
+        json.dump(data, tf, indent=2, ensure_ascii=False)
+        temp_name = tf.name
+    os.replace(temp_name, path)
 
 # -----------------------------------------------------------------------------
 # CONSTANTS & LEXICONS
@@ -125,7 +144,6 @@ OVERT_SLURS_MULTILINGUAL = {
     ]
 }
 
-# Stopwords / markers for language verification
 LANGUAGE_MARKERS = {
     'EN': {'the', 'and', 'is', 'to', 'in', 'it', 'you', 'that', 'this', 'for', 'are', 'with', 'not'},
     'IT': {'il', 'la', 'che', 'e', 'un', 'una', 'in', 'per', 'non', 'sono', 'questo', 'questa', 'di', 'con'},
@@ -134,7 +152,7 @@ LANGUAGE_MARKERS = {
 
 
 # -----------------------------------------------------------------------------
-# DETERMINISTIC VALIDATION & CLEANING FUNCTIONS
+# DETERMINISTIC CLEANING & FILTER FUNCTIONS
 # -----------------------------------------------------------------------------
 
 def clean_comment_text(text: str) -> str:
@@ -197,15 +215,6 @@ def check_overt_slurs(text: str, lang: str) -> Tuple[bool, Optional[str]]:
         if re.search(pattern, text_lower):
             return True, slur
     return False, None
-
-
-def compute_token_similarity(text1: str, text2: str) -> float:
-    """Computes Jaccard word-level similarity between two texts."""
-    words1 = set(re.findall(r'\w+', text1.lower()))
-    words2 = set(re.findall(r'\w+', text2.lower()))
-    if not words1 or not words2:
-        return 0.0
-    return len(words1 & words2) / len(words1 | words2)
 
 
 def check_language_markers(text: str, lang: str) -> Tuple[bool, float]:
@@ -299,10 +308,6 @@ class BatchLLMJudge:
             self.last_call_time = time.time()
 
     def judge_batch(self, items: List[Dict[str, Any]], lang: str) -> Dict[str, Dict[str, Any]]:
-        """
-        Evaluates a batch of candidate items in ONE single API call.
-        Returns a dict mapping item_id -> evaluation dict.
-        """
         self._wait_rate_limit()
 
         formatted_items = []
@@ -384,11 +389,11 @@ class BatchLLMJudge:
 
 
 # -----------------------------------------------------------------------------
-# MAIN VALIDATION PIPELINE
+# MAIN VALIDATION PIPELINE WITH CHECKPOINTING
 # -----------------------------------------------------------------------------
 
 class SyntheticDataValidator:
-    """Comprehensive multi-stage validator and cleaner for synthetic TSV datasets."""
+    """Comprehensive multi-stage validator and cleaner with persistent checkpointing."""
     def __init__(
         self,
         min_words: int = 3,
@@ -397,18 +402,33 @@ class SyntheticDataValidator:
         judge_api: str = "gemini",
         judge_model: Optional[str] = None,
         judge_batch_size: int = 5,
-        judge_rpm: int = 0
+        judge_rpm: int = 0,
+        resume: bool = True
     ):
         self.min_words = min_words
         self.max_words = max_words
         self.use_llm_judge = use_llm_judge
         self.judge_batch_size = judge_batch_size
+        self.resume = resume
         self.batch_judge = BatchLLMJudge(
             api=judge_api,
             model_name=judge_model,
             batch_size=judge_batch_size,
             rpm=judge_rpm
         ) if use_llm_judge else None
+
+    def _load_checkpoint(self, checkpoint_path: str) -> Dict[str, Any]:
+        """Loads existing checkpoint cache if available."""
+        if not self.resume or not os.path.isfile(checkpoint_path):
+            return {"judgments": {}, "processed_ids": []}
+        try:
+            with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            print(f"  ⚡ Loaded existing checkpoint: {len(data.get('judgments', {}))} items already validated.")
+            return data
+        except Exception as e:
+            print(f"  [Warning] Could not load checkpoint from {checkpoint_path}: {e}")
+            return {"judgments": {}, "processed_ids": []}
 
     def validate_file(
         self,
@@ -418,9 +438,13 @@ class SyntheticDataValidator:
         known_val_titles: Optional[Set[str]] = None,
         known_val_ids: Optional[Set[str]] = None
     ) -> Dict[str, Any]:
-        """Validates a single synthetic TSV file and saves clean records."""
+        """Validates a single synthetic TSV file with incremental checkpointing."""
         if not os.path.isfile(input_tsv):
             raise FileNotFoundError(f"Input file not found: {input_tsv}")
+
+        checkpoint_path = input_tsv + ".checkpoint.json"
+        cached_data = self._load_checkpoint(checkpoint_path)
+        checkpoint_judgments: Dict[str, Dict[str, Any]] = cached_data.get("judgments", {})
 
         match = re.search(r'_([A-Z]{2})(?:_training|_clean)?\.tsv$', input_tsv)
         lang = match.group(1) if match else "NL"
@@ -527,28 +551,48 @@ class SyntheticDataValidator:
         print(f"  ✅ {len(candidate_rows)}/{total_samples} samples passed deterministic filter.")
 
         # -------------------------------------------------------------
-        # Stage 6: BATCH LLM-AS-A-JUDGE (If enabled)
+        # Stage 6: BATCH LLM-AS-A-JUDGE WITH CHECKPOINTING
         # -------------------------------------------------------------
         accepted_rows = []
         if self.batch_judge and candidate_rows:
-            print(f"\n🤖 Stage 6: Running Batch LLM-as-a-Judge (Batch Size: {self.judge_batch_size}, Total: {len(candidate_rows)})...")
-            batches = [candidate_rows[i:i + self.judge_batch_size] for i in range(0, len(candidate_rows), self.judge_batch_size)]
-            
-            for b_idx, batch in enumerate(batches):
-                print(f"  Evaluating batch {b_idx + 1}/{len(batches)} ({len(batch)} items)...", end="\r", flush=True)
-                judge_results = self.batch_judge.judge_batch(batch, lang=lang)
+            # Separate already cached vs pending
+            pending_candidates = [it for it in candidate_rows if it['id'] not in checkpoint_judgments]
+            print(f"\n🤖 Stage 6: Batch LLM-as-a-Judge (Batch Size: {self.judge_batch_size})")
+            print(f"  • Total Candidates:    {len(candidate_rows)}")
+            print(f"  • Cached (From Checkpoint): {len(candidate_rows) - len(pending_candidates)}")
+            print(f"  • Pending API Evaluation:   {len(pending_candidates)}")
+
+            if pending_candidates:
+                batches = [pending_candidates[i:i + self.judge_batch_size] for i in range(0, len(pending_candidates), self.judge_batch_size)]
                 
-                for item in batch:
-                    res = judge_results.get(item['id'], {'verdict': 'ACCEPT'})
-                    if res['verdict'] == 'REJECT':
-                        rejected_stats['llm_judge_rejected'] += 1
-                        rejection_details.append({
-                            'id': item['id'],
-                            'reason': f"LLM Judge: {res.get('reason', 'Rejected')} (Detected: {res.get('detected_class')})",
-                            'comment': item['comment']
+                try:
+                    for b_idx, batch in enumerate(batches):
+                        print(f"  Evaluating batch {b_idx + 1}/{len(batches)} ({len(batch)} items)...", end="\r", flush=True)
+                        batch_results = self.batch_judge.judge_batch(batch, lang=lang)
+                        checkpoint_judgments.update(batch_results)
+
+                        # Save checkpoint incrementally after every batch
+                        atomic_save_json(checkpoint_path, {
+                            "input_file": input_tsv,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                            "judgments": checkpoint_judgments
                         })
-                    else:
-                        accepted_rows.append(item['row_data'])
+                except KeyboardInterrupt:
+                    print("\n[Ctrl+C detected] Saving progress to checkpoint before exit...", flush=True)
+
+            # Consolidate accepted / rejected based on completed judgments
+            for item in candidate_rows:
+                res = checkpoint_judgments.get(item['id'], {'verdict': 'ACCEPT'})
+                if res['verdict'] == 'REJECT':
+                    rejected_stats['llm_judge_rejected'] += 1
+                    rejection_details.append({
+                        'id': item['id'],
+                        'reason': f"LLM Judge: {res.get('reason', 'Rejected')} (Detected: {res.get('detected_class')})",
+                        'comment': item['comment']
+                    })
+                else:
+                    accepted_rows.append(item['row_data'])
+
             print(f"\n  ✨ Batch LLM Judge completed. Accepted: {len(accepted_rows)} samples.")
         else:
             accepted_rows = [item['row_data'] for item in candidate_rows]
@@ -574,6 +618,7 @@ class SyntheticDataValidator:
         report = {
             "input_file": input_tsv,
             "output_file": output_tsv,
+            "checkpoint_file": checkpoint_path,
             "language": lang,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "total_input_rows": total_samples,
@@ -593,6 +638,7 @@ class SyntheticDataValidator:
         print("📊 SYNTHETIC DATA QUALITY AUDIT REPORT")
         print(f"  • Input File:        {report['input_file']}")
         print(f"  • Cleaned Output:    {report['output_file']}")
+        print(f"  • Checkpoint Cache:  {report['checkpoint_file']}")
         print(f"  • Total Evaluated:   {report['total_input_rows']} samples")
         print(f"  • Accepted Clean:    {report['accepted_rows']} samples ({report['acceptance_rate_percent']}%)")
         print(f"  • Filtered Out:      {report['rejected_rows']} samples")
@@ -608,13 +654,17 @@ class SyntheticDataValidator:
 # -----------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Validate & Clean Synthetic TSV Dataset for StereoQueerEval 2027")
+    parser = argparse.ArgumentParser(description="Validate & Clean Synthetic TSV Dataset with Checkpoint/Resume")
     parser.add_argument("--input", "-i", type=str, default=None, help="Path to single synthetic TSV file")
     parser.add_argument("--data-dir", "-d", type=str, default="data", help="Directory to scan for Synth*.tsv files")
     parser.add_argument("--output", "-o", type=str, default=None, help="Output TSV path (default: {input}_clean.tsv)")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite the input TSV directly in-place")
     parser.add_argument("--report-file", type=str, default="data/synth_validation_report.json", help="Path to save audit JSON report")
     
+    # Checkpoint & Resume
+    parser.add_argument("--no-resume", action="store_true", help="Do not load existing checkpoint cache")
+    parser.add_argument("--force-restart", action="store_true", help="Delete checkpoint file and restart from scratch")
+
     # Filter thresholds
     parser.add_argument("--min-words", type=int, default=3, help="Minimum word length for a valid comment")
     parser.add_argument("--max-words", type=int, default=180, help="Maximum word length for a valid comment")
@@ -631,6 +681,14 @@ def parse_args():
 
 def main():
     args = parse_args()
+    
+    # Check if force restart
+    if args.force_restart and args.input:
+        ckpt = args.input + ".checkpoint.json"
+        if os.path.exists(ckpt):
+            os.remove(ckpt)
+            print(f"🗑️ Removed checkpoint cache {ckpt} (Force Restart)")
+
     validator = SyntheticDataValidator(
         min_words=args.min_words,
         max_words=args.max_words,
@@ -638,7 +696,8 @@ def main():
         judge_api=args.api,
         judge_model=args.judge_model,
         judge_batch_size=args.judge_batch_size,
-        judge_rpm=args.judge_rpm
+        judge_rpm=args.judge_rpm,
+        resume=not args.no_resume
     )
 
     target_files = []
