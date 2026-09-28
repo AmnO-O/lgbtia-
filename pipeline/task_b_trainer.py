@@ -361,10 +361,14 @@ class TaskBTrainer:
                 last_metrics = metrics
 
                 macro_f1 = metrics.get('hs_macro_f1', 0.0)
+                f1_no = metrics.get('hs_f1_no', 0.0)
+                f1_imp = metrics.get('hs_f1_implicit', 0.0)
+                f1_exp = metrics.get('hs_f1_explicit', 0.0)
+
                 gate_str = f" | Gates: [{', '.join([f'E{i}:{g:.2f}' for i, g in enumerate(train_gates)])}]" if len(train_gates) > 0 and not np.all(train_gates == 0) else ""
                 print(f"Epoch {epoch:02d}/{self.config.freeze_phase_epochs:02d} [{elapsed:.1f}s] "
                       f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                      f"Val Macro-F1: {macro_f1:.4f}{gate_str}")
+                      f"Val Macro-F1: {macro_f1:.4f} [no: {f1_no:.4f}, implicit: {f1_imp:.4f}, explicit: {f1_exp:.4f}]{gate_str}")
 
                 self.history.append({
                     'epoch': epoch,
@@ -372,6 +376,9 @@ class TaskBTrainer:
                     'train_loss': train_loss,
                     'val_loss': val_loss,
                     'hs_macro_f1': macro_f1,
+                    'hs_f1_no': f1_no,
+                    'hs_f1_implicit': f1_imp,
+                    'hs_f1_explicit': f1_exp,
                     'gates': train_gates
                 })
 
@@ -409,10 +416,14 @@ class TaskBTrainer:
                 last_metrics = metrics
 
                 macro_f1 = metrics.get('hs_macro_f1', 0.0)
+                f1_no = metrics.get('hs_f1_no', 0.0)
+                f1_imp = metrics.get('hs_f1_implicit', 0.0)
+                f1_exp = metrics.get('hs_f1_explicit', 0.0)
+
                 gate_str = f" | Gates: [{', '.join([f'E{i}:{g:.2f}' for i, g in enumerate(train_gates)])}]" if len(train_gates) > 0 and not np.all(train_gates == 0) else ""
                 print(f"Epoch {epoch:02d}/{total_p2_epochs:02d} [{elapsed:.1f}s] "
                       f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                      f"Val Macro-F1: {macro_f1:.4f}{gate_str}")
+                      f"Val Macro-F1: {macro_f1:.4f} [no: {f1_no:.4f}, implicit: {f1_imp:.4f}, explicit: {f1_exp:.4f}]{gate_str}")
 
                 self.history.append({
                     'epoch': self.config.freeze_phase_epochs + epoch,
@@ -420,6 +431,9 @@ class TaskBTrainer:
                     'train_loss': train_loss,
                     'val_loss': val_loss,
                     'hs_macro_f1': macro_f1,
+                    'hs_f1_no': f1_no,
+                    'hs_f1_implicit': f1_imp,
+                    'hs_f1_explicit': f1_exp,
                     'gates': train_gates
                 })
 
@@ -448,10 +462,14 @@ class TaskBTrainer:
                 last_metrics = metrics
 
                 macro_f1 = metrics.get('hs_macro_f1', 0.0)
-                gate_str = ", ".join([f"E{i}:{g:.2f}" for i, g in enumerate(train_gates)]) if len(train_gates) > 0 else "N/A"
+                f1_no = metrics.get('hs_f1_no', 0.0)
+                f1_imp = metrics.get('hs_f1_implicit', 0.0)
+                f1_exp = metrics.get('hs_f1_explicit', 0.0)
+
+                gate_str = f" | Gates: [{', '.join([f'E{i}:{g:.2f}' for i, g in enumerate(train_gates)])}]" if len(train_gates) > 0 and not np.all(train_gates == 0) else ""
                 print(f"Epoch {epoch:02d}/{self.config.epochs:02d} [{elapsed:.1f}s] "
                       f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                      f"Val Macro-F1: {macro_f1:.4f} | Gates: [{gate_str}]")
+                      f"Val Macro-F1: {macro_f1:.4f} [no: {f1_no:.4f}, implicit: {f1_imp:.4f}, explicit: {f1_exp:.4f}]{gate_str}")
 
                 self.history.append({
                     'epoch': epoch,
@@ -459,6 +477,9 @@ class TaskBTrainer:
                     'train_loss': train_loss,
                     'val_loss': val_loss,
                     'hs_macro_f1': macro_f1,
+                    'hs_f1_no': f1_no,
+                    'hs_f1_implicit': f1_imp,
+                    'hs_f1_explicit': f1_exp,
                     'gates': train_gates
                 })
 

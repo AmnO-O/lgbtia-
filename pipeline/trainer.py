@@ -137,7 +137,7 @@ class StereoQueerTrainer:
         tg_probs = np.concatenate(tg_list, axis=0)
 
         # Compute metrics
-        from sklearn.metrics import accuracy_score, f1_score
+        from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
         from .data import decode_target
 
         st_preds = (st_probs >= 0.5).astype(int)
@@ -147,11 +147,16 @@ class StereoQueerTrainer:
         gold_hs = self.df_val['hs_y'].values.astype(int)
         gold_tg = self.df_val['target'].fillna('none').values
 
+        _, _, hs_f1s, _ = precision_recall_fscore_support(gold_hs, hs_preds, labels=[0, 1, 2], zero_division=0)
+
         metrics = {
             'st_acc': float(accuracy_score(gold_st, st_preds)),
             'st_f1': float(f1_score(gold_st, st_preds, average='macro', zero_division=0)),
             'hs_acc': float(accuracy_score(gold_hs, hs_preds)),
             'hs_f1': float(f1_score(gold_hs, hs_preds, average='macro', zero_division=0)),
+            'hs_f1_no': float(hs_f1s[0]),
+            'hs_f1_implicit': float(hs_f1s[1]),
+            'hs_f1_explicit': float(hs_f1s[2]),
             'tg_exact_match': float((tg_pred_str == gold_tg).mean()),
         }
         metrics['macro_avg_f1'] = float((metrics['st_f1'] + metrics['hs_f1'] + metrics['tg_exact_match']) / 3.0)
@@ -190,8 +195,9 @@ class StereoQueerTrainer:
             }
             self.history.append(epoch_record)
 
+            f1_no_str = f" [no:{metrics['hs_f1_no']:.3f}, imp:{metrics['hs_f1_implicit']:.3f}, exp:{metrics['hs_f1_explicit']:.3f}]" if 'hs_f1_no' in metrics else ""
             print(f"Epoch {epoch+1:02d}/{num_epochs:02d} | Train: {train_loss:.4f} | Val: {val_loss:.4f} | "
-                  f"ST F1: {metrics['st_f1']:.3f} | HS F1: {metrics['hs_f1']:.3f} | TG Exact: {metrics['tg_exact_match']:.3f} | {elapsed:.1f}s")
+                  f"ST F1: {metrics['st_f1']:.3f} | HS F1: {metrics['hs_f1']:.3f}{f1_no_str} | TG Exact: {metrics['tg_exact_match']:.3f} | {elapsed:.1f}s")
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss

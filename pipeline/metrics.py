@@ -43,8 +43,8 @@ def compute_classification_metrics(
       - hs_acc: Overall Accuracy
       - hs_macro_f1: Macro-Averaged F1 across (no, implicit, explicit)
       - hs_f1_no: F1 score for class 0 (no hate)
-      - hs_f1_implicit: F1 score for class 1 (implicit hate)
-      - hs_f1_explicit: F1 score for class 2 (explicit hate)
+      - hs_f1_implicit: F1 score for class 1 (yes_implicit hate)
+      - hs_f1_explicit: F1 score for class 2 (yes_explicit hate)
     """
     acc = float(accuracy_score(y_true, y_pred))
     macro_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
@@ -60,8 +60,12 @@ def compute_classification_metrics(
         f"{task}_f1_no": float(f1s[0]),
         f"{task}_f1_implicit": float(f1s[1]),
         f"{task}_f1_explicit": float(f1s[2]),
+        f"{task}_prec_no": float(precisions[0]),
         f"{task}_prec_implicit": float(precisions[1]),
+        f"{task}_prec_explicit": float(precisions[2]),
+        f"{task}_recall_no": float(recalls[0]),
         f"{task}_recall_implicit": float(recalls[1]),
+        f"{task}_recall_explicit": float(recalls[2]),
     }
     return metrics
 
@@ -76,7 +80,7 @@ def evaluate_stereoqueer(
     """
     Computes official StereoQueerEval evaluation metrics:
       - Stereotype: accuracy + macro-F1
-      - Hate speech: accuracy + macro-F1 (3 classes: no, implicit, explicit)
+      - Hate speech: accuracy + macro-F1 (3 classes: no, implicit, explicit) + per-class F1
       - Target: string exact-match accuracy against gold annotations
       - Per-language metrics breakdown (EN, IT, NL)
     """
@@ -88,11 +92,18 @@ def evaluate_stereoqueer(
     gold_hs = df['hs_y'].values.astype(int)
     gold_tg = df['target'].fillna('none').values
 
+    _, _, hs_f1s, _ = precision_recall_fscore_support(
+        gold_hs, hs_preds, labels=[0, 1, 2], zero_division=0
+    )
+
     metrics = {
         'st_acc': float(accuracy_score(gold_st, st_preds)),
         'st_f1': float(f1_score(gold_st, st_preds, average='macro', zero_division=0)),
         'hs_acc': float(accuracy_score(gold_hs, hs_preds)),
         'hs_f1': float(f1_score(gold_hs, hs_preds, average='macro', zero_division=0)),
+        'hs_f1_no': float(hs_f1s[0]),
+        'hs_f1_implicit': float(hs_f1s[1]),
+        'hs_f1_explicit': float(hs_f1s[2]),
         'tg_exact_match': float((tg_pred_str == gold_tg).mean()),
     }
     # Weighted composite score
@@ -110,10 +121,17 @@ def evaluate_stereoqueer(
             sub_gold_tg = gold_tg[idx]
             sub_tg_preds = tg_pred_str[idx]
 
+            _, _, sub_hs_f1s, _ = precision_recall_fscore_support(
+                sub_gold_hs, sub_hs_preds, labels=[0, 1, 2], zero_division=0
+            )
+
             per_language[lang] = {
                 'count': int(idx.sum()),
                 'st_f1': float(f1_score(sub_gold_st, sub_st_preds, average='macro', zero_division=0)),
                 'hs_f1': float(f1_score(sub_gold_hs, sub_hs_preds, average='macro', zero_division=0)),
+                'hs_f1_no': float(sub_hs_f1s[0]),
+                'hs_f1_implicit': float(sub_hs_f1s[1]),
+                'hs_f1_explicit': float(sub_hs_f1s[2]),
                 'tg_exact_match': float((sub_tg_preds == sub_gold_tg).mean()),
             }
 
@@ -133,7 +151,7 @@ def print_metrics(metrics: Dict[str, float], title: str = "VALIDATION"):
     print(f"\n==================== {title} ====================")
     for k, v in metrics.items():
         if isinstance(v, float):
-            print(f"  {k:<18}: {v:.4f}")
+            print(f"  {k:<20}: {v:.4f}")
         else:
-            print(f"  {k:<18}: {v}")
+            print(f"  {k:<20}: {v}")
     print("==================================================\n")

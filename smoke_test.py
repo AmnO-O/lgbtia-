@@ -207,6 +207,9 @@ class TestPipelineSmoke(unittest.TestCase):
         val_loss, metrics, preds, probs, val_gates = trainer.eval_epoch()
         self.assertIn('hs_macro_f1', metrics)
         self.assertIn('hs_acc', metrics)
+        self.assertIn('hs_f1_no', metrics)
+        self.assertIn('hs_f1_implicit', metrics)
+        self.assertIn('hs_f1_explicit', metrics)
 
 
 if __name__ == '__main__':
