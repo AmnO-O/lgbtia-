@@ -1,7 +1,7 @@
 """
 Task B Specialized Trainer with 4-Expert Mixture of Latent Query Banks (MoE),
 Fast Gradient Method (FGM) Adversarial Regularization, Multi-Sample Dropout,
-and Dynamic Router Gate Utilization Tracking.
+Early Stopping with Patience, and Dynamic Router Gate Utilization Tracking.
 """
 
 import os
@@ -57,6 +57,7 @@ class FGM:
 class TaskBTrainer:
     """
     Trainer for Task B 4-Expert MoE Architecture with:
+      - Early Stopping with Configurable Patience
       - Dynamic Router Gate Utilization Tracking & Load Balancing
       - 2-Phase Backbone Fine-Tuning (Frozen -> Layer-Unfrozen: top N layers)
       - Cosine Annealing with Warmup
@@ -317,12 +318,13 @@ class TaskBTrainer:
 
     def fit(self) -> Dict[str, Any]:
         """
-        Executes complete training lifecycle (Phase 1: Frozen -> Phase 2: Unfrozen, or single-phase).
+        Executes complete training lifecycle with Early Stopping (Patience).
         """
         os.makedirs(self.config.output_dir, exist_ok=True)
+        patience_limit = getattr(self.config, 'patience', 5)
         print(f"\n=======================================================")
         print(f" Task B 4-Expert MoE Training Pipeline")
-        print(f" Device: {self.device} | AMP: {self.use_amp} | Experts: {self.config.num_experts}")
+        print(f" Device: {self.device} | AMP: {self.use_amp} | Experts: {self.config.num_experts} | Patience: {patience_limit}")
         print(f"=======================================================")
 
         last_metrics: Dict[str, float] = {}
@@ -335,6 +337,7 @@ class TaskBTrainer:
                 
             optimizer = self.build_optimizer(lr=self.config.learning_rate)
             scheduler = self.build_scheduler(optimizer, self.config.freeze_phase_epochs)
+            p1_patience_counter = 0
 
             for epoch in range(1, self.config.freeze_phase_epochs + 1):
                 t0 = time.time()
@@ -351,6 +354,7 @@ class TaskBTrainer:
 
                 self.history.append({
                     'epoch': epoch,
+                    'phase': 1,
                     'train_loss': train_loss,
                     'val_loss': val_loss,
                     'hs_macro_f1': macro_f1,
@@ -360,6 +364,12 @@ class TaskBTrainer:
                 if macro_f1 > self.best_macro_f1:
                     self.best_macro_f1 = macro_f1
                     self.best_checkpoint_path = self.save_checkpoint("best_phase1.pt")
+                    p1_patience_counter = 0
+                else:
+                    p1_patience_counter += 1
+                    if p1_patience_counter >= patience_limit:
+                        print(f"  [EarlyStopping] Phase 1 Early stopped after {patience_limit} non-improving epochs.")
+                        break
 
             # PHASE 2: Unfreeze Top N Layers of mmBERT
             print(f"\n>>> [Phase 2/2] Unfreezing Top {self.config.unfreeze_layers} Backbone Layers for {self.config.unfreeze_phase_epochs} epochs...")
@@ -373,6 +383,7 @@ class TaskBTrainer:
             )
             scheduler = self.build_scheduler(optimizer, self.config.unfreeze_phase_epochs)
             total_p2_epochs = self.config.unfreeze_phase_epochs
+            p2_patience_counter = 0
 
             for epoch in range(1, total_p2_epochs + 1):
                 t0 = time.time()
@@ -389,6 +400,7 @@ class TaskBTrainer:
 
                 self.history.append({
                     'epoch': self.config.freeze_phase_epochs + epoch,
+                    'phase': 2,
                     'train_loss': train_loss,
                     'val_loss': val_loss,
                     'hs_macro_f1': macro_f1,
@@ -400,10 +412,18 @@ class TaskBTrainer:
                     self.best_checkpoint_path = self.save_checkpoint("best_model.pt")
                     if self.config.save_predictions and self.df_val is not None:
                         self.save_val_predictions(y_pred, y_prob, y_gates)
+                    p2_patience_counter = 0
+                else:
+                    p2_patience_counter += 1
+                    print(f"  [EarlyStopping] No improvement in Macro-F1 ({p2_patience_counter}/{patience_limit}).")
+                    if p2_patience_counter >= patience_limit:
+                        print(f"  [EarlyStopping] Triggered at Epoch {epoch:02d}! Best Val Macro-F1: {self.best_macro_f1:.4f}")
+                        break
         else:
             # Single-phase training
             optimizer = self.build_optimizer(lr=self.config.learning_rate)
             scheduler = self.build_scheduler(optimizer, self.config.epochs)
+            patience_counter = 0
             for epoch in range(1, self.config.epochs + 1):
                 t0 = time.time()
                 train_loss, train_gates = self.train_epoch(optimizer, scheduler, apply_fgm=getattr(self.config, 'use_fgm', False))
@@ -419,6 +439,7 @@ class TaskBTrainer:
 
                 self.history.append({
                     'epoch': epoch,
+                    'phase': 1,
                     'train_loss': train_loss,
                     'val_loss': val_loss,
                     'hs_macro_f1': macro_f1,
@@ -430,6 +451,13 @@ class TaskBTrainer:
                     self.best_checkpoint_path = self.save_checkpoint("best_model.pt")
                     if self.config.save_predictions and self.df_val is not None:
                         self.save_val_predictions(y_pred, y_prob, y_gates)
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    print(f"  [EarlyStopping] No improvement in Macro-F1 ({patience_counter}/{patience_limit}).")
+                    if patience_counter >= patience_limit:
+                        print(f"  [EarlyStopping] Triggered at Epoch {epoch:02d}! Best Val Macro-F1: {self.best_macro_f1:.4f}")
+                        break
 
         return {
             "best_macro_f1": self.best_macro_f1,
