@@ -376,18 +376,23 @@ class TaskBTrainer:
                     break
 
         # -----------------------------------------------------------------
-        # PHASE 2: Unfreeze Backbone Top N Layers + FGM Adversarial Training
+        # PHASE 2: Unfreeze Backbone Top N Layers
         # -----------------------------------------------------------------
         if self.config.two_phase and self.config.unfreeze_phase_epochs > 0:
-            print(f"\n--- PHASE 2: End-to-End Fine-Tuning + FGM Adversarial Training ({self.config.unfreeze_phase_epochs} Epochs) ---")
+            use_fgm_p2 = getattr(self.config, 'use_fgm', False)
+            fgm_status = "Enabled (Adversarial)" if use_fgm_p2 else "Disabled (Standard Fine-Tuning)"
+            print(f"\n--- PHASE 2: Discriminative Fine-Tuning ({self.config.unfreeze_phase_epochs} Epochs | FGM: {fgm_status}) ---")
             
             # Load best checkpoint from Phase 1 before unfreezing
             if os.path.exists(self.best_checkpoint_path):
                 self.model.load_state_dict(torch.load(self.best_checkpoint_path, map_location=self.device))
                 print(f"  Loaded Phase 1 Best Weights (Macro-F1: {self.best_macro_f1:.4f})")
 
-            # Enable gradient checkpointing to keep VRAM usage minimal
-            self.enable_gradient_checkpointing()
+            # Enable gradient checkpointing only if explicitly requested
+            if getattr(self.config, 'use_gradient_checkpointing', False):
+                self.enable_gradient_checkpointing()
+            else:
+                print("  [Speed Optimization] Standard backpropagation enabled (Gradient Checkpointing disabled for max speed).")
 
             # Clean cache and reset TorchDynamo compilation guards before unfreezing
             if torch.cuda.is_available():
