@@ -152,9 +152,15 @@ def main():
             model = TaskBClassAwareAttentionModel(
                 mmbert_model=backbone,
                 d_model=config.mmbert_dim,
+                num_experts=getattr(config, 'num_experts', 4),
+                num_slots_per_expert=getattr(config, 'num_slots_per_expert', 1),
                 num_heads=config.num_heads,
                 dropout=config.dropout,
-                use_query_interaction=config.use_query_interaction
+                router_hidden_dim=getattr(config, 'router_hidden_dim', 256),
+                router_temperature=getattr(config, 'router_temperature', 1.0),
+                use_query_interaction=config.use_query_interaction,
+                use_rmsnorm=getattr(config, 'use_rmsnorm', True),
+                use_msd=getattr(config, 'use_msd', True)
             )
             is_task_b = True
             is_mmbert_tf = False

@@ -311,7 +311,8 @@ class TaskBTrainer:
         y_true = np.array(all_labels)
         y_pred = np.array(all_preds)
         y_prob = np.array(all_probs)
-        y_gates = np.array(all_gates) if all_gates else np.zeros((len(y_true), 4))
+        num_exp = getattr(self.config, 'num_experts', 4)
+        y_gates = np.array(all_gates) if all_gates else np.zeros((len(y_true), num_exp))
 
         metrics = compute_classification_metrics(y_true, y_pred, y_prob, task="hs")
         return avg_loss, metrics, y_pred, y_prob, y_gates
