@@ -108,51 +108,13 @@ LANGUAGE_INSTRUCTIONS = {
     'NL': "Dutch. Authentic colloquial Dutch YouTube comment style (e.g., 'even normaal doen', 'wat een onzin weer', 'gaat weer lekker hoor', 'het houdt ook niet op', subtle sarcasm). Do NOT write in English."
 }
 
-FEW_SHOT_EXAMPLES = {
-    'EN': """
-EXAMPLES OF AUTHENTIC IMPLICIT REPHRASING:
-- Source Explicit: "Disgusting faggots need to be eliminated."
-  * Variant 1 (Short/Sarcasm): "Yeah, totally normal behavior right here 🙄"
-  * Variant 2 (False Concern/Rhetorical): "And people wonder why birth rates are collapsing."
-  * Variant 3 (Coded Language/Contextual): "Biology really doesn't matter anymore, does it?"
-
-- Source Explicit: "Trannies are mentally ill freaks ruining women's sports!"
-  * Variant 1 (Irony/Snark): "Fair play award of the year goes to..."
-  * Variant 2 (Coded Concern): "Real women worked decades for their spaces just for this."
-  * Variant 3 (Short dismissal): "We used to treat delusions, now we applaud them."
-""",
-    'IT': """
-EXAMPLES OF AUTHENTIC IMPLICIT REPHRASING:
-- Source Explicit: "Che schifo questi froci malati dovrebbero sparire."
-  * Variant 1 (Irony/Snark): "Ecco i grandi progressi della società moderna 🤡"
-  * Variant 2 (False Concern): "Poi ci chiediamo perché i giovani crescono confusi."
-  * Variant 3 (Coded/Colloquial): "La natura ormai è diventata un'opinione a quanto pare."
-
-- Source Explicit: "I trans sono mostri che rovinano i nostri figli."
-  * Variant 1 (Short dismissal): "Ma dove siamo arrivati... senza parole."
-  * Variant 2 (False Concern): "Proteggere l'infanzia ormai è un reato?"
-  * Variant 3 (Coded Language): "Chiamiamo le cose con il loro nome, la biologia non mente."
-""",
-    'NL': """
-EXAMPLES OF AUTHENTIC IMPLICIT REPHRASING:
-- Source Explicit: "Vieze flikkers moeten oprotten uit ons land."
-  * Variant 1 (Irony/Snark): "Prachtig voorbeeld van onze vooruitgang hoor 🙄"
-  * Variant 2 (False Concern): "En dan gek opkijken als normen en waarden verdwijnen."
-  * Variant 3 (Coded/Colloquial): "Gewoon normaal doen is tegenwoordig ook teveel gevraagd."
-
-- Source Explicit: "Die transgenders zijn gestoorde gekken die vrouwen bedreigen."
-  * Variant 1 (Short dismissal): "Het houdt ook niet op tegenwoordig."
-  * Variant 2 (False Concern): "Echte vrouwen hebben straks nergens meer een veilige plek."
-  * Variant 3 (Coded Language): "Biologie telt blijkbaar niet meer mee."
-"""
-}
-
 SINGLE_SYSTEM_PROMPT = """You are an expert computational linguist creating realistic YouTube dataset augmentations for LGBTQ+ implicit hate detection (SemEval StereoQueerEval).
 Your task is Counterfactual Tone Perturbation: transform an EXPLICIT hate comment into {n_variants} AUTHENTIC, DIVERSE, and REALISTIC IMPLICIT (veiled / subtle) hate comments.
 
 CRITICAL QUALITY & REALISM RULES:
 1. TARGET & INTENT PRESERVATION:
-   - Target identity (gay, trans, lesbian, bi, non-binary) and the hostile subtext MUST remain subtly perceptible between the lines.
+   - Use ONLY the 'target' label provided in the input; never redirect, broaden, or switch to another group.
+   - The hostile subtext toward that exact target MUST remain subtly perceptible between the lines.
 2. STRICTLY REMOVE OVERT TOXICITY:
    - Zero direct slurs, swear words, insults, or open calls to violence.
 3. ANTI-ROBOTIC RULES (DO NOT MAKE IT SOUND LIKE AN AI):
@@ -183,7 +145,7 @@ Your task is Counterfactual Tone Perturbation on a BATCH of {batch_size} EXPLICI
 For EACH item, generate {n_variants} AUTHENTIC, DIVERSE, and REALISTIC IMPLICIT (veiled / subtle) hate comments.
 
 CRITICAL QUALITY & REALISM RULES PER ITEM:
-1. TARGET & INTENT PRESERVATION: Keep the target identity and veiled hostile subtext intact.
+1. TARGET & INTENT PRESERVATION: Each item carries its own mandatory 'target' label in the input; produce variants aimed ONLY at that target. Keep the veiled hostile subtext intact.
 2. ZERO OVERT SLURS: Remove all slurs, profanity, vulgarity, and explicit threats.
 3. AUTHENTIC YOUTUBE REALISM:
    - Avoid generic polite AI templates.
@@ -248,6 +210,8 @@ def parse_args():
                         help='Max retries per sample upon rate limit')
     parser.add_argument('--max-chars', type=int, default=1200,
                         help='Truncate over-length input comments')
+    parser.add_argument('--few-shots', type=int, default=3,
+                        help='Number of REAL explicit->implicit few-shot pairs mined per language from the official corpus (0 disables)')
     parser.add_argument('--temp', type=float, default=0.75,
                         help='Sampling temperature')
     parser.add_argument('--out', default='LGBT/outputs.json',
@@ -307,7 +271,12 @@ def find_input_paths() -> List[str]:
     return sorted(set(found))
 
 
-def read_source_rows(paths: List[str]) -> List[Dict[str, Any]]:
+def read_source_rows(paths: List[str], hate_only: Optional[str] = 'yes_explicit') -> List[Dict[str, Any]]:
+    """Reads the official corpus rows.
+
+    hate_only='yes_explicit' -> only explicit comments (the augmentation workload).
+    hate_only=None           -> ALL rows (used to mine real few-shot pairs).
+    """
     rows: List[Dict[str, Any]] = []
     for p in paths:
         lang_match = re.search(r'_([A-Z]{2})_training\.tsv$', os.path.basename(p), re.IGNORECASE)
@@ -329,7 +298,8 @@ def read_source_rows(paths: List[str]) -> List[Dict[str, Any]]:
                 for line in reader:
                     if len(line) <= max(col_idx.values()):
                         continue
-                    if line[col_idx['hate_speech']].strip() != 'yes_explicit':
+                    label = line[col_idx['hate_speech']].strip()
+                    if hate_only and label != hate_only:
                         continue
 
                     comment_text = line[col_idx['yt_comment']].strip()
@@ -349,11 +319,73 @@ def read_source_rows(paths: List[str]) -> List[Dict[str, Any]]:
                         'yt_description': desc,
                         'stereotype': stereotype,
                         'target': target,
+                        'hate_speech': label,
                         'text': comment_text[:ARGS.max_chars],
                     })
         except Exception as e:
             print(f"  [Error reading {p}]: {e}", file=sys.stderr)
     return rows
+
+
+# -----------------------------------------------------------------------------
+# FEW-SHOT MINING FROM THE OFFICIAL CORPUS
+# -----------------------------------------------------------------------------
+
+FEWSHOT_SEED = 42
+_FEWSHOTS_BY_LANG: Dict[str, List[Dict[str, Any]]] = {}
+_FEWSHOT_TEXTS: Set[str] = set()
+
+
+def collect_fewshot_pairs(rows_all: List[Dict[str, Any]], lang: str, k: int = 2) -> List[Dict[str, Any]]:
+    """Mines REAL few-shot pairs from the official corpus:
+    videos that contain BOTH a labeled yes_explicit and a labeled yes_implicit comment.
+    The real implicit comment is an authentic in-domain example of the target register."""
+    by_video: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    for r in rows_all:
+        if r.get('lang') != lang:
+            continue
+        vkey = (r.get('yt_title') or '').strip() or r['id']
+        bucket = by_video.setdefault(vkey, {'ex': [], 'im': []})
+        if r['hate_speech'] == 'yes_explicit':
+            bucket['ex'].append(r)
+        elif r['hate_speech'] == 'yes_implicit':
+            bucket['im'].append(r)
+
+    candidates = [v for v, b in by_video.items() if b['ex'] and b['im']]
+    rng = random.Random(FEWSHOT_SEED)
+    rng.shuffle(candidates)
+
+    pairs: List[Dict[str, Any]] = []
+    used_implicit: Set[str] = set()
+    for v in candidates:
+        if len(pairs) >= k:
+            break
+        b = by_video[v]
+        ex = rng.choice(b['ex'])
+        im = rng.choice(b['im'])
+        if im['text'].strip().lower() == ex['text'].strip().lower():
+            continue
+        key = im['text'].strip().lower()
+        if key in used_implicit:
+            continue
+        used_implicit.add(key)
+        pairs.append({'explicit': ex['text'], 'implicit': im['text'], 'video': v, 'lang': lang})
+    return pairs
+
+
+def build_few_shot_guide(pairs: List[Dict[str, Any]]) -> str:
+    """Renders real corpus pairs in the same style as the static FEW_SHOT_EXAMPLES block."""
+    if not pairs:
+        return ""
+    lines = ["REAL IMPLICIT EXAMPLES FROM THE OFFICIAL CORPUS (imitate the TONE of the implicit",
+             "comment; NEVER copy its wording, and keep YOUR OWN target label):"]
+    for i, p in enumerate(pairs, start=1):
+        ex = re.sub(r'[\t\r\n]+', ' ', p['explicit']).strip()[:240]
+        im = re.sub(r'[\t\r\n]+', ' ', p['implicit']).strip()[:240]
+        lines.append(f"Example {i}:")
+        lines.append(f"  Source Explicit: \"{ex}\"")
+        lines.append(f"  Authentic Implicit (official corpus): \"{im}\"")
+    return "\n".join(lines)
 
 
 # -----------------------------------------------------------------------------
@@ -417,7 +449,7 @@ def build_prompt_payload(batch: List[Dict[str, Any]]) -> Tuple[str, str]:
     """Constructs prompts safely for either single or batch processing."""
     lang = batch[0]['lang']
     lang_inst = LANGUAGE_INSTRUCTIONS.get(lang, f"{lang}. Use authentic colloquial YouTube style.")
-    few_shot = FEW_SHOT_EXAMPLES.get(lang, FEW_SHOT_EXAMPLES['EN'])
+    few_shot = build_few_shot_guide(_FEWSHOTS_BY_LANG.get(lang, []))
 
     if len(batch) == 1:
         row = batch[0]
@@ -429,10 +461,15 @@ def build_prompt_payload(batch: List[Dict[str, Any]]) -> Tuple[str, str]:
         title_str = row.get('yt_title', '') or '(None)'
         desc_str = row.get('yt_description', '') or '(None)'
         comment_str = row.get('text', '')
+        target = row.get('target', 'none')
+        stereo = row.get('stereotype', 'no')
         user = (
             f"Video Context:\n"
             f"- Title: {title_str}\n"
             f"- Description: {desc_str}\n\n"
+            f"OFFICIAL LABELS (MANDATORY):\n"
+            f"- target: {target}  (hostility in EVERY variant must target exactly this; do not redirect or broaden)\n"
+            f"- stereotype: {stereo}\n\n"
             f"Explicit Comment to Rephrase:\n"
             f"\"{comment_str}\"\n\n"
             f"Generate {ARGS.n_variants} distinct implicit hate variations:"
@@ -452,10 +489,12 @@ def build_prompt_payload(batch: List[Dict[str, Any]]) -> Tuple[str, str]:
             "id": r['id'],
             "video_title": r.get('yt_title', ''),
             "video_description": r.get('yt_description', ''),
+            "target": r.get('target', 'none'),
+            "stereotype": r.get('stereotype', 'no'),
             "explicit_comment": r['text']
         })
     user = (
-        f"Input Batch ({len(batch)} explicit comments):\n"
+        f"Input Batch ({len(batch)} explicit comments; each carries its own mandatory target label):\n"
         f"{json.dumps(items_json, ensure_ascii=False, indent=2)}\n\n"
         f"Generate {ARGS.n_variants} distinct implicit hate variations for each item:"
     )
@@ -573,6 +612,9 @@ def clean_and_validate_single_variants(raw_text: str, original_text: str) -> Lis
         if is_refusal:
             continue
 
+        if lower_item in _FEWSHOT_TEXTS:
+            continue
+
         if item_str not in valid_variants:
             valid_variants.append(item_str)
 
@@ -614,8 +656,9 @@ def clean_and_validate_batch_results(raw_text: str, batch: List[Dict[str, Any]])
                 clean_v = []
                 for v in v_list:
                     v_str = re.sub(r'[\t\r\n]+', ' ', str(v)).strip().strip('"').strip("'")
-                    if len(v_str) >= 5 and v_str.lower() != orig_text.lower():
-                        if not any(re.search(pat, v_str.lower()) for pat in REFUSAL_PATTERNS):
+                    v_low = v_str.lower()
+                    if len(v_str) >= 5 and v_low != orig_text.lower() and v_low not in _FEWSHOT_TEXTS:
+                        if not any(re.search(pat, v_low) for pat in REFUSAL_PATTERNS):
                             clean_v.append(v_str)
                 if clean_v:
                     results_map[item_id] = clean_v
@@ -697,6 +740,48 @@ def atomic_save_json(path: str, data: Any):
             os.remove(tmp_path)
 
 
+_LEADING_QUOTES_RE = re.compile(r'^[\'"\u2018\u2019\u201c\u201d]+')
+
+
+def _strip_leading_quotes(text: str) -> str:
+    """Removes leading quote chars (unquoted TSV fields that START with a quote char
+    are misread by csv/pandas readers as opening-quote markers, shifting columns)."""
+    if not text:
+        return text
+    return _LEADING_QUOTES_RE.sub('', text)
+
+
+def verify_generated_tsv(path: str) -> Tuple[int, List[str]]:
+    """Post-write integrity check: header schema, field count, unique ids,
+    non-empty comments, and the 'yes_implicit' label invariant."""
+    issues: List[str] = []
+    total = 0
+    seen_ids = set()
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace', newline='') as f:
+            reader = csv.reader(f, delimiter='\t')
+            header = next(reader, None)
+            if header != HEADER:
+                issues.append(f"Header mismatch: {header!r}")
+            for line in reader:
+                total += 1
+                if len(line) != len(HEADER):
+                    issues.append(f"Row {total}: expected {len(HEADER)} fields, got {len(line)}: {str(line)[:80]}")
+                    continue
+                row = dict(zip(HEADER, line))
+                rid = row['StereoQueerEval_id']
+                if rid in seen_ids:
+                    issues.append(f"Row {total}: duplicate id {rid}")
+                seen_ids.add(rid)
+                if not row['yt_comment'].strip():
+                    issues.append(f"Row {total}: empty yt_comment")
+                if row['hate_speech'] != 'yes_implicit':
+                    issues.append(f"Row {total}: hate_speech={row['hate_speech']!r}")
+    except Exception as e:
+        return total, [f"Verify error on {path}: {e}"]
+    return total, issues
+
+
 def write_canonical_tsv(lang: str, items: List[Dict[str, Any]], out_tsv_path: str):
     """Writes clean, deterministic, unquoted TSV lines conforming to SemEval schema."""
     os.makedirs(os.path.dirname(os.path.abspath(out_tsv_path)) or '.', exist_ok=True)
@@ -709,9 +794,9 @@ def write_canonical_tsv(lang: str, items: List[Dict[str, Any]], out_tsv_path: st
                 variants = [item['rewritten']]
 
             for v_idx, variant_text in enumerate(variants, start=1):
-                clean_variant = re.sub(r'[\t\r\n]+', ' ', variant_text).strip()
-                clean_title = re.sub(r'[\t\r\n]+', ' ', item.get('yt_title', '')).strip()
-                clean_desc = re.sub(r'[\t\r\n]+', ' ', item.get('yt_description', '')).strip()
+                clean_variant = _strip_leading_quotes(re.sub(r'[\t\r\n]+', ' ', variant_text).strip())
+                clean_title = _strip_leading_quotes(re.sub(r'[\t\r\n]+', ' ', item.get('yt_title', '')).strip())
+                clean_desc = _strip_leading_quotes(re.sub(r'[\t\r\n]+', ' ', item.get('yt_description', '')).strip())
                 clean_stereo = item.get('stereotype', 'no').strip()
                 clean_target = item.get('target', 'none').strip()
 
@@ -742,9 +827,21 @@ def main():
         sys.exit(f"No original dataset found matching patterns: {DEFAULT_INPUT_GLOBS}")
 
     print(f"Found input files: {paths}")
-    rows = read_source_rows(paths)
+    rows_all = read_source_rows(paths, hate_only=None)
+    rows = [r for r in rows_all if r['hate_speech'] == 'yes_explicit']
     if not rows:
         sys.exit("No matching 'yes_explicit' rows found in the specified dataset.")
+
+    # Mine REAL few-shot pairs from the official corpus (videos with both labels)
+    for fs_lang in sorted({r['lang'] for r in rows_all}):
+        pairs = collect_fewshot_pairs(rows_all, fs_lang, ARGS.few_shots)
+        _FEWSHOTS_BY_LANG[fs_lang] = pairs
+        _FEWSHOT_TEXTS.update(p['implicit'].strip().lower() for p in pairs)
+        if pairs:
+            print(f"  Few-shots mined from official corpus ({fs_lang}): {len(pairs)} real paired "
+                  f"explicit->implicit example(s), e.g. \"{pairs[0]['implicit'][:50]}...\"")
+        elif ARGS.few_shots > 0:
+            print(f"  [Info] No official {fs_lang} video found with BOTH labels -> few-shot guide disabled for {fs_lang}")
 
     from collections import Counter
     lang_counter = Counter(r['lang'] for r in rows)
@@ -825,6 +922,10 @@ def main():
         for lang, items in by_lang.items():
             tsv_path = os.path.join(ARGS.tsv_dir, f"SynthImplicit_{lang}{ARGS.txt_suffix}")
             write_canonical_tsv(lang, items, tsv_path)
+            row_count, tsv_issues = verify_generated_tsv(tsv_path)
+            if tsv_issues:
+                for issue in tsv_issues[:20]:
+                    print(f"  [TSV CHECK] {tsv_path}: {issue}", file=sys.stderr)
 
         return total_variants_count
 
