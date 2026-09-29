@@ -103,52 +103,103 @@ REFUSAL_PATTERNS = [
 ]
 
 LANGUAGE_INSTRUCTIONS = {
-    'EN': "English. Use authentic English YouTube comment phrasing (informal, rhetorical questions, dog-whistles, sarcasm).",
-    'IT': "Italian. Use authentic Italian YouTube comment phrasing (e.g., subtle colloquialisms, 'ma che schifo di valori', faux-irony, rhetorical questions). Do NOT translate into English.",
-    'NL': "Dutch. Use authentic Dutch YouTube comment phrasing (e.g., 'even normaal doen', subtle sarcasm, moral lecturing, rhetorical questions). Do NOT translate into English."
+    'EN': "English. Authentic informal YouTube comment style (slang, sarcasm, rhetorical questions, internet memes, dog-whistles, concise). Avoid robotic or academic phrasing.",
+    'IT': "Italian. Authentic colloquial Italian YouTube comment style (e.g., 'ma per favore', 'che tristezza', 'andiamo bene...', 'ma dove siamo arrivati', 'roba da matti', subtle sarcasm). Do NOT write in English.",
+    'NL': "Dutch. Authentic colloquial Dutch YouTube comment style (e.g., 'even normaal doen', 'wat een onzin weer', 'gaat weer lekker hoor', 'het houdt ook niet op', subtle sarcasm). Do NOT write in English."
 }
 
-SINGLE_SYSTEM_PROMPT = """You are an expert computational linguist assisting in dataset augmentation for LGBTQ+ hate-speech detection research (SemEval StereoQueerEval).
-Your task is Counterfactual Tone Perturbation: convert an EXPLICIT hate comment into {n_variants} DISTINCT and DIVERSE IMPLICIT (indirect / veiled) hate comments.
+FEW_SHOT_EXAMPLES = {
+    'EN': """
+EXAMPLES OF AUTHENTIC IMPLICIT REPHRASING:
+- Source Explicit: "Disgusting faggots need to be eliminated."
+  * Variant 1 (Short/Sarcasm): "Yeah, totally normal behavior right here 🙄"
+  * Variant 2 (False Concern/Rhetorical): "And people wonder why birth rates are collapsing."
+  * Variant 3 (Coded Language/Contextual): "Biology really doesn't matter anymore, does it?"
 
-STRICT REQUIREMENTS:
-1. TARGET PRESERVATION: Keep the exact same target identity (e.g., gay, trans, lesbian, bisexual, non-binary).
-2. INTENT PRESERVATION: The underlying hostility, prejudice, or rejection MUST remain clearly perceptible between the lines in each variant.
-3. REMOVE OVERT WORDS: Completely remove all direct slurs, swear words, explicit vulgarities, or overt violent threats.
+- Source Explicit: "Trannies are mentally ill freaks ruining women's sports!"
+  * Variant 1 (Irony/Snark): "Fair play award of the year goes to..."
+  * Variant 2 (Coded Concern): "Real women worked decades for their spaces just for this."
+  * Variant 3 (Short dismissal): "We used to treat delusions, now we applaud them."
+""",
+    'IT': """
+EXAMPLES OF AUTHENTIC IMPLICIT REPHRASING:
+- Source Explicit: "Che schifo questi froci malati dovrebbero sparire."
+  * Variant 1 (Irony/Snark): "Ecco i grandi progressi della società moderna 🤡"
+  * Variant 2 (False Concern): "Poi ci chiediamo perché i giovani crescono confusi."
+  * Variant 3 (Coded/Colloquial): "La natura ormai è diventata un'opinione a quanto pare."
+
+- Source Explicit: "I trans sono mostri che rovinano i nostri figli."
+  * Variant 1 (Short dismissal): "Ma dove siamo arrivati... senza parole."
+  * Variant 2 (False Concern): "Proteggere l'infanzia ormai è un reato?"
+  * Variant 3 (Coded Language): "Chiamiamo le cose con il loro nome, la biologia non mente."
+""",
+    'NL': """
+EXAMPLES OF AUTHENTIC IMPLICIT REPHRASING:
+- Source Explicit: "Vieze flikkers moeten oprotten uit ons land."
+  * Variant 1 (Irony/Snark): "Prachtig voorbeeld van onze vooruitgang hoor 🙄"
+  * Variant 2 (False Concern): "En dan gek opkijken als normen en waarden verdwijnen."
+  * Variant 3 (Coded/Colloquial): "Gewoon normaal doen is tegenwoordig ook teveel gevraagd."
+
+- Source Explicit: "Die transgenders zijn gestoorde gekken die vrouwen bedreigen."
+  * Variant 1 (Short dismissal): "Het houdt ook niet op tegenwoordig."
+  * Variant 2 (False Concern): "Echte vrouwen hebben straks nergens meer een veilige plek."
+  * Variant 3 (Coded Language): "Biologie telt blijkbaar niet meer mee."
+"""
+}
+
+SINGLE_SYSTEM_PROMPT = """You are an expert computational linguist creating realistic YouTube dataset augmentations for LGBTQ+ implicit hate detection (SemEval StereoQueerEval).
+Your task is Counterfactual Tone Perturbation: transform an EXPLICIT hate comment into {n_variants} AUTHENTIC, DIVERSE, and REALISTIC IMPLICIT (veiled / subtle) hate comments.
+
+CRITICAL QUALITY & REALISM RULES:
+1. TARGET & INTENT PRESERVATION:
+   - Target identity (gay, trans, lesbian, bi, non-binary) and the hostile subtext MUST remain subtly perceptible between the lines.
+2. STRICTLY REMOVE OVERT TOXICITY:
+   - Zero direct slurs, swear words, insults, or open calls to violence.
+3. ANTI-ROBOTIC RULES (DO NOT MAKE IT SOUND LIKE AN AI):
+   - FORBIDDEN: Do NOT write polite essay sentences like "What a fine contribution to civilized society".
+   - FORBIDDEN: Do NOT repeat identical formulaic sentence patterns across variants.
+   - ALLOW realistic comment styles: varied length (mix of short 4-8 word comments and 1-2 sentence comments), informal punctuation (..., 🙄, 🤡, !?), conversational flow.
 4. STYLISTIC DIVERSITY ACROSS VARIANTS:
-   - Variant 1: Sarcasm / Irony / Mocking tone
-   - Variant 2: Rhetorical Question / False concern ("Is this really what we want our kids to see?", "Just asking questions")
-   - Variant 3: Dog-whistles, euphemisms, coded language ("traditional family values", "agenda", "lifestyle choice", "social contagion")
-5. LANGUAGE PRESERVATION: Every variant MUST be in the exact same language ({lang_instruction}).
-6. PLATFORM STYLE: Keep the natural, concise YouTube comment style (keep tokens like [url], [channel], [email] if present in source).
+   - Variant 1: Gritty Internet Sarcasm / Snark / Mockery
+   - Variant 2: Rhetorical Question / "Just asking questions" / Faux concern for children or society
+   - Variant 3: Coded Language, Dog-whistles, or Dismissive colloquialism
+5. LANGUAGE:
+   - Must be 100% in {lang_instruction}
+
+{few_shot_guide}
 
 OUTPUT FORMAT:
-You MUST reply with ONLY a raw JSON object (no markdown, no backticks, no explanations):
+Return ONLY a valid raw JSON object (no markdown codeblocks, no explanations):
 {{
   "variants": [
-    "Implicit variation 1",
-    "Implicit variation 2"
+    "Variant 1 text",
+    "Variant 2 text",
+    "Variant 3 text"
   ]
 }}"""
 
-BATCH_SYSTEM_PROMPT = """You are an expert computational linguist assisting in dataset augmentation for LGBTQ+ hate-speech detection research (SemEval StereoQueerEval).
+BATCH_SYSTEM_PROMPT = """You are an expert computational linguist creating realistic YouTube dataset augmentations for LGBTQ+ implicit hate detection (SemEval StereoQueerEval).
 Your task is Counterfactual Tone Perturbation on a BATCH of {batch_size} EXPLICIT hate comments.
-For EACH item in the batch, generate {n_variants} DISTINCT and DIVERSE IMPLICIT (indirect / veiled) hate comments.
+For EACH item, generate {n_variants} AUTHENTIC, DIVERSE, and REALISTIC IMPLICIT (veiled / subtle) hate comments.
 
-STRICT REQUIREMENTS PER ITEM:
-1. TARGET PRESERVATION: Keep the exact same target identity.
-2. INTENT PRESERVATION: The underlying hostility must remain clearly perceptible between the lines.
-3. REMOVE OVERT WORDS: Completely remove all direct slurs, swear words, or overt violent threats.
-4. STYLISTIC DIVERSITY: Sarcasm, Rhetorical questions, Dog-whistles / Coded language.
-5. LANGUAGE PRESERVATION: Every variant MUST be in the exact same language ({lang_instruction}).
+CRITICAL QUALITY & REALISM RULES PER ITEM:
+1. TARGET & INTENT PRESERVATION: Keep the target identity and veiled hostile subtext intact.
+2. ZERO OVERT SLURS: Remove all slurs, profanity, vulgarity, and explicit threats.
+3. AUTHENTIC YOUTUBE REALISM:
+   - Avoid generic polite AI templates.
+   - Vary comment lengths (include short 4-8 word dismissals and medium sarcastic remarks).
+   - Use colloquial idioms, rhetorical questions, and realistic dog-whistles.
+4. LANGUAGE: Must be 100% in {lang_instruction}.
+
+{few_shot_guide}
 
 OUTPUT FORMAT:
-You MUST reply with ONLY a raw JSON object (no markdown, no backticks, no explanations):
+Return ONLY a valid raw JSON object (no markdown codeblocks, no explanations):
 {{
   "results": [
     {{
-      "id": "source_id_here",
-      "variants": ["variant 1", "variant 2", "variant 3"]
+      "id": "item_id_here",
+      "variants": ["Variant 1", "Variant 2", "Variant 3"]
     }}
   ]
 }}"""
@@ -366,10 +417,15 @@ def build_prompt_payload(batch: List[Dict[str, Any]]) -> Tuple[str, str]:
     """Constructs prompts safely for either single or batch processing."""
     lang = batch[0]['lang']
     lang_inst = LANGUAGE_INSTRUCTIONS.get(lang, f"{lang}. Use authentic colloquial YouTube style.")
+    few_shot = FEW_SHOT_EXAMPLES.get(lang, FEW_SHOT_EXAMPLES['EN'])
 
     if len(batch) == 1:
         row = batch[0]
-        system = SINGLE_SYSTEM_PROMPT.format(lang_instruction=lang_inst, n_variants=ARGS.n_variants)
+        system = SINGLE_SYSTEM_PROMPT.format(
+            lang_instruction=lang_inst,
+            n_variants=ARGS.n_variants,
+            few_shot_guide=few_shot
+        )
         title_str = row.get('yt_title', '') or '(None)'
         desc_str = row.get('yt_description', '') or '(None)'
         comment_str = row.get('text', '')
@@ -387,7 +443,8 @@ def build_prompt_payload(batch: List[Dict[str, Any]]) -> Tuple[str, str]:
     system = BATCH_SYSTEM_PROMPT.format(
         lang_instruction=lang_inst,
         batch_size=len(batch),
-        n_variants=ARGS.n_variants
+        n_variants=ARGS.n_variants,
+        few_shot_guide=few_shot
     )
     items_json = []
     for r in batch:
