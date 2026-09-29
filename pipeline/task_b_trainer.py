@@ -179,9 +179,11 @@ class TaskBTrainer:
         optimizer: torch.optim.Optimizer,
         scheduler: Optional[Any] = None,
         apply_fgm: bool = True
-    ) -> Tuple[float, np.ndarray]:
+    ) -> Tuple[float, Dict[str, float], np.ndarray]:
         self.model.train()
         total_loss = 0.0
+        all_train_preds: List[np.ndarray] = []
+        all_train_targets: List[np.ndarray] = []
         all_gates: List[np.ndarray] = []
 
         for batch in self.train_loader:
@@ -208,6 +210,13 @@ class TaskBTrainer:
                     logits, _, _ = out
                     gates = None
                 loss = self.criterion(logits, hs_labels, gates=gates)
+
+            # Record clean predictions for training metrics tracking
+            with torch.no_grad():
+                eval_logits = torch.mean(torch.stack(logits, dim=0), dim=0) if isinstance(logits, list) else logits
+                preds = torch.argmax(eval_logits, dim=-1)
+                all_train_preds.append(preds.detach().cpu().numpy())
+                all_train_targets.append(hs_labels.detach().cpu().numpy())
 
             if gates is not None:
                 all_gates.append(gates.detach().cpu().numpy())
@@ -269,7 +278,12 @@ class TaskBTrainer:
 
         avg_loss = total_loss / max(len(self.train_loader), 1)
         mean_gates = np.mean(np.concatenate(all_gates, axis=0), axis=0) if all_gates else np.array([])
-        return avg_loss, mean_gates
+        
+        y_train_true = np.concatenate(all_train_targets, axis=0) if all_train_targets else np.array([])
+        y_train_pred = np.concatenate(all_train_preds, axis=0) if all_train_preds else np.array([])
+        train_metrics = compute_classification_metrics(y_train_true, y_train_pred, task="hs") if len(y_train_true) > 0 else {}
+        
+        return avg_loss, train_metrics, mean_gates
 
     @torch.no_grad()
     def eval_epoch(self) -> Tuple[float, Dict[str, float], np.ndarray, np.ndarray, np.ndarray]:
@@ -355,35 +369,44 @@ class TaskBTrainer:
 
             for epoch in range(1, self.config.freeze_phase_epochs + 1):
                 t0 = time.time()
-                train_loss, train_gates = self.train_epoch(optimizer, scheduler, apply_fgm=False)
+                train_loss, tr_m, train_gates = self.train_epoch(optimizer, scheduler, apply_fgm=False)
                 val_loss, metrics, y_pred, y_prob, y_gates = self.eval_epoch()
                 elapsed = time.time() - t0
                 last_metrics = metrics
 
-                macro_f1 = metrics.get('hs_macro_f1', 0.0)
-                f1_no = metrics.get('hs_f1_no', 0.0)
-                f1_imp = metrics.get('hs_f1_implicit', 0.0)
-                f1_exp = metrics.get('hs_f1_explicit', 0.0)
+                tr_f1 = tr_m.get('hs_macro_f1', 0.0)
+                tr_no = tr_m.get('hs_f1_no', 0.0)
+                tr_imp = tr_m.get('hs_f1_implicit', 0.0)
+                tr_exp = tr_m.get('hs_f1_explicit', 0.0)
+
+                val_f1 = metrics.get('hs_macro_f1', 0.0)
+                val_no = metrics.get('hs_f1_no', 0.0)
+                val_imp = metrics.get('hs_f1_implicit', 0.0)
+                val_exp = metrics.get('hs_f1_explicit', 0.0)
 
                 gate_str = f" | Gates: [{', '.join([f'E{i}:{g:.2f}' for i, g in enumerate(train_gates)])}]" if len(train_gates) > 0 and not np.all(train_gates == 0) else ""
-                print(f"Epoch {epoch:02d}/{self.config.freeze_phase_epochs:02d} [{elapsed:.1f}s] "
-                      f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                      f"Val Macro-F1: {macro_f1:.4f} [no: {f1_no:.4f}, implicit: {f1_imp:.4f}, explicit: {f1_exp:.4f}]{gate_str}")
+                print(f"Epoch {epoch:02d}/{self.config.freeze_phase_epochs:02d} [{elapsed:.1f}s]{gate_str}\n"
+                      f"  Train: Loss {train_loss:.4f} | Macro-F1: {tr_f1:.4f} [no: {tr_no:.4f}, implicit: {tr_imp:.4f}, explicit: {tr_exp:.4f}]\n"
+                      f"  Val:   Loss {val_loss:.4f} | Macro-F1: {val_f1:.4f} [no: {val_no:.4f}, implicit: {val_imp:.4f}, explicit: {val_exp:.4f}]")
 
                 self.history.append({
                     'epoch': epoch,
                     'phase': 1,
                     'train_loss': train_loss,
                     'val_loss': val_loss,
-                    'hs_macro_f1': macro_f1,
-                    'hs_f1_no': f1_no,
-                    'hs_f1_implicit': f1_imp,
-                    'hs_f1_explicit': f1_exp,
+                    'train_macro_f1': tr_f1,
+                    'train_f1_no': tr_no,
+                    'train_f1_implicit': tr_imp,
+                    'train_f1_explicit': tr_exp,
+                    'hs_macro_f1': val_f1,
+                    'hs_f1_no': val_no,
+                    'hs_f1_implicit': val_imp,
+                    'hs_f1_explicit': val_exp,
                     'gates': train_gates
                 })
 
-                if macro_f1 > self.best_macro_f1:
-                    self.best_macro_f1 = macro_f1
+                if val_f1 > self.best_macro_f1:
+                    self.best_macro_f1 = val_f1
                     self.best_checkpoint_path = self.save_checkpoint("best_phase1.pt")
                     if self.config.save_predictions and self.df_val is not None:
                         self.save_val_predictions(y_pred, y_prob, y_gates)
@@ -410,35 +433,44 @@ class TaskBTrainer:
 
             for epoch in range(1, total_p2_epochs + 1):
                 t0 = time.time()
-                train_loss, train_gates = self.train_epoch(optimizer, scheduler, apply_fgm=getattr(self.config, 'use_fgm', False))
+                train_loss, tr_m, train_gates = self.train_epoch(optimizer, scheduler, apply_fgm=getattr(self.config, 'use_fgm', False))
                 val_loss, metrics, y_pred, y_prob, y_gates = self.eval_epoch()
                 elapsed = time.time() - t0
                 last_metrics = metrics
 
-                macro_f1 = metrics.get('hs_macro_f1', 0.0)
-                f1_no = metrics.get('hs_f1_no', 0.0)
-                f1_imp = metrics.get('hs_f1_implicit', 0.0)
-                f1_exp = metrics.get('hs_f1_explicit', 0.0)
+                tr_f1 = tr_m.get('hs_macro_f1', 0.0)
+                tr_no = tr_m.get('hs_f1_no', 0.0)
+                tr_imp = tr_m.get('hs_f1_implicit', 0.0)
+                tr_exp = tr_m.get('hs_f1_explicit', 0.0)
+
+                val_f1 = metrics.get('hs_macro_f1', 0.0)
+                val_no = metrics.get('hs_f1_no', 0.0)
+                val_imp = metrics.get('hs_f1_implicit', 0.0)
+                val_exp = metrics.get('hs_f1_explicit', 0.0)
 
                 gate_str = f" | Gates: [{', '.join([f'E{i}:{g:.2f}' for i, g in enumerate(train_gates)])}]" if len(train_gates) > 0 and not np.all(train_gates == 0) else ""
-                print(f"Epoch {epoch:02d}/{total_p2_epochs:02d} [{elapsed:.1f}s] "
-                      f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                      f"Val Macro-F1: {macro_f1:.4f} [no: {f1_no:.4f}, implicit: {f1_imp:.4f}, explicit: {f1_exp:.4f}]{gate_str}")
+                print(f"Epoch {epoch:02d}/{total_p2_epochs:02d} [{elapsed:.1f}s]{gate_str}\n"
+                      f"  Train: Loss {train_loss:.4f} | Macro-F1: {tr_f1:.4f} [no: {tr_no:.4f}, implicit: {tr_imp:.4f}, explicit: {tr_exp:.4f}]\n"
+                      f"  Val:   Loss {val_loss:.4f} | Macro-F1: {val_f1:.4f} [no: {val_no:.4f}, implicit: {val_imp:.4f}, explicit: {val_exp:.4f}]")
 
                 self.history.append({
                     'epoch': self.config.freeze_phase_epochs + epoch,
                     'phase': 2,
                     'train_loss': train_loss,
                     'val_loss': val_loss,
-                    'hs_macro_f1': macro_f1,
-                    'hs_f1_no': f1_no,
-                    'hs_f1_implicit': f1_imp,
-                    'hs_f1_explicit': f1_exp,
+                    'train_macro_f1': tr_f1,
+                    'train_f1_no': tr_no,
+                    'train_f1_implicit': tr_imp,
+                    'train_f1_explicit': tr_exp,
+                    'hs_macro_f1': val_f1,
+                    'hs_f1_no': val_no,
+                    'hs_f1_implicit': val_imp,
+                    'hs_f1_explicit': val_exp,
                     'gates': train_gates
                 })
 
-                if macro_f1 > self.best_macro_f1:
-                    self.best_macro_f1 = macro_f1
+                if val_f1 > self.best_macro_f1:
+                    self.best_macro_f1 = val_f1
                     self.best_checkpoint_path = self.save_checkpoint("best_model.pt")
                     if self.config.save_predictions and self.df_val is not None:
                         self.save_val_predictions(y_pred, y_prob, y_gates)
@@ -456,34 +488,43 @@ class TaskBTrainer:
             patience_counter = 0
             for epoch in range(1, self.config.epochs + 1):
                 t0 = time.time()
-                train_loss, train_gates = self.train_epoch(optimizer, scheduler, apply_fgm=getattr(self.config, 'use_fgm', False))
+                train_loss, tr_m, train_gates = self.train_epoch(optimizer, scheduler, apply_fgm=getattr(self.config, 'use_fgm', False))
                 val_loss, metrics, y_pred, y_prob, y_gates = self.eval_epoch()
                 elapsed = time.time() - t0
                 last_metrics = metrics
 
-                macro_f1 = metrics.get('hs_macro_f1', 0.0)
-                f1_no = metrics.get('hs_f1_no', 0.0)
-                f1_imp = metrics.get('hs_f1_implicit', 0.0)
-                f1_exp = metrics.get('hs_f1_explicit', 0.0)
+                tr_f1 = tr_m.get('hs_macro_f1', 0.0)
+                tr_no = tr_m.get('hs_f1_no', 0.0)
+                tr_imp = tr_m.get('hs_f1_implicit', 0.0)
+                tr_exp = tr_m.get('hs_f1_explicit', 0.0)
+
+                val_f1 = metrics.get('hs_macro_f1', 0.0)
+                val_no = metrics.get('hs_f1_no', 0.0)
+                val_imp = metrics.get('hs_f1_implicit', 0.0)
+                val_exp = metrics.get('hs_f1_explicit', 0.0)
 
                 gate_str = f" | Gates: [{', '.join([f'E{i}:{g:.2f}' for i, g in enumerate(train_gates)])}]" if len(train_gates) > 0 and not np.all(train_gates == 0) else ""
-                print(f"Epoch {epoch:02d}/{self.config.epochs:02d} [{elapsed:.1f}s] "
-                      f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                      f"Val Macro-F1: {macro_f1:.4f} [no: {f1_no:.4f}, implicit: {f1_imp:.4f}, explicit: {f1_exp:.4f}]{gate_str}")
+                print(f"Epoch {epoch:02d}/{self.config.epochs:02d} [{elapsed:.1f}s]{gate_str}\n"
+                      f"  Train: Loss {train_loss:.4f} | Macro-F1: {tr_f1:.4f} [no: {tr_no:.4f}, implicit: {tr_imp:.4f}, explicit: {tr_exp:.4f}]\n"
+                      f"  Val:   Loss {val_loss:.4f} | Macro-F1: {val_f1:.4f} [no: {val_no:.4f}, implicit: {val_imp:.4f}, explicit: {val_exp:.4f}]")
 
                 self.history.append({
                     'epoch': epoch,
                     'phase': 1,
                     'train_loss': train_loss,
                     'val_loss': val_loss,
-                    'hs_macro_f1': macro_f1,
-                    'hs_f1_no': f1_no,
-                    'hs_f1_implicit': f1_imp,
-                    'hs_f1_explicit': f1_exp,
+                    'train_macro_f1': tr_f1,
+                    'train_f1_no': tr_no,
+                    'train_f1_implicit': tr_imp,
+                    'train_f1_explicit': tr_exp,
+                    'hs_macro_f1': val_f1,
+                    'hs_f1_no': val_no,
+                    'hs_f1_implicit': val_imp,
+                    'hs_f1_explicit': val_exp,
                     'gates': train_gates
                 })
 
-                if macro_f1 > self.best_macro_f1:
+                if val_f1 > self.best_macro_f1:
                     self.best_macro_f1 = macro_f1
                     self.best_checkpoint_path = self.save_checkpoint("best_model.pt")
                     if self.config.save_predictions and self.df_val is not None:
