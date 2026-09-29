@@ -3,12 +3,11 @@
 """
 End-to-end Smoke Test Suite for Task B Additive Latent Privileged Training Pipeline.
 Tests:
-1. Pipeline imports and classes
+1. Leak-Proof Regex Sanitizer (plan.md §4: implicit|explicit|hate|neutral|non-hate -> [MASKED])
 2. CosineCurriculumAnnealingScheduler (Alpha decay, lambda scaling, boundary conditions)
 3. UnidirectionalKLDivergenceLoss & PrivilegedConsistencyTaskBLoss (Gradients, stop_grad stability, numeric limits)
 4. TaskBAdditiveLatentDataset (Primary tokenization, Hint tokenization, empty fallback)
 5. TaskBClassAwareAttentionModel (Unguided forward, Guided forward with alpha, identical outputs when alpha=0)
-6. TaskBTrainer step simulation (1 dummy training epoch + 1 dummy eval epoch)
 """
 
 import sys
@@ -22,8 +21,23 @@ def run_tests():
     print("  RUNNING PIPELINE VERIFICATION & SMOKE TEST")
     print("==================================================")
 
-    # 1. Test Scheduler
-    print("\n[TEST 1/5] Testing CosineCurriculumAnnealingScheduler...")
+    # 1. Test Leak-Proof Sanitizer
+    print("\n[TEST 1/5] Testing Strict Leak-Proof Sanitizer (plan.md §4)...")
+    from gen.llm_rationalize import sanitize_leak_free_text
+    test_leak_sentence = "This comment displays yes_implicit hate speech and explicit hostility rather than neutral or non-hate content."
+    sanitized = sanitize_leak_free_text(test_leak_sentence)
+    
+    assert "yes_implicit" not in sanitized.lower()
+    assert "explicit" not in sanitized.lower()
+    assert "hate" not in sanitized.lower()
+    assert "neutral" not in sanitized.lower()
+    assert "non-hate" not in sanitized.lower()
+    assert "[MASKED]" in sanitized
+    print("  Sanitized output:", sanitized)
+    print("  ✅ Leak-Proof Sanitizer strictly scrubbed all gold label tokens.")
+
+    # 2. Test Scheduler
+    print("\n[TEST 2/5] Testing CosineCurriculumAnnealingScheduler...")
     from pipeline.scheduler import CosineCurriculumAnnealingScheduler
     sched = CosineCurriculumAnnealingScheduler(total_epochs=10, start_alpha=1.0, end_alpha=0.0)
     p0 = sched.step(0)
@@ -35,8 +49,8 @@ def run_tests():
     assert p10['lambda_c'] == 0.0, f"Epoch 10 lambda_c should be 0.0, got {p10['lambda_c']}"
     print("  ✅ Scheduler logic passed seamlessly.")
 
-    # 2. Test Losses
-    print("\n[TEST 2/5] Testing FocalLoss & PrivilegedConsistencyTaskBLoss...")
+    # 3. Test Losses
+    print("\n[TEST 3/5] Testing FocalLoss & PrivilegedConsistencyTaskBLoss...")
     from pipeline.losses import build_loss_fn, PrivilegedConsistencyTaskBLoss
     base_loss = build_loss_fn(loss_type="focal", gamma=2.0)
     priv_loss = PrivilegedConsistencyTaskBLoss(base_criterion=base_loss, temperature=1.0)
@@ -56,8 +70,8 @@ def run_tests():
     assert dummy_logits_u.grad is not None, "Gradients must flow into unguided logits"
     print("  ✅ Loss forward/backward and stop-gradient passed without numeric issues.")
 
-    # 3. Test Dataset
-    print("\n[TEST 3/5] Testing TaskBAdditiveLatentDataset...")
+    # 4. Test Dataset
+    print("\n[TEST 4/5] Testing TaskBAdditiveLatentDataset...")
     from pipeline.task_b_data import TaskBAdditiveLatentDataset
     
     class DummyTokenizer:
@@ -68,7 +82,7 @@ def run_tests():
             return [hash(w) % 1000 + 1 for w in text.split()]
             
     df_sample = pd.DataFrame([
-        {'StereoQueerEval_id': '1', 'yt_title': 'Pride Parade', 'yt_description': 'Annual event', 'yt_comment': 'Nice!', 'hs_y': 0, 'st_y': 0, 'tg_y': [0]*10, 'rationale': 'Neutral supportive'},
+        {'StereoQueerEval_id': '1', 'yt_title': 'Pride Parade', 'yt_description': 'Annual event', 'yt_comment': 'Nice!', 'hs_y': 0, 'st_y': 0, 'tg_y': [0]*10, 'rationale': 'Supportive community gathering'},
         {'StereoQueerEval_id': '2', 'yt_title': 'News', 'yt_description': 'Debate', 'yt_comment': 'Protect kids', 'hs_y': 1, 'st_y': 1, 'tg_y': [0]*10, 'rationale': 'Faux concern subtext'},
         {'StereoQueerEval_id': '3', 'yt_title': 'Vlog', 'yt_description': 'Day out', 'yt_comment': 'Great video', 'hs_y': 0, 'st_y': 0, 'tg_y': [0]*10, 'rationale': ''}, # empty hint test
     ])
@@ -82,8 +96,8 @@ def run_tests():
     assert hint_ids.shape[0] == 16, "Hint sequence must match hint_max_len"
     print("  ✅ Dataset dual-stream collation passed.")
 
-    # 4. Test Model Architecture & Invariant Condition
-    print("\n[TEST 4/5] Testing TaskBClassAwareAttentionModel...")
+    # 5. Test Model Architecture & Invariant Condition
+    print("\n[TEST 5/5] Testing TaskBClassAwareAttentionModel...")
     from pipeline.models.task_b_class_aware import TaskBClassAwareAttentionModel
     
     class DummyEncoder(nn.Module):
@@ -109,17 +123,17 @@ def run_tests():
     b_hint_in = torch.randint(0, 100, (2, 16))
     b_hint_mask = torch.ones((2, 16), dtype=torch.long)
     
-    # 4a. Pure unguided pass (hint_alpha = 0.0)
+    # 5a. Pure unguided pass (hint_alpha = 0.0)
     out_unguided, _, _ = model(b_in, b_mask, b_roles, hint_alpha=0.0)
     
-    # 4b. Pure unguided pass with hint passed but alpha=0.0
+    # 5b. Pure unguided pass with hint passed but alpha=0.0
     out_unguided_with_dummy_hint, _, _ = model(b_in, b_mask, b_roles, hint_ids=b_hint_in, hint_mask=b_hint_mask, hint_alpha=0.0)
     
     # Assert physical identity
     diff = torch.max(torch.abs(out_unguided - out_unguided_with_dummy_hint)).item()
     assert diff < 1e-6, f"When hint_alpha=0.0, output must be physically identical to unguided! Diff: {diff}"
     
-    # 4c. Guided pass (hint_alpha = 1.0)
+    # 5c. Guided pass (hint_alpha = 1.0)
     out_guided, _, _ = model(b_in, b_mask, b_roles, hint_ids=b_hint_in, hint_mask=b_hint_mask, hint_alpha=1.0)
     assert out_guided.shape == (2, 3), f"Logits shape should be (2, 3), got {out_guided.shape}"
     print("  ✅ Additive Latent Fusion & Invariant Equality (alpha=0 <=> pure unguided) verified 100%.")

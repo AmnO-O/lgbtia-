@@ -6,17 +6,19 @@ for StereoQueerEval 2027 (SemEval Task B / C).
 
 Core Concepts:
 1. Label-Agnostic Feature Extraction: Strictly prohibits the LLM from outputting gold label tokens
-   ('no', 'implicit', 'explicit') to prevent label shortcut leakage.
-2. 5-Axis Contrastive Linguistic Decomposition:
+   ('no', 'implicit', 'explicit', 'hate_speech', 'neutral', 'non-hate') to prevent label shortcut leakage.
+2. Leak-Proof Regex Sanitizer (plan.md §4): Programmatically sanitizes all free-text fields
+   (`rationale`, `boundary_note`) by replacing label leak tokens with `[MASKED]` before caching to disk.
+3. 5-Axis Contrastive Linguistic Decomposition:
    - direct_hostility: [weak | moderate | strong]
    - indirect_subtext: [weak | moderate | strong]
    - context_dependence: [weak | moderate | strong]
-   - counter_speech: [weak | moderate | strong]
+   - counter_speech: [weak | strong]
    - target_reference: [present | absent]
-3. Multi-Class Boundary Contrast:
-   - why_hostility_present_or_absent: Short factual rationale of the pragmatic subtext
-   - confusion_boundary: Why this comment could be mistaken for the nearest alternative class
-4. High-Throughput Batch Processing & Robust JSON-checkpointing.
+4. Multi-Class Boundary Contrast:
+   - rationale: Objective pragmatic breakdown
+   - boundary_note: Confusion boundary and communicative nuance
+5. High-Throughput Batch Processing & Atomic JSON checkpointing.
 """
 
 import argparse
@@ -70,16 +72,38 @@ LANGUAGE_NAMES = {
     'NL': "Dutch"
 }
 
+# Strict Leak-Proof Sanitization Pattern (plan.md §4)
+# Programmatically scrubs any explicit label token or variant before writing to disk
+LEAK_WORDS_PATTERN = re.compile(
+    r'\b(yes_implicit|yes_explicit|no_hate|non[-_ ]?hate|implicit(ly)?|explicit(ly)?|hate[-_ ]?speech|hatespeech|hate|neutral|nonhate)\b',
+    re.IGNORECASE
+)
+
+def sanitize_leak_free_text(text: Optional[str]) -> str:
+    """
+    Strict Leak-Proof Sanitizer:
+    Replaces any occurrence of label leak tokens ('implicit', 'explicit', 'hate',
+    'non-hate', 'neutral', etc.) with '[MASKED]' before saving to cache/disk.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+    # Replace label-revealing tokens with [MASKED]
+    cleaned = LEAK_WORDS_PATTERN.sub('[MASKED]', text)
+    # Collapse multiple consecutive [MASKED] tokens for readability
+    cleaned = re.sub(r'(\[MASKED\]\s*)+', '[MASKED] ', cleaned).strip()
+    return cleaned
+
+
 RATIONALE_SYSTEM_PROMPT = """You are a senior computational sociolinguist conducting pragmatic discourse analysis for YouTube video comments related to LGBTQ+ topics.
 
 Analyze the given comment strictly based on pragmatic and linguistic evidence.
 
 CRITICAL INSTRUCTIONS TO PREVENT DATA LEAKAGE:
-1. DO NOT mention the classification label words ("no", "implicit", "explicit", "hate_speech") in your analysis!
+1. DO NOT mention the classification label words ("no", "implicit", "explicit", "hate_speech", "neutral", "non-hate") in your analysis!
 2. Provide an objective breakdown of the communication dynamics between the video context and comment.
 3. Assess the linguistic axes:
    - direct_hostility: 'weak' (no slurs/threats), 'moderate', or 'strong' (overt slurs/violent threats)
-   - indirect_subtext: 'weak' (literal/neutral/supportive), 'moderate', or 'strong' (sarcasm, dog-whistle, faux-concern, moral lecturing)
+   - indirect_subtext: 'weak' (literal/supportive), 'moderate', or 'strong' (sarcasm, dog-whistle, faux-concern, moral lecturing)
    - context_dependence: 'weak' (meaning is clear standalone), 'moderate', or 'strong' (meaning flips completely based on video title/topic)
    - counter_speech: 'weak' (not defending LGBTQ+), 'strong' (defending or supporting LGBTQ+ persons)
    - target_reference: 'present' (explicitly or implicitly mentions LGBTQ+ identities/groups), 'absent'
@@ -99,7 +123,7 @@ Reply ONLY with a raw JSON object:
         "target_reference": "present|absent"
       },
       "rationale": "Objective 1-2 sentence breakdown of the tone, sarcasm, innuendo, or literal stance.",
-      "boundary_note": "Why this comment might seem neutral or overt at first glance, and what makes its true tone distinct."
+      "boundary_note": "Why this comment might seem literal or severe at first glance, and what makes its true communicative nuance distinct."
     }
   ]
 }"""
@@ -140,98 +164,123 @@ def read_tsv_rows(paths: List[str], lang_filter: Optional[str] = None) -> List[D
                 header = next(reader, None)
                 if not header:
                     continue
-                col_idx = {h: i for i, h in enumerate(header)}
-                for line in reader:
-                    if len(line) <= max(col_idx.values()):
+                header = [h.strip() for h in header]
+                idx_map = {col: i for i, col in enumerate(header)}
+                
+                id_col = 'StereoQueerEval_id' if 'StereoQueerEval_id' in idx_map else header[0]
+                c_col = 'yt_comment' if 'yt_comment' in idx_map else None
+                t_col = 'yt_title' if 'yt_title' in idx_map else None
+                d_col = 'yt_description' if 'yt_description' in idx_map else None
+
+                for row in reader:
+                    if not row or len(row) <= idx_map.get(id_col, 0):
                         continue
+                    sid = row[idx_map[id_col]].strip()
+                    if not sid:
+                        continue
+                    comment = row[idx_map[c_col]].strip() if c_col and len(row) > idx_map[c_col] else ""
+                    title = row[idx_map[t_col]].strip() if t_col and len(row) > idx_map[t_col] else ""
+                    desc = row[idx_map[d_col]].strip() if d_col and len(row) > idx_map[d_col] else ""
+                    
                     rows.append({
-                        'id': line[col_idx['StereoQueerEval_id']].strip(),
+                        'id': sid,
                         'lang': lang,
-                        'yt_title': line[col_idx['yt_title']].strip() if 'yt_title' in col_idx else '',
-                        'yt_description': line[col_idx['yt_description']].strip() if 'yt_description' in col_idx else '',
-                        'yt_comment': line[col_idx['yt_comment']].strip() if 'yt_comment' in col_idx else '',
-                        'target': line[col_idx['target']].strip() if 'target' in col_idx else 'none',
-                        'stereotype': line[col_idx['stereotype']].strip() if 'stereotype' in col_idx else 'no',
-                        'hate_speech': line[col_idx['hate_speech']].strip() if 'hate_speech' in col_idx else 'no'
+                        'yt_comment': comment,
+                        'yt_title': title,
+                        'yt_description': desc
                     })
         except Exception as e:
-            print(f"Error reading {p}: {e}", file=sys.stderr)
+            print(f"Error reading {p}: {e}")
     return rows
 
-def init_client(api: str):
-    if api == 'gemini':
+def init_client(api_name: str):
+    if api_name == 'gemini':
+        api_key = os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
+        if not api_key:
+            raise FatalAPIError("GEMINI_API_KEY not found in environment!")
         from google import genai
-        key = os.environ.get('GEMINI_API_KEY')
-        if not key:
-            raise SystemExit('Missing GEMINI_API_KEY in environment or .env')
-        return ('gemini', genai.Client(api_key=key))
-    elif api == 'groq':
-        from openai import OpenAI
-        key = os.environ.get('GROQ_API_KEY')
-        if not key:
-            raise SystemExit('Missing GROQ_API_KEY in environment or .env')
-        return ('groq', OpenAI(api_key=key, base_url='https://api.groq.com/openai/v1'))
-    raise ValueError(f"Unknown API: {api}")
+        client = genai.Client(api_key=api_key)
+        return ('gemini', client)
+    elif api_name == 'groq':
+        api_key = os.environ.get('GROQ_API_KEY')
+        if not api_key:
+            raise FatalAPIError("GROQ_API_KEY not found in environment!")
+        from groq import Groq
+        client = Groq(api_key=api_key)
+        return ('groq', client)
+    else:
+        raise FatalAPIError(f"Unsupported API: {api_name}")
 
-def call_llm(cli_tuple, model_name: str, system_prompt: str, user_prompt: str, temp: float) -> str:
-    kind, cli = cli_tuple
-    if kind == 'gemini':
+def call_llm(cli_tuple, model_name: str, sys_prompt: str, user_prompt: str, temp: float) -> str:
+    api_name, client = cli_tuple
+    if api_name == 'gemini':
         from google.genai import types
-        from google.genai import errors as genai_errors
         try:
-            config = types.GenerateContentConfig(
-                system_instruction=system_prompt,
+            cfg = types.GenerateContentConfig(
+                system_instruction=sys_prompt,
                 temperature=temp,
-                max_output_tokens=3000,
                 response_mime_type="application/json"
             )
-            response = cli.models.generate_content(
+            resp = client.models.generate_content(
                 model=model_name,
                 contents=user_prompt,
-                config=config
+                config=cfg
             )
-            return response.text or ""
-        except genai_errors.APIError as e:
-            if getattr(e, 'code', None) in (429, 500, 502, 503, 504):
-                raise RetryableAPIError() from e
-            raise FatalAPIError(f"Gemini error: {e}") from e
-    elif kind == 'groq':
+            return resp.text
+        except Exception as e:
+            err_str = str(e).lower()
+            if '429' in err_str or 'quota' in err_str or 'resource_exhausted' in err_str or 'rate' in err_str:
+                raise RetryableAPIError()
+            raise e
+    elif api_name == 'groq':
         try:
-            resp = cli.chat.completions.create(
+            resp = client.chat.completions.create(
                 model=model_name,
                 messages=[
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=temp,
                 response_format={"type": "json_object"}
             )
-            return resp.choices[0].message.content or ""
+            return resp.choices[0].message.content
         except Exception as e:
-            if "429" in str(e).lower():
-                raise RetryableAPIError() from e
-            raise
+            err_str = str(e).lower()
+            if '429' in err_str or 'rate' in err_str:
+                raise RetryableAPIError()
+            raise e
+    return ""
 
 def main():
     args = parse_args()
-    candidate_paths = args.input or DEFAULT_INPUT_GLOBS
-    all_files = sorted({p for pat in candidate_paths for p in glob.glob(pat, recursive=True) if os.path.isfile(p)})
-    if not all_files:
-        sys.exit(f"No source files found in {candidate_paths}")
     
-    rows = read_tsv_rows(all_files, args.lang)
-    if not rows:
-        sys.exit("No data rows loaded.")
+    input_files = []
+    if args.input:
+        for inp in args.input:
+            input_files.extend(glob.glob(inp))
+    else:
+        for g in DEFAULT_INPUT_GLOBS:
+            found = glob.glob(g)
+            if found:
+                input_files.extend(found)
+                break
+                
+    input_files = sorted(list(set(input_files)))
+    if not input_files:
+        print("Error: No training TSV files found!")
+        sys.exit(1)
+        
+    print(f"Reading training files: {input_files}")
+    rows = read_tsv_rows(input_files, lang_filter=args.lang)
     if args.limit:
         rows = rows[:args.limit]
-    
-    # Load cache
+        
     cache: Dict[str, Any] = {}
     if args.resume and not args.force_restart and os.path.exists(args.out):
         try:
             with open(args.out, 'r', encoding='utf-8') as f:
                 cache = json.load(f)
-            print(f"Loaded existing cache with {len(cache)} analyzed rationales from {args.out}")
+            print(f"Loaded existing cache with {len(cache)} diagnostic rationales.")
         except Exception:
             cache = {}
     
@@ -271,10 +320,20 @@ def main():
                 for item in items:
                     item_id = item.get('id')
                     if item_id:
+                        # -------------------------------------------------------------
+                        # LEAK-PROOF SANITIZER (plan.md §4):
+                        # Strict programmatic masking before writing to cache / disk
+                        # -------------------------------------------------------------
+                        raw_rationale = item.get('rationale', '')
+                        raw_boundary = item.get('boundary_note', '')
+                        
+                        clean_rationale = sanitize_leak_free_text(raw_rationale)
+                        clean_boundary = sanitize_leak_free_text(raw_boundary)
+
                         cache[item_id] = {
                             'axes': item.get('axes', {}),
-                            'rationale': item.get('rationale', ''),
-                            'boundary_note': item.get('boundary_note', '')
+                            'rationale': clean_rationale,
+                            'boundary_note': clean_boundary
                         }
                 success = True
             except RetryableAPIError:
@@ -292,12 +351,12 @@ def main():
             json.dump(cache, f, ensure_ascii=False, indent=2)
             
         elapsed = time.time() - t0
-        print(f"Processed {min(i+batch_size, len(pending))}/{len(pending)} (Saved to {args.out}) [{elapsed:.1f}s]")
+        print(f"Processed {min(i+batch_size, len(pending))}/{len(pending)} (Saved sanitized to {args.out}) [{elapsed:.1f}s]")
         
         if min_interval > elapsed:
             time.sleep(min_interval - elapsed)
 
-    print(f"\n🎉 Finished generating {len(cache)} diagnostic rationales -> {args.out}")
+    print(f"\n🎉 Finished generating {len(cache)} leak-proof diagnostic rationales -> {args.out}")
 
 if __name__ == '__main__':
     main()
