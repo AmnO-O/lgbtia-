@@ -67,18 +67,19 @@ class PureClassQueryScoringHead(nn.Module):
         return_all_msd_logits: bool = False
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         B, num_classes, d = z_classes.shape
-        z_flat = z_classes.view(B * num_classes, d)
+        # Use .contiguous().reshape(...) instead of .view(...) to handle non-contiguous memory layouts safely
+        z_flat = z_classes.contiguous().reshape(B * num_classes, d)
         z_normed = self.norm(z_flat)
 
         if self.use_msd:
             msd_outputs = self.msd_head(z_normed) # List of [B * num_classes, 1]
-            branch_logits = [out.view(B, num_classes) for out in msd_outputs]
+            branch_logits = [out.contiguous().reshape(B, num_classes) for out in msd_outputs]
             if return_all_msd_logits and self.training:
                 return branch_logits
             return torch.mean(torch.stack(branch_logits, dim=0), dim=0)
         else:
             out = self.linear(z_normed) # [B * num_classes, 1]
-            return out.view(B, num_classes)
+            return out.contiguous().reshape(B, num_classes)
 
 
 class TaskBClassAwareAttentionModel(nn.Module):
@@ -236,7 +237,8 @@ class TaskBClassAwareAttentionModel(nn.Module):
             h_role = h_role + (hint_alpha * hint_vec.unsqueeze(1))
 
         # 3. Expand 3 Class Prototype Queries to Batch: [B, total_queries, d_model]
-        q_raw = self.class_queries.unsqueeze(0).expand(B, -1, -1)
+        # .contiguous() ensures memory layout compatibility across CUDA devices
+        q_raw = self.class_queries.unsqueeze(0).expand(B, -1, -1).contiguous()
         if q_raw.dtype != h_role.dtype:
             q_raw = q_raw.to(h_role.dtype)
 
@@ -265,7 +267,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
             )
             attn_weights = None
 
-        z = q_raw + self.dropout_cross(z_attn) # [B, total_queries, d_model]
+        z = (q_raw + self.dropout_cross(z_attn)).contiguous() # [B, total_queries, d_model]
 
         # 5. Layer 2: Optional Inter-Class Query Self-Interaction
         if self.use_query_interaction and self.total_queries > 1:
@@ -276,13 +278,13 @@ class TaskBClassAwareAttentionModel(nn.Module):
                 value=z_normed,
                 need_weights=False
             )
-            z = z + self.dropout_self(z_self)
+            z = (z + self.dropout_self(z_self)).contiguous()
 
         # Pool slots per class if num_slots_per_class > 1
         if self.num_slots_per_class == 1:
-            z_classes = z.view(B, self.num_classes, self.d_model)
+            z_classes = z.contiguous().reshape(B, self.num_classes, self.d_model)
         else:
-            z_classes = z.view(B, self.num_classes, self.num_slots_per_class, self.d_model).mean(dim=2)
+            z_classes = z.contiguous().reshape(B, self.num_classes, self.num_slots_per_class, self.d_model).mean(dim=2)
 
         # 6. Layer 3: Shared Class Query Scoring Head
         out_logits = self.scoring_head(
