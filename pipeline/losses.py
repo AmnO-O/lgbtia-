@@ -88,42 +88,140 @@ class FocalLoss(nn.Module):
         return focal_loss
 
 
+class UnidirectionalKLDivergenceLoss(nn.Module):
+    """
+    Unidirectional KL Divergence Consistency Distillation Loss with Stop-Gradient.
+    
+    Formula:
+        L_cons = KL( sg(p_teacher) || p_student )
+               = sum_{c} sg(p_teacher_c) * ( log(sg(p_teacher_c)) - log(p_student_c) )
+               
+    Guarantees:
+      1. Stop-gradient on teacher predictions ensures student learns from teacher
+         without pulling teacher predictions down to a worse unguided state.
+      2. Device and AMP safe with numerical stability clamping.
+    """
+    def __init__(self, temperature: float = 1.0, reduction: str = "mean"):
+        super().__init__()
+        self.temperature = float(temperature)
+        self.reduction = reduction
+
+    def forward(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            student_logits: [B, C] (Unguided predictions p_u)
+            teacher_logits: [B, C] (Privileged teacher predictions p_c)
+        """
+        # Temperature scale logits
+        s_logits = student_logits / self.temperature
+        t_logits = teacher_logits.detach() / self.temperature  # sg(p_c)
+
+        # Log softmax of student and soft probabilities of teacher
+        log_p_student = F.log_softmax(s_logits, dim=-1)
+        p_teacher = F.softmax(t_logits, dim=-1)
+        p_teacher = torch.clamp(p_teacher, min=1e-7, max=1.0 - 1e-7)
+
+        # KL(p_teacher || p_student) = sum p_teacher * (log(p_teacher) - log(p_student))
+        kl_per_sample = torch.sum(p_teacher * (torch.log(p_teacher) - log_p_student), dim=-1) # [B]
+
+        # Scale by T^2 as per standard Hinton distillation
+        kl_per_sample = (self.temperature ** 2) * kl_per_sample
+
+        if self.reduction == "mean":
+            return kl_per_sample.mean()
+        elif self.reduction == "sum":
+            return kl_per_sample.sum()
+        return kl_per_sample
+
+
+class PrivilegedConsistencyTaskBLoss(nn.Module):
+    """
+    Unified Multi-Objective Loss for Privileged Information Training:
+        L_total = L_task(y, p_u) + lambda_c * L_task(y, p_c) + lambda_cons * KL(sg(p_c) || p_u)
+        
+    When conditional output is None (e.g. running purely without hints or during unguided training),
+    falls back cleanly to standard L_task(y, p_u).
+    """
+    def __init__(
+        self,
+        base_criterion: nn.Module,
+        temperature: float = 1.0
+    ):
+        super().__init__()
+        self.base_criterion = base_criterion
+        self.kl_criterion = UnidirectionalKLDivergenceLoss(temperature=temperature)
+
+    def forward(
+        self,
+        logits_u: Union[torch.Tensor, List[torch.Tensor]],
+        targets: torch.Tensor,
+        logits_c: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        lambda_c: float = 0.0,
+        lambda_cons: float = 0.0
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        # 1. Unconditional Loss
+        if isinstance(logits_u, list):
+            losses_u = [self.base_criterion(b, targets) for b in logits_u]
+            loss_u = torch.mean(torch.stack(losses_u))
+            eval_logits_u = torch.mean(torch.stack(logits_u, dim=0), dim=0)
+        else:
+            loss_u = self.base_criterion(logits_u, targets)
+            eval_logits_u = logits_u
+
+        # If no teacher logits provided or weights are 0, return pure unconditional loss
+        if logits_c is None or (lambda_c <= 0.0 and lambda_cons <= 0.0):
+            return loss_u, {
+                'loss_total': float(loss_u.detach().item()),
+                'loss_u': float(loss_u.detach().item()),
+                'loss_c': 0.0,
+                'loss_cons': 0.0
+            }
+
+        # 2. Conditional Loss
+        if isinstance(logits_c, list):
+            losses_c = [self.base_criterion(b, targets) for b in logits_c]
+            loss_c = torch.mean(torch.stack(losses_c))
+            eval_logits_c = torch.mean(torch.stack(logits_c, dim=0), dim=0)
+        else:
+            loss_c = self.base_criterion(logits_c, targets)
+            eval_logits_c = logits_c
+
+        # 3. Unidirectional Consistency Distillation with stop_gradient(p_c)
+        loss_cons = self.kl_criterion(eval_logits_u, eval_logits_c)
+
+        total_loss = loss_u + (lambda_c * loss_c) + (lambda_cons * loss_cons)
+
+        return total_loss, {
+            'loss_total': float(total_loss.detach().item()),
+            'loss_u': float(loss_u.detach().item()),
+            'loss_c': float(loss_c.detach().item()),
+            'loss_cons': float(loss_cons.detach().item())
+        }
+
+
 class MoELoadBalanceLoss(nn.Module):
     """
-    Mixture-of-Experts (MoE) Router Load Balancing Loss.
-    
-    Prevents expert collapse where the router overwhelmingly selects only one expert.
-    Computes normalized square-deviation across the batch:
-        L_balance = N * sum_{i=1}^N (mean(g_i)^2) - 1.0
-        
-    When distribution across experts is uniform (mean(g_i) = 1/N), loss is 0.0.
+    Mixture-of-Experts (MoE) Router Load Balancing Loss (kept for backward compatibility).
     """
     def __init__(self, num_experts: int = 4):
         super().__init__()
         self.num_experts = num_experts
 
     def forward(self, gates: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            gates: Tensor of routing probabilities [B, num_experts]
-        Returns:
-            Scalar load balance regularization loss
-        """
         if gates is None or gates.shape[0] == 0:
             return torch.tensor(0.0, device=gates.device if gates is not None else 'cpu')
-        
-        # Batch-average expert utilization: [num_experts]
         mean_gates = torch.mean(gates, dim=0)
-        
-        # L_balance = N * sum(mean_gates^2) - 1.0
         loss = self.num_experts * torch.sum(mean_gates ** 2) - 1.0
         return torch.clamp(loss, min=0.0)
 
 
 class TaskBLoss(nn.Module):
     """
-    Unified Task B Loss combining multi-class focal loss (with Multi-Sample Dropout averaging)
-    and optional MoE Router Load Balancing regularization.
+    Unified Task B Loss combining multi-class focal loss and optional MoE Router Load Balancing.
     """
     def __init__(
         self,
@@ -142,12 +240,6 @@ class TaskBLoss(nn.Module):
         targets: torch.Tensor,
         gates: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """
-        Args:
-            logits: Single tensor [B, 3] or list of MSD branch tensors
-            targets: Class target indices [B]
-            gates: Optional router gates [B, num_experts]
-        """
         if isinstance(logits, list):
             branch_losses = [self.base_criterion(branch_logit, targets) for branch_logit in logits]
             cls_loss = torch.mean(torch.stack(branch_losses))
@@ -192,78 +284,3 @@ def build_loss_fn(
             weight=weight_tensor,
             label_smoothing=label_smoothing
         )
-
-
-class MultiTaskLoss(nn.Module):
-    """
-    Weighted Multi-Task Loss for StereoQueer:
-      - Stereotype Presence (ST): BCEWithLogitsLoss
-      - Hate Speech Type (HS): CrossEntropyLoss or FocalLoss
-      - Stereotype Target Group (TG): BCEWithLogitsLoss
-    """
-    def __init__(self, config: PipelineConfig):
-        super().__init__()
-        self.w_st = config.loss_st_weight
-        self.w_hs = config.loss_hs_weight
-        self.w_tg = config.loss_tg_weight
-        
-        self.loss_st = nn.BCEWithLogitsLoss()
-        
-        if getattr(config, 'loss_type', 'focal') == 'focal':
-            class_weights = getattr(config, 'class_weights', None)
-            focal_gamma = getattr(config, 'focal_gamma', 2.0)
-            label_smoothing = getattr(config, 'label_smoothing', 0.05)
-            self.loss_hs = FocalLoss(
-                gamma=focal_gamma,
-                alpha=class_weights,
-                label_smoothing=label_smoothing
-            )
-        else:
-            class_weights = getattr(config, 'class_weights', None)
-            weight_tensor = torch.tensor(class_weights, dtype=torch.float32) if class_weights else None
-            self.loss_hs = nn.CrossEntropyLoss(weight=weight_tensor)
-            
-        self.loss_tg = nn.BCEWithLogitsLoss()
-
-    def forward(
-        self,
-        *args,
-        **kwargs
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Accepts:
-          - (preds_dict, targets_dict)
-          - (st_logits, hs_logits, tg_logits, st_tgt, hs_tgt, tg_tgt)
-        Returns:
-          - (total_loss, {'total': total_loss, 'st': l_st, 'hs': l_hs, 'tg': l_tg})
-        """
-        if len(args) == 2 and isinstance(args[0], dict) and isinstance(args[1], dict):
-            preds, targets = args[0], args[1]
-            st_pred, hs_pred, tg_pred = preds['st'], preds['hs'], preds['tg']
-            st_tgt, hs_tgt, tg_tgt = targets['st'], targets['hs'], targets['tg']
-        elif len(args) == 6:
-            st_pred, hs_pred, tg_pred, st_tgt, hs_tgt, tg_tgt = args
-        elif 'preds' in kwargs and 'targets' in kwargs:
-            preds, targets = kwargs['preds'], kwargs['targets']
-            st_pred, hs_pred, tg_pred = preds['st'], preds['hs'], preds['tg']
-            st_tgt, hs_tgt, tg_tgt = targets['st'], targets['hs'], targets['tg']
-        else:
-            raise ValueError("MultiTaskLoss expects either 2 dicts (preds, targets) or 6 positional tensors.")
-
-        # Ensure matching shapes for ST binary classification
-        st_pred = st_pred.squeeze(-1) if st_pred.ndim > 1 and st_pred.shape[-1] == 1 else st_pred
-        st_tgt = st_tgt.view_as(st_pred)
-
-        l_st = self.loss_st(st_pred, st_tgt)
-        l_hs = self.loss_hs(hs_pred, hs_tgt)
-        l_tg = self.loss_tg(tg_pred, tg_tgt)
-
-        total = self.w_st * l_st + self.w_hs * l_hs + self.w_tg * l_tg
-        loss_dict = {
-            'total': total,
-            'st': l_st,
-            'hs': l_hs,
-            'tg': l_tg,
-        }
-
-        return total, loss_dict

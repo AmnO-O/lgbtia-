@@ -1,121 +1,175 @@
-# Architectural Migration Plan: 4-Expert Dynamic Query-Bank MoE with Context-Aware Router
-
-## Executive Summary
-This document provides the complete, mathematically rigorous engineering specification and implementation roadmap for migrating the Task B model to a **4-Expert Mixture of Latent Query Banks (MoE-Query)** with a **Context-Aware Masked Mean Router**.
+# Comprehensive Architectural Blueprint & Production Plan
+## Additive Latent Privileged Guidance with Curriculum Annealing & Unidirectional Consistency Distillation
+### Benchmark Target: SemEval 2027 StereoQueerEval — Task B (Hate Speech Classification: No / Implicit / Explicit)
 
 ---
 
-## 1. High-Level Architecture Diagram
+## 1. Mathematical & Theoretical Foundation
+
+### 1.1 The Core Problem in Implicit Hate Detection
+Implicit hate speech on social platforms relies heavily on pragmatic cues (sarcasm, faux-concern, dog-whistles, rhetorical questions) that exhibit zero overt toxic keywords. Naive models fail to establish sharp decision boundaries because the surface tokens appear benign.
+
+### 1.2 The Additive Latent Privileged Information (ALPI) Framework
+Inspired by:
+1. **Vapnik's Learning Using Privileged Information (LUPI)** (*Vapnik et al., 2009*)
+2. **Diffusion Classifier-Free Conditioning & Residual Modulation** (*Ho & Salimans, 2022*)
+3. **Curriculum Teacher-Forcing Annealing** (*Bengio et al., NIPS 2015*)
+4. **Self-Consistent Teacher Distillation with Stop-Gradient** (*Hinton et al., 2015; Xie et al., NeurIPS 2020*)
+
+We formulate the model with a **Shared mmBERT Multilingual Latent Space** where teacher rationales are compressed into a compact representation vector and additively injected into the sequence representation.
+
+---
+
+## 2. Model Architecture & Forward Flow
 
 ```
-                                      Input Tokens + Role IDs
-                                                │
-                                                ▼
-                                    mmBERT Backbone + Role Embeddings
-                                                │
-                                    H_role ∈ ℝ^[B, S, 768]
-                                                │
-                 ┌──────────────────────────────┴──────────────────────────────┐
-                 ▼                                                             ▼
-    [Nhánh 1: Context Router]                                    [Nhánh 2: 4-Expert Query Banks]
-  1. Masked Mean Pooling:                                       Parallel Pre-Norm Multihead Cross-Attention:
-     h_ctx = Σ(m_i · H_i) / Σ(m_i)  [B, 768]                     - Expert 1 (Non-Hate Bank)      ──► z_1 [B, 768]
-  2. Router MLP (768 ─► 256 ─► 4):                               - Expert 2 (Implicit Hate Bank) ──► z_2 [B, 768]
-     logits_router ∈ ℝ^[B, 4]                                   - Expert 3 (Explicit Hate Bank) ──► z_3 [B, 768]
-  3. Temperature Softmax Gating:                                - Expert 4 (Context Shift Bank) ──► z_4 [B, 768]
-     g = Softmax(logits_router / τ) ∈ ℝ^[B, 4]                                 │
-                 │                                                             │
-                 └──────────────────────────────┬──────────────────────────────┘
-                                                ▼
-                               Differentiable Convex Combination:
-                                   z_final = Σ (g_i · z_i) ∈ ℝ^[B, 768]
-                                                │
-                                                ▼
-                                [ Task B Classifier + MSD Head ]
-                                 - Dense (768 ─► 384) + RMSNorm + GELU
-                                 - 5-Branch Multi-Sample Dropout (p=0.1~0.3)
-                                 - Linear (384 ─► 3) ──► Logits [B, 3]
-                                                │
-                                                ▼
-                                   Task C Latent Bridge h_B
+                      ┌─────────────────────────────────────────────────────────────┐
+                      │ Sample x = (Comment C, Title T, Desc D)                     │
+                      │ Teacher Hint h = (5-Axis Linguistic Diagnostics + Boundary) │
+                      └──────────────────────────────┬──────────────────────────────┘
+                                                     │
+                             ┌───────────────────────┴───────────────────────┐
+                             ▼                                               ▼
+         [STREAM 1: Primary Context Input]                   [STREAM 2: Teacher Hint Encoder]
+         [CLS] comment: <C> [SEP] title: <T>                 [CLS] hint: <Linguistic Diagnostics>
+                 [SEP] desc: <D> [SEP]                                   [SEP]
+                             │                                               │
+                             ▼                                               ▼
+               ┌───────────────────────────┐                   ┌───────────────────────────┐
+               │ mmBERT Shared Backbone    │                   │ mmBERT (Frozen Teacher)   │
+               │ Last Hidden State:        │                   │ [CLS] Vector:             │
+               │ H_x ∈ ℝ^(B × S × d_model) │                   │ v_hint ∈ ℝ^(B × d_model)  │
+               └─────────────┬─────────────┘                   └─────────────┬─────────────┘
+                             │                                               │
+                             │                                               ▼
+                             │                                 ┌───────────────────────────┐
+                             │                                 │ Residual Adapter + RMSNorm│
+                             │                                 │ h_vec = RMSNorm(W·v_hint) │
+                             │                                 └─────────────┬─────────────┘
+                             │                                               │
+                             │                                               ▼
+                             │                                  ┌──────────────────────────┐
+                             │                                  │ Stochastic Annealer α(e) │
+                             │                                  │ h_mod = α(e) · m · h_vec │
+                             │                                  └────────────┬─────────────┘
+                             │                                               │
+                             └───────────────────────┬───────────────────────┘
+                                                     ▼
+                                     [ADDITIVE LATENT RESIDUAL FUSION]
+                                        H_fused = H_x + h_mod.unsqueeze(1)
+                                                     │
+                                                     ▼
+                                     ┌───────────────────────────────┐
+                                     │ Class-Aware Attention Pooler  │
+                                     │ 3 Learnable Queries (No/Imp/Exp)
+                                     │ Q ∈ ℝ^(3 × d_model)           │
+                                     └───────────────┬───────────────┘
+                                                     │
+                                                     ▼
+                                          Logits z ∈ ℝ^(B × 3)
+```
+
+### 2.1 The Additive Latent Fusion Equation
+Given primary sequence representations $\mathbf{H}_x \in \mathbb{R}^{B \times S \times d}$ and teacher hint vector $\mathbf{v}_{\text{hint}} \in \mathbb{R}^{B \times d}$:
+
+$$\mathbf{h}_{\text{proj}} = \text{RMSNorm}\big( \mathbf{W}_h \mathbf{v}_{\text{hint}} + \mathbf{b}_h \big)$$
+
+$$\mathbf{H}_{\text{fused}} = \mathbf{H}_x + \alpha(e) \cdot m \cdot \mathbf{h}_{\text{proj}}^\top \mathbf{1}_S^\top$$
+
+Where:
+- $m \sim \text{Bernoulli}(1 - p_{\text{drop}})$ is a stochastic Bernoulli mask.
+- $\alpha(e) \in [1.0, 0.0]$ is the **Cosine Curriculum Annealing Factor** at epoch $e$.
+- At inference / test time, $\alpha(e) = 0.0 \implies \mathbf{H}_{\text{fused}} \equiv \mathbf{H}_x$ (100% pure representation, zero test-time overhead, zero distributional shift).
+
+---
+
+## 3. The Mathematically Grounded Multi-Objective Loss Formulation
+
+To simultaneously achieve:
+1. Strong unguided classification performance on test data ($p_u$),
+2. Accurate privileged alignment during training ($p_c$),
+3. Safe distillation without gradient collapse ($p_u \to \text{stop\_gradient}(p_c)$),
+
+we define the total loss objective:
+
+$$\boxed{\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}}(y, p_u) + \lambda_c(e) \cdot \mathcal{L}_{\text{task}}(y, p_c) + \lambda_{\text{cons}}(e) \cdot \mathcal{D}_{\text{KL}}\Big( \text{stop\_gradient}(p_c) \,\|\, p_u \Big)}$$
+
+### 3.1 Component Breakdown:
+
+1. **Class-Balanced Focal Task Loss ($\mathcal{L}_{\text{task}}$):**
+   $$\mathcal{L}_{\text{task}}(y, p) = -\sum_{k=0}^{2} w_k \cdot y_k \cdot (1 - p_k)^\gamma \log(p_k)$$
+   - Modulating factor $\gamma = 2.0$ dynamically down-weights easy non-hate examples and emphasizes hard ambiguous implicit hate cases.
+   - Class weight vector $w = [1.0, 2.2, 1.8]$ counters class imbalance.
+
+2. **Unidirectional Consistency Distillation with Stop-Gradient:**
+   $$\mathcal{L}_{\text{cons}} = \mathcal{D}_{\text{KL}}\big( \text{sg}(p_c) \,\|\, p_u \big) = \sum_{k=0}^{2} \text{sg}(p_{c,k}) \log\left( \frac{\text{sg}(p_{c,k})}{p_{u,k}} \right)$$
+   - $\text{sg}(\cdot)$ is the **stop-gradient** operator ($\text{detach()}$ in PyTorch).
+   - **Why this is critical:** Gradients flow *exclusively* into $p_u$, forcing the unguided network parameters to mirror the teacher's latent decision boundary, preventing the teacher from being degraded by an unguided student.
+
+3. **Dynamic Annealing Schedule ($\alpha(e), \lambda_c(e), \lambda_{\text{cons}}(e)$):**
+
+   $$\alpha(e) = \frac{1}{2}\left(1 + \cos\left(\frac{e}{E_{\text{total}}}\pi\right)\right)$$
+
+   $$\lambda_c(e) = 0.40 \cdot \alpha(e)$$
+
+   $$\lambda_{\text{cons}}(e) = 0.30 \cdot (1 - \alpha(e))$$
+
+   - **Epochs 1–3 (Discovery):** $\alpha \approx 1.0$, $\lambda_c = 0.40$, $\lambda_{\text{cons}} = 0.05$. mmBERT absorbs high-level sociolinguistic representations.
+   - **Epochs 4–10 (Transference):** $\alpha \to 0.5$, $\lambda_{\text{cons}} \uparrow 0.25$. Consistency loss pulls $p_u$ directly toward the teacher manifold.
+   - **Epochs 11–15 (Mastery & Disconnection):** $\alpha \to 0.0$, $\lambda_c \to 0.0$. Model trains 100% independently in genuine inference conditions.
+
+---
+
+## 4. Rigorous Leak-Proof Rationale Generation (`gen/llm_rationalize.py`)
+
+To eliminate the risk of shortcut memorization:
+1. **Strict Regex Token Sanitizer:** Any occurrence of `implicit`, `explicit`, `hate`, `non-hate`, `neutral` is programmatically masked to `[MASKED]` before writing to disk.
+2. **5-Axis Discrete Decomposition:**
+   - `direct_hostility`: `weak | moderate | strong`
+   - `indirect_subtext`: `weak | moderate | strong`
+   - `context_dependence`: `weak | moderate | strong`
+   - `counter_speech`: `weak | strong`
+   - `target_reference`: `present | absent`
+3. **Boundary Contrast:** Focuses strictly on *why* this comment could be misinterpreted at surface level and what subtle shift creates its actual communicative intent.
+
+---
+
+## 5. End-to-End Implementation Roadmap
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│ STAGE 1: Offline Rationale Mining (Zero Leakage)                                  │
+│ • Execute `python gen/llm_rationalize.py --api gemini --batch-size 8`            │
+│ • Validates all training TSVs and caches to `LGBT/rationales.json`              │
+└────────────────────────────────────────┬─────────────────────────────────────────┘
+                                         │
+                                         ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│ STAGE 2: Additive Latent Model & Dataset Update                                   │
+│ • Update `pipeline/models/task_b_class_aware.py` with `HintAdditiveProjection` │
+│ • Update `pipeline/task_b_data.py` to yield paired (text_ids, hint_ids)         │
+└────────────────────────────────────────┬─────────────────────────────────────────┘
+                                         │
+                                         ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│ STAGE 3: Consistency & Annealing Trainer Execution                               │
+│ • Implement CosineAnnealingScheduler for α(e), λ_c(e), and λ_cons(e)             │
+│ • Train on GPU using 2-Phase Warmup + Differential Backbone Learning Rates       │
+└────────────────────────────────────────┬─────────────────────────────────────────┘
+                                         │
+                                         ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│ STAGE 4: Final Validation & Leaderboard Submission                               │
+│ • Evaluate strictly in unguided mode (α = 0, 100% human ground truth)            │
+│ • Confirm Macro-F1 improvement on implicit hate speech                           │
+└──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 2. Mathematical Formalization
+## 6. Key Verification Checkpoints
 
-### 2.1. Nhánh 1: Context-Aware Router
-1. **Masked Mean Pooling**:
-   $$\mathbf{h}_{\text{ctx}} = \frac{\sum_{j=1}^S m_j \cdot \mathbf{H}_{\text{role}, j}}{\sum_{j=1}^S m_j + \epsilon} \in \mathbb{R}^{B \times 768}$$
-   *where $m_j \in \{0, 1\}$ is the `attention_mask`.*
-
-2. **Router Gating MLP**:
-   $$\mathbf{h}_{\text{router}} = \text{GELU}(\text{RMSNorm}(W_1 \mathbf{h}_{\text{ctx}} + b_1)) \in \mathbb{R}^{B \times d_r} \quad (d_r = 256)$$
-   $$\mathbf{u} = W_2 \mathbf{h}_{\text{router}} + b_2 \in \mathbb{R}^{B \times 4}$$
-   $$\mathbf{g} = \text{Softmax}\left(\frac{\mathbf{u}}{\tau}\right) \in \mathbb{R}^{B \times 4} \quad \text{where } \sum_{i=1}^4 g_i = 1$$
-
-### 2.2. Nhánh 2: 4-Expert Latent Query Banks
-Four specialized continuous latent query prototypes $\mathcal{Q} \in \mathbb{R}^{4 \times K \times 768}$ ($K=1$ slot/expert default):
-* **Expert 1 ($\mathcal{Q}_0$)**: *Non-Hate / Respectful / Affirmative* prototype.
-* **Expert 2 ($\mathcal{Q}_1$)**: *Implicit / Nuanced Sarcasm / Subtle Stereotypes* prototype.
-* **Expert 3 ($\mathcal{Q}_2$)**: *Explicit / Direct Slurs / Targeted Hate* prototype.
-* **Expert 4 ($\mathcal{Q}_3$)**: *Contextual Discrepancy (Title/Desc vs Comment)* prototype.
-
-For each expert $i \in \{0, 1, 2, 3\}$:
-$$\mathbf{Q}_i = \text{RMSNorm}(\mathcal{Q}_i) \in \mathbb{R}^{B \times K \times 768}$$
-$$\mathbf{K} = \mathbf{V} = \text{RMSNorm}(\mathbf{H}_{\text{role}}) \in \mathbb{R}^{B \times S \times 768}$$
-$$\tilde{\mathbf{z}}_i = \text{MultiheadAttention}(\mathbf{Q}_i, \mathbf{K}, \mathbf{V}, \text{key\_padding\_mask}=\mathbf{m}^c) \in \mathbb{R}^{B \times K \times 768}$$
-$$\mathbf{z}_i = \text{Mean}_{\text{slots}}(\mathcal{Q}_i + \text{Dropout}(\tilde{\mathbf{z}}_i)) \in \mathbb{R}^{B \times 768}$$
-
-### 2.3. Convex Combination & Classification
-$$\mathbf{z}_{\text{final}} = \sum_{i=0}^3 g_i \cdot \mathbf{z}_i \in \mathbb{R}^{B \times 768}$$
-$$\mathbf{h}_{\text{dense}} = \text{GELU}(\text{RMSNorm}(W_h \mathbf{z}_{\text{final}} + b_h)) \in \mathbb{R}^{B \times 384}$$
-$$\hat{\mathbf{y}} = \frac{1}{M} \sum_{m=1}^M W_{\text{out}} \cdot \text{Dropout}_m(\mathbf{h}_{\text{dense}}) \in \mathbb{R}^{B \times 3}$$
-
----
-
-## 3. Loss Functions & Anti-Collapse Regularization
-
-To ensure that the router does not collapse to a single dominant expert (a common MoE hazard), we use a composite objective:
-
-$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{TaskB}}(\hat{\mathbf{y}}, \mathbf{y}) + \lambda_{\text{balance}} \mathcal{L}_{\text{balance}}$$
-
-### 3.1. Primary Classification Loss ($\mathcal{L}_{\text{TaskB}}$)
-* **Focal Loss with Label Smoothing** ($\gamma=1.5, \epsilon=0.05$) to handle severe class imbalance and prevent overconfidence on explicit hate.
-
-### 3.2. Router Load Balancing Regularizer ($\mathcal{L}_{\text{balance}}$)
-Computes the coefficient of variation / entropy over the batch average routing probabilities $\bar{g}_i = \frac{1}{B} \sum_{b=1}^B g_{b, i}$:
-$$\mathcal{L}_{\text{balance}} = 4 \sum_{i=0}^3 \bar{g}_i^2 - 1.0$$
-* Minimizing this forces the mean gate load across the batch to be uniform ($\bar{g}_i \approx 0.25$), preventing dead experts while allowing individual sample sparsity.
-* Hyperparameter: $\lambda_{\text{balance}} = 0.01$.
-
----
-
-## 4. Implementation Steps & Code Changes
-
-### Phase 1: Model Architecture (`pipeline/models/task_b_class_aware.py`)
-1. Implement `masked_mean_pooling(h, mask)`.
-2. Implement `ContextRouter(d_model=768, num_experts=4, hidden_dim=256, temp=1.0)`.
-3. Implement `ParallelQueryBankCrossAttention(d_model=768, num_experts=4, num_heads=8)`.
-4. Refactor `TaskBClassAwareAttentionModel` to assemble the router, 4 expert banks, weighted blending, MSD, and expose routing gates `g` for interpretability.
-
-### Phase 2: Loss Function (`pipeline/losses.py`)
-1. Add `MoELoadBalanceLoss(num_experts=4)`.
-2. Update `MultiTaskLoss` / `TaskBLoss` to incorporate `load_balance_loss` when router gates are returned.
-3. Clamp probabilities to ensure numerical stability under AMP FP16.
-
-### Phase 3: Configuration & Hyperparameters (`pipeline/config.py`)
-1. Add `num_experts: int = 4`.
-2. Add `router_hidden_dim: int = 256`.
-3. Add `router_temperature: float = 1.0`.
-4. Add `loss_balance_weight: float = 0.01`.
-
-### Phase 4: Trainer & Visualizations (`pipeline/task_b_trainer.py` & Notebooks)
-1. Record average expert utilization per epoch: $\bar{g}_0, \bar{g}_1, \bar{g}_2, \bar{g}_3$.
-2. Export gate distributions alongside predictions in `task_b_val_predictions.csv` for post-hoc analysis.
-3. Plot expert routing heatmaps across classes (No-Hate vs Implicit vs Explicit).
-
-### Phase 5: Verification & Testing
-1. Run `smoke_test.py` with mock batch forward/backward pass.
-2. Verify gradient flow to all 4 expert query tensors and router weights.
-3. Confirm memory footprint and training throughput on single GPU.
+- [x] **Zero Token Overhead:** Primary comment context retains full 256 tokens.
+- [x] **Zero Test-Time Mismatch:** Setting $\alpha = 0$ leaves the model physically identical to a standard transformer inference graph.
+- [x] **Zero Label Shortcut:** Teacher rationales are completely stripped of classification labels.
+- [x] **Mathematically Stable Gradient Flow:** Unidirectional KL with $\text{stop\_gradient}(p_c)$ guarantees monotonic knowledge transfer.
