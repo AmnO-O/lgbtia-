@@ -25,6 +25,13 @@ class PipelineConfig:
     mmbert_dim: int = 768
     max_length: int = 256
     
+    # Privileged Teacher Guidance & Curriculum Annealing
+    use_privileged_guidance: bool = False       # Set True when rationales/teacher hints are available
+    hint_start_alpha: float = 1.0               # Initial hint strength alpha at epoch 0
+    lambda_c: float = 0.40                      # Conditional path loss weight
+    lambda_cons: float = 0.30                   # Unidirectional consistency distillation weight
+    kd_temperature: float = 1.0                 # Knowledge distillation temperature
+    
     # 4-Expert MoE & Query Bank Settings
     num_experts: int = 4                        # Number of dynamic expert query banks (4: Non-Hate, Implicit, Explicit, Context Mismatch)
     num_slots_per_expert: int = 1               # Number of learnable query vectors per expert bank

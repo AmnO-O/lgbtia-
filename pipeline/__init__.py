@@ -6,7 +6,7 @@ ModernBERT/mmBERT backbones, Bi-LSTM, and Transformer baselines.
 
 from .config import PipelineConfig, HATE_CLASSES, HATE2IDX, IDX2HATE
 from .data import StereoQueerDataset, MMBertSeqDataset, DataPipeline, safe_clean, encode_target, decode_target
-from .task_b_data import TaskBRoleDataset
+from .task_b_data import TaskBAdditiveLatentDataset, TaskBRoleDataset
 from .augmentation import (
     random_swap,
     random_deletion,
@@ -28,6 +28,7 @@ from .models.task_b_class_aware import (
     ROLE_TITLE,
     ROLE_DESC,
     ROLE_COMMENT,
+    ROLE_HINT,
     NUM_ROLES,
 )
 from .models.task_b_questions import (
@@ -36,7 +37,14 @@ from .models.task_b_questions import (
     get_default_probes,
     get_probes_for_language,
 )
-from .losses import MultiTaskLoss, FocalLoss, build_loss_fn
+from .losses import (
+    MultiTaskLoss,
+    FocalLoss,
+    build_loss_fn,
+    UnidirectionalKLDivergenceLoss,
+    PrivilegedConsistencyTaskBLoss,
+    TaskBLoss
+)
 from .metrics import evaluate_stereoqueer, print_metrics, compute_classification_metrics
 from .trainer import StereoQueerTrainer
 from .task_b_trainer import TaskBTrainer, FGM
@@ -49,6 +57,7 @@ __all__ = [
     "IDX2HATE",
     "StereoQueerDataset",
     "MMBertSeqDataset",
+    "TaskBAdditiveLatentDataset",
     "TaskBRoleDataset",
     "random_swap",
     "random_deletion",
@@ -68,6 +77,7 @@ __all__ = [
     "ROLE_TITLE",
     "ROLE_DESC",
     "ROLE_COMMENT",
+    "ROLE_HINT",
     "NUM_ROLES",
     "QueryProbe",
     "DEFAULT_TASK_B_PROBES",
@@ -80,6 +90,9 @@ __all__ = [
     "MultiTaskLoss",
     "FocalLoss",
     "build_loss_fn",
+    "UnidirectionalKLDivergenceLoss",
+    "PrivilegedConsistencyTaskBLoss",
+    "TaskBLoss",
     "evaluate_stereoqueer",
     "print_metrics",
     "compute_classification_metrics",

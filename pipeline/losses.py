@@ -11,15 +11,6 @@ class FocalLoss(nn.Module):
     
     Formula:
         FL(p_t) = - alpha_t * (1 - p_t)^gamma * log(p_t)
-        
-    Args:
-        gamma (float): Focusing parameter (gamma >= 0). 
-                       When gamma = 0, Focal Loss is equivalent to CrossEntropyLoss.
-                       Higher gamma puts more emphasis on hard/misclassified examples.
-        alpha (Tensor or List[float], optional): Class balancing weights. 
-                       Shape [C] matching the number of classes.
-        label_smoothing (float): Label smoothing epsilon (0.0 to 1.0).
-        reduction (str): 'mean', 'sum', or 'none'.
     """
     def __init__(
         self,
@@ -41,46 +32,30 @@ class FocalLoss(nn.Module):
             self.alpha = None
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            inputs: Logits tensor of shape [B, C]
-            targets: Ground truth class indices of shape [B]
-        Returns:
-            Scalar loss (if reduction='mean' or 'sum') or per-sample loss [B] (if reduction='none')
-        """
         B, C = inputs.shape
-        log_p = F.log_softmax(inputs, dim=-1) # [B, C]
-        p = torch.exp(log_p)                  # [B, C]
+        log_p = F.log_softmax(inputs, dim=-1)
+        p = torch.exp(log_p)
 
-        # Numerical stability clamp to avoid 0 * inf = NaN under AMP/float16
         p = torch.clamp(p, min=1e-7, max=1.0 - 1e-7)
 
-        # Gather target probabilities and log probabilities: [B]
         target_p = p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
         target_p = torch.clamp(target_p, min=1e-7, max=1.0 - 1e-7)
         target_log_p = log_p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
 
-        # Focal modulating factor: (1 - p_t)^gamma
-        focal_weight = torch.pow(1.0 - target_p, self.gamma) # [B]
+        focal_weight = torch.pow(1.0 - target_p, self.gamma)
+        ce_loss = - target_log_p
 
-        # Standard hard-target CE loss per sample: - log(p_t)
-        ce_loss = - target_log_p # [B]
-
-        # Apply label smoothing if requested
         if self.label_smoothing > 0.0:
-            smooth_loss = - log_p.mean(dim=-1) # [B]
+            smooth_loss = - log_p.mean(dim=-1)
             ce_loss = (1.0 - self.label_smoothing) * ce_loss + self.label_smoothing * smooth_loss
 
-        # Apply focal modulation
-        focal_loss = focal_weight * ce_loss # [B]
+        focal_loss = focal_weight * ce_loss
 
-        # Apply alpha class weights if provided (device-safe buffer)
         if self.alpha is not None:
             alpha = self.alpha.to(targets.device)
-            alpha_t = alpha[targets] # [B]
+            alpha_t = alpha[targets]
             focal_loss = alpha_t * focal_loss
 
-        # Reduction
         if self.reduction == "mean":
             return focal_loss.mean()
         elif self.reduction == "sum":
@@ -91,15 +66,6 @@ class FocalLoss(nn.Module):
 class UnidirectionalKLDivergenceLoss(nn.Module):
     """
     Unidirectional KL Divergence Consistency Distillation Loss with Stop-Gradient.
-    
-    Formula:
-        L_cons = KL( sg(p_teacher) || p_student )
-               = sum_{c} sg(p_teacher_c) * ( log(sg(p_teacher_c)) - log(p_student_c) )
-               
-    Guarantees:
-      1. Stop-gradient on teacher predictions ensures student learns from teacher
-         without pulling teacher predictions down to a worse unguided state.
-      2. Device and AMP safe with numerical stability clamping.
     """
     def __init__(self, temperature: float = 1.0, reduction: str = "mean"):
         super().__init__()
@@ -111,24 +77,14 @@ class UnidirectionalKLDivergenceLoss(nn.Module):
         student_logits: torch.Tensor,
         teacher_logits: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Args:
-            student_logits: [B, C] (Unguided predictions p_u)
-            teacher_logits: [B, C] (Privileged teacher predictions p_c)
-        """
-        # Temperature scale logits
         s_logits = student_logits / self.temperature
-        t_logits = teacher_logits.detach() / self.temperature  # sg(p_c)
+        t_logits = teacher_logits.detach() / self.temperature
 
-        # Log softmax of student and soft probabilities of teacher
         log_p_student = F.log_softmax(s_logits, dim=-1)
         p_teacher = F.softmax(t_logits, dim=-1)
         p_teacher = torch.clamp(p_teacher, min=1e-7, max=1.0 - 1e-7)
 
-        # KL(p_teacher || p_student) = sum p_teacher * (log(p_teacher) - log(p_student))
-        kl_per_sample = torch.sum(p_teacher * (torch.log(p_teacher) - log_p_student), dim=-1) # [B]
-
-        # Scale by T^2 as per standard Hinton distillation
+        kl_per_sample = torch.sum(p_teacher * (torch.log(p_teacher) - log_p_student), dim=-1)
         kl_per_sample = (self.temperature ** 2) * kl_per_sample
 
         if self.reduction == "mean":
@@ -142,9 +98,6 @@ class PrivilegedConsistencyTaskBLoss(nn.Module):
     """
     Unified Multi-Objective Loss for Privileged Information Training:
         L_total = L_task(y, p_u) + lambda_c * L_task(y, p_c) + lambda_cons * KL(sg(p_c) || p_u)
-        
-    When conditional output is None (e.g. running purely without hints or during unguided training),
-    falls back cleanly to standard L_task(y, p_u).
     """
     def __init__(
         self,
@@ -163,7 +116,6 @@ class PrivilegedConsistencyTaskBLoss(nn.Module):
         lambda_c: float = 0.0,
         lambda_cons: float = 0.0
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        # 1. Unconditional Loss
         if isinstance(logits_u, list):
             losses_u = [self.base_criterion(b, targets) for b in logits_u]
             loss_u = torch.mean(torch.stack(losses_u))
@@ -172,7 +124,6 @@ class PrivilegedConsistencyTaskBLoss(nn.Module):
             loss_u = self.base_criterion(logits_u, targets)
             eval_logits_u = logits_u
 
-        # If no teacher logits provided or weights are 0, return pure unconditional loss
         if logits_c is None or (lambda_c <= 0.0 and lambda_cons <= 0.0):
             return loss_u, {
                 'loss_total': float(loss_u.detach().item()),
@@ -181,7 +132,6 @@ class PrivilegedConsistencyTaskBLoss(nn.Module):
                 'loss_cons': 0.0
             }
 
-        # 2. Conditional Loss
         if isinstance(logits_c, list):
             losses_c = [self.base_criterion(b, targets) for b in logits_c]
             loss_c = torch.mean(torch.stack(losses_c))
@@ -190,9 +140,7 @@ class PrivilegedConsistencyTaskBLoss(nn.Module):
             loss_c = self.base_criterion(logits_c, targets)
             eval_logits_c = logits_c
 
-        # 3. Unidirectional Consistency Distillation with stop_gradient(p_c)
         loss_cons = self.kl_criterion(eval_logits_u, eval_logits_c)
-
         total_loss = loss_u + (lambda_c * loss_c) + (lambda_cons * loss_cons)
 
         return total_loss, {
@@ -204,9 +152,6 @@ class PrivilegedConsistencyTaskBLoss(nn.Module):
 
 
 class MoELoadBalanceLoss(nn.Module):
-    """
-    Mixture-of-Experts (MoE) Router Load Balancing Loss (kept for backward compatibility).
-    """
     def __init__(self, num_experts: int = 4):
         super().__init__()
         self.num_experts = num_experts
@@ -220,9 +165,6 @@ class MoELoadBalanceLoss(nn.Module):
 
 
 class TaskBLoss(nn.Module):
-    """
-    Unified Task B Loss combining multi-class focal loss and optional MoE Router Load Balancing.
-    """
     def __init__(
         self,
         base_criterion: nn.Module,
@@ -253,6 +195,73 @@ class TaskBLoss(nn.Module):
         return cls_loss
 
 
+class MultiTaskLoss(nn.Module):
+    """
+    Weighted Multi-Task Loss for StereoQueer:
+      - Stereotype Presence (ST): BCEWithLogitsLoss
+      - Hate Speech Type (HS): CrossEntropyLoss or FocalLoss
+      - Stereotype Target Group (TG): BCEWithLogitsLoss
+    """
+    def __init__(self, config: PipelineConfig):
+        super().__init__()
+        self.w_st = config.loss_st_weight
+        self.w_hs = config.loss_hs_weight
+        self.w_tg = config.loss_tg_weight
+        
+        self.loss_st = nn.BCEWithLogitsLoss()
+        
+        if getattr(config, 'loss_type', 'focal') == 'focal':
+            class_weights = getattr(config, 'class_weights', None)
+            focal_gamma = getattr(config, 'focal_gamma', 2.0)
+            label_smoothing = getattr(config, 'label_smoothing', 0.05)
+            self.loss_hs = FocalLoss(
+                gamma=focal_gamma,
+                alpha=class_weights,
+                label_smoothing=label_smoothing
+            )
+        else:
+            class_weights = getattr(config, 'class_weights', None)
+            weight_tensor = torch.tensor(class_weights, dtype=torch.float32) if class_weights else None
+            self.loss_hs = nn.CrossEntropyLoss(weight=weight_tensor)
+            
+        self.loss_tg = nn.BCEWithLogitsLoss()
+
+    def forward(
+        self,
+        *args,
+        **kwargs
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if len(args) == 2 and isinstance(args[0], dict) and isinstance(args[1], dict):
+            preds, targets = args[0], args[1]
+            st_pred, hs_pred, tg_pred = preds['st'], preds['hs'], preds['tg']
+            st_tgt, hs_tgt, tg_tgt = targets['st'], targets['hs'], targets['tg']
+        elif len(args) == 6:
+            st_pred, hs_pred, tg_pred, st_tgt, hs_tgt, tg_tgt = args
+        elif 'preds' in kwargs and 'targets' in kwargs:
+            preds, targets = kwargs['preds'], kwargs['targets']
+            st_pred, hs_pred, tg_pred = preds['st'], preds['hs'], preds['tg']
+            st_tgt, hs_tgt, tg_tgt = targets['st'], targets['hs'], targets['tg']
+        else:
+            raise ValueError("MultiTaskLoss expects either 2 dicts (preds, targets) or 6 positional tensors.")
+
+        st_pred = st_pred.squeeze(-1) if st_pred.ndim > 1 and st_pred.shape[-1] == 1 else st_pred
+        st_tgt = st_tgt.view_as(st_pred)
+
+        l_st = self.loss_st(st_pred, st_tgt)
+        l_hs = self.loss_hs(hs_pred, hs_tgt)
+        l_tg = self.loss_tg(tg_pred, tg_tgt)
+
+        total = self.w_st * l_st + self.w_hs * l_hs + self.w_tg * l_tg
+        loss_dict = {
+            'total': total,
+            'st': l_st,
+            'hs': l_hs,
+            'tg': l_tg,
+        }
+
+        return total, loss_dict
+
+
 def build_loss_fn(
     loss_type: str = "focal",
     class_weights: Optional[List[float]] = None,
@@ -260,9 +269,6 @@ def build_loss_fn(
     label_smoothing: float = 0.05,
     device: Optional[torch.device] = None
 ) -> nn.Module:
-    """
-    Factory builder for Task B base loss functions (Focal Loss or CrossEntropyLoss).
-    """
     if loss_type == "focal":
         alpha = None
         if class_weights is not None:
