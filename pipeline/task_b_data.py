@@ -38,7 +38,7 @@ class TaskBAdditiveLatentDataset(Dataset):
         tokenizer,
         max_len: int = 256,
         hint_max_len: int = 64,
-        hint_col: str = 'rationale'
+        hint_col: str = 'hint'
     ):
         self.df = df
         self.max_len = max_len

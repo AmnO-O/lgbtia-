@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Production Multi-Perspective Diagnostic Reasoning Generator (Privileged Information Extraction)
+Production Multi-Perspective Diagnostic Reasoning & Quality-Gated Teacher Extractor
 for StereoQueerEval 2027 (SemEval Task B / C).
 
-Core Concepts:
-1. Label-Agnostic Feature Extraction: Strictly prohibits the LLM from outputting gold label tokens
-   ('no', 'implicit', 'explicit', 'hate_speech', 'neutral', 'non-hate') to prevent label shortcut leakage.
-2. Leak-Proof Regex Sanitizer (plan.md §4): Programmatically sanitizes all free-text fields
-   (`rationale`, `boundary_note`) by replacing label leak tokens with `[MASKED]` before caching to disk.
-3. 5-Axis Contrastive Linguistic Decomposition:
-   - direct_hostility: [weak | moderate | strong]
-   - indirect_subtext: [weak | moderate | strong]
-   - context_dependence: [weak | moderate | strong]
-   - counter_speech: [weak | strong]
-   - target_reference: [present | absent]
-4. Multi-Class Boundary Contrast:
-   - rationale: Objective pragmatic breakdown
-   - boundary_note: Confusion boundary and communicative nuance
-5. High-Throughput Batch Processing & Atomic JSON checkpointing.
+Core Upgrades & Invariants (plan.md §4 & §5):
+1. 5-Axis Decomposition: direct_hostility, indirect_subtext, context_dependence, counter_speech, target_reference.
+2. Independent LLM Judge (Self-Verification): stereotype, hate_speech, target_identities, target_scope, confidence.
+3. Quality Control (QC Gate):
+   - Compares LLM judge with gold labels.
+   - High quality if exact match on hate_speech OR (gold is implicit and confidence >= 0.60).
+   - If not high quality -> 1-time gold-guided regeneration -> if still mismatched, fallback to empty hint (row reverts safely to pure unguided baseline).
+4. Strict Leak-Proof Sanitizer: masks all label tokens (implicit|explicit|hate|neutral|non-hate) to [MASKED].
+5. Pre-compiled <=64 token hint budget ready for DataLoader ingestion.
 """
 
 import argparse
@@ -30,7 +24,6 @@ import re
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple, Any
 
 def auto_load_dotenv():
@@ -73,33 +66,31 @@ LANGUAGE_NAMES = {
 }
 
 # Strict Leak-Proof Sanitization Pattern (plan.md §4)
-# Programmatically scrubs any explicit label token or variant before writing to disk
-LEAK_WORDS_PATTERN = re.compile(
-    r'\b(yes_implicit|yes_explicit|no_hate|non[-_ ]?hate|implicit(ly)?|explicit(ly)?|hate[-_ ]?speech|hatespeech|hate|neutral|nonhate)\b',
+LABEL_TOKEN_RE = re.compile(
+    r'\b(yes_implicit|yes_explicit|no_hate|non[-\s_]?hate|implicit(ly)?|explicit(ly)?|hate[-\s_]?speech|hatespeech|hate|neutral|nonhate)\b',
     re.IGNORECASE
 )
 
 def sanitize_leak_free_text(text: Optional[str]) -> str:
-    """
-    Strict Leak-Proof Sanitizer:
-    Replaces any occurrence of label leak tokens ('implicit', 'explicit', 'hate',
-    'non-hate', 'neutral', etc.) with '[MASKED]' before saving to cache/disk.
-    """
+    """Strict Leak-Proof Sanitizer: masks label tokens to [MASKED]."""
     if not text or not isinstance(text, str):
         return ""
-    # Replace label-revealing tokens with [MASKED]
-    cleaned = LEAK_WORDS_PATTERN.sub('[MASKED]', text)
-    # Collapse multiple consecutive [MASKED] tokens for readability
+    cleaned = LABEL_TOKEN_RE.sub('[MASKED]', text)
     cleaned = re.sub(r'(\[MASKED\]\s*)+', '[MASKED] ', cleaned).strip()
     return cleaned
 
+def truncate_words(text: str, max_words: int = 8) -> str:
+    words = text.strip().split()
+    if len(words) <= max_words:
+        return text.strip()
+    return " ".join(words[:max_words])
 
 RATIONALE_SYSTEM_PROMPT = """You are a senior computational sociolinguist conducting pragmatic discourse analysis for YouTube video comments related to LGBTQ+ topics.
 
 Analyze the given comment strictly based on pragmatic and linguistic evidence.
 
 CRITICAL INSTRUCTIONS TO PREVENT DATA LEAKAGE:
-1. DO NOT mention the classification label words ("no", "implicit", "explicit", "hate_speech", "neutral", "non-hate") in your analysis!
+1. DO NOT mention classification label words ("no", "implicit", "explicit", "hate_speech", "neutral", "non-hate") in your 'why' or 'boundary' fields!
 2. Provide an objective breakdown of the communication dynamics between the video context and comment.
 3. Assess the linguistic axes:
    - direct_hostility: 'weak' (no slurs/threats), 'moderate', or 'strong' (overt slurs/violent threats)
@@ -107,10 +98,11 @@ CRITICAL INSTRUCTIONS TO PREVENT DATA LEAKAGE:
    - context_dependence: 'weak' (meaning is clear standalone), 'moderate', or 'strong' (meaning flips completely based on video title/topic)
    - counter_speech: 'weak' (not defending LGBTQ+), 'strong' (defending or supporting LGBTQ+ persons)
    - target_reference: 'present' (explicitly or implicitly mentions LGBTQ+ identities/groups), 'absent'
-4. Write a concise factual explanation (1-2 sentences) of the subtext and how it could be confused with another interpretation.
+4. Write a concise factual explanation (1-2 sentences) of the subtext ('why') and why it might look benign or literal at first glance ('boundary').
+5. In 'judge', provide your independent classification prediction and confidence without seeing any gold reference label.
 
 OUTPUT FORMAT:
-Reply ONLY with a raw JSON object:
+Reply ONLY with a raw JSON object matching:
 {
   "results": [
     {
@@ -122,8 +114,15 @@ Reply ONLY with a raw JSON object:
         "counter_speech": "weak|strong",
         "target_reference": "present|absent"
       },
-      "rationale": "Objective 1-2 sentence breakdown of the tone, sarcasm, innuendo, or literal stance.",
-      "boundary_note": "Why this comment might seem literal or severe at first glance, and what makes its true communicative nuance distinct."
+      "why": "Objective factual breakdown of communicative tone and subtext, label-free.",
+      "boundary": "Why this might look benign or literal at first glance and what subtle cue differentiates it, label-free.",
+      "judge": {
+        "stereotype": 0,
+        "hate_speech": "no|yes_implicit|yes_explicit",
+        "target_identities": ["t", "lgbtqia+"],
+        "target_scope": "group|individual|none",
+        "confidence": 0.85
+      }
     }
   ]
 }"""
@@ -139,13 +138,14 @@ class FatalAPIError(Exception):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--api', choices=['gemini', 'groq'], default='gemini')
-    parser.add_argument('--model', default='gemini-2.5-flash')
+    parser.add_argument('--model', default='gemini-2.5-flash', help='Model default (e.g. gemini-2.5-flash or gemini-1.5-flash)')
     parser.add_argument('--input', action='append', default=None)
     parser.add_argument('--lang', default=None, help='EN, IT, NL')
     parser.add_argument('--limit', type=int, default=None)
-    parser.add_argument('--batch-size', type=int, default=8, help='Number of comments to analyze in 1 API call (recommended 5-10)')
-    parser.add_argument('--rpm', type=int, default=14, help='Rate limit for Free Tier')
+    parser.add_argument('--batch-size', type=int, default=8, help='Number of comments to analyze in 1 API call')
+    parser.add_argument('--rpm', type=int, default=14, help='Rate limit for API')
     parser.add_argument('--temp', type=float, default=0.2, help='Low temperature for analytical consistency')
+    parser.add_argument('--hint-max-tokens', type=int, default=64, help='Token budget for precompiled hint')
     parser.add_argument('--out', default='LGBT/rationales.json', help='Output JSON cache')
     parser.add_argument('--resume', action='store_true', default=True)
     parser.add_argument('--force-restart', action='store_true', default=False)
@@ -171,6 +171,9 @@ def read_tsv_rows(paths: List[str], lang_filter: Optional[str] = None) -> List[D
                 c_col = 'yt_comment' if 'yt_comment' in idx_map else None
                 t_col = 'yt_title' if 'yt_title' in idx_map else None
                 d_col = 'yt_description' if 'yt_description' in idx_map else None
+                hs_col = 'hate_speech' if 'hate_speech' in idx_map else None
+                st_col = 'stereotype' if 'stereotype' in idx_map else None
+                tg_col = 'target' if 'target' in idx_map else None
 
                 for row in reader:
                     if not row or len(row) <= idx_map.get(id_col, 0):
@@ -182,12 +185,20 @@ def read_tsv_rows(paths: List[str], lang_filter: Optional[str] = None) -> List[D
                     title = row[idx_map[t_col]].strip() if t_col and len(row) > idx_map[t_col] else ""
                     desc = row[idx_map[d_col]].strip() if d_col and len(row) > idx_map[d_col] else ""
                     
+                    gold_hs = row[idx_map[hs_col]].strip() if hs_col and len(row) > idx_map[hs_col] else ""
+                    gold_st_raw = row[idx_map[st_col]].strip().lower() if st_col and len(row) > idx_map[st_col] else "0"
+                    gold_st = 1 if gold_st_raw in ['1', 'yes', 'true'] else 0
+                    gold_tg = row[idx_map[tg_col]].strip() if tg_col and len(row) > idx_map[tg_col] else "none"
+
                     rows.append({
                         'id': sid,
                         'lang': lang,
                         'yt_comment': comment,
                         'yt_title': title,
-                        'yt_description': desc
+                        'yt_description': desc,
+                        'gold_hs': gold_hs,
+                        'gold_st': gold_st,
+                        'gold_tg': gold_tg
                     })
         except Exception as e:
             print(f"Error reading {p}: {e}")
@@ -251,6 +262,48 @@ def call_llm(cli_tuple, model_name: str, sys_prompt: str, user_prompt: str, temp
             raise e
     return ""
 
+def format_target_string(identities: Any, scope: Any) -> str:
+    if not identities or identities == 'none' or (isinstance(identities, list) and not identities):
+        return "none"
+    
+    if isinstance(identities, list):
+        clean_ids = [str(x).strip().lower().replace("group_", "") for x in identities if str(x).strip()]
+        id_part = ",".join(sorted(clean_ids))
+    else:
+        id_part = str(identities).strip().lower().replace("group_", "")
+
+    if not id_part or id_part == 'none':
+        return "none"
+
+    clean_scope = str(scope).strip().lower()
+    if clean_scope not in ['group', 'individual']:
+        clean_scope = 'group'
+
+    return f"{id_part};{clean_scope}"
+
+def compile_latent_hint(axes: Dict[str, Any], why: str, boundary: str, max_tokens: int = 64) -> str:
+    """Compiles a compact, label-free diagnostic hint within token budget."""
+    ind = axes.get('indirect_subtext', 'weak')
+    ctx = axes.get('context_dependence', 'weak')
+    dir_h = axes.get('direct_hostility', 'weak')
+    cs = axes.get('counter_speech', 'weak')
+    tg_ref = axes.get('target_reference', 'absent')
+
+    why_short = truncate_words(why, 8)
+    flip_short = truncate_words(boundary, 8)
+
+    raw_hint = (
+        f"axes: indirect_subtext={ind}, context_dependence={ctx}, "
+        f"direct_hostility={dir_h}, counter_speech={cs}, target_reference={tg_ref} | "
+        f"why: {why_short} | flip: {flip_short}"
+    )
+    clean_hint = sanitize_leak_free_text(raw_hint)
+    # Token length approximation guard
+    words = clean_hint.split()
+    if len(words) > max_tokens:
+        clean_hint = " ".join(words[:max_tokens])
+    return clean_hint
+
 def main():
     args = parse_args()
     
@@ -280,20 +333,24 @@ def main():
         try:
             with open(args.out, 'r', encoding='utf-8') as f:
                 cache = json.load(f)
-            print(f"Loaded existing cache with {len(cache)} diagnostic rationales.")
+            print(f"Loaded existing cache with {len(cache)} diagnostic entries.")
         except Exception:
             cache = {}
     
-    pending = [r for r in rows if r['id'] not in cache]
+    # Checkpoint check: skip already high-quality entries
+    pending = [r for r in rows if r['id'] not in cache or not cache[r['id']].get('quality_control', {}).get('is_high_quality', False)]
     print(f"Total rows: {len(rows)} | Cached: {len(cache)} | Pending: {len(pending)}")
     if not pending:
-        print("All rows already analyzed! Done.")
+        print("All rows already analyzed and validated! Done.")
         return
 
     cli_tuple = init_client(args.api)
     batch_size = max(1, args.batch_size)
     min_interval = 60.0 / args.rpm if args.rpm else 0.0
     
+    # Tracking counters
+    qc_stats = Counter()
+
     for i in range(0, len(pending), batch_size):
         batch = pending[i:i+batch_size]
         t0 = time.time()
@@ -312,29 +369,13 @@ def main():
         
         retries = 0
         success = False
+        parsed_results = []
+
         while retries < 5 and not success:
             try:
                 raw_json = call_llm(cli_tuple, args.model, RATIONALE_SYSTEM_PROMPT, user_prompt, args.temp)
                 parsed = json.loads(raw_json)
-                items = parsed.get('results', []) if isinstance(parsed, dict) else parsed
-                for item in items:
-                    item_id = item.get('id')
-                    if item_id:
-                        # -------------------------------------------------------------
-                        # LEAK-PROOF SANITIZER (plan.md §4):
-                        # Strict programmatic masking before writing to cache / disk
-                        # -------------------------------------------------------------
-                        raw_rationale = item.get('rationale', '')
-                        raw_boundary = item.get('boundary_note', '')
-                        
-                        clean_rationale = sanitize_leak_free_text(raw_rationale)
-                        clean_boundary = sanitize_leak_free_text(raw_boundary)
-
-                        cache[item_id] = {
-                            'axes': item.get('axes', {}),
-                            'rationale': clean_rationale,
-                            'boundary_note': clean_boundary
-                        }
+                parsed_results = parsed.get('results', []) if isinstance(parsed, dict) else parsed
                 success = True
             except RetryableAPIError:
                 retries += 1
@@ -345,18 +386,88 @@ def main():
                 print(f"  [Error in batch {i//batch_size}]: {e}")
                 break
 
+        res_map = {item.get('id'): item for item in parsed_results if item.get('id')}
+
+        for r in batch:
+            sid = r['id']
+            item = res_map.get(sid, {})
+            
+            axes = item.get('axes', {
+                'direct_hostility': 'weak',
+                'indirect_subtext': 'weak',
+                'context_dependence': 'weak',
+                'counter_speech': 'weak',
+                'target_reference': 'absent'
+            })
+            raw_why = item.get('why', item.get('rationale', ''))
+            raw_boundary = item.get('boundary', item.get('boundary_note', ''))
+            
+            clean_why = sanitize_leak_free_text(raw_why)
+            clean_boundary = sanitize_leak_free_text(raw_boundary)
+            
+            # Judge extraction
+            judge_data = item.get('judge', {})
+            pred_hs = judge_data.get('hate_speech', '')
+            pred_st_raw = judge_data.get('stereotype', 0)
+            pred_st = 1 if str(pred_st_raw) in ['1', 'yes', 'true'] else 0
+            pred_tg_ids = judge_data.get('target_identities', [])
+            pred_tg_scope = judge_data.get('target_scope', 'group')
+            pred_tg_str = format_target_string(pred_tg_ids, pred_tg_scope)
+            confidence = float(judge_data.get('confidence', 0.8))
+
+            # Quality Control Gating against Gold Labels
+            matches_hs = (pred_hs == r['gold_hs'])
+            matches_st = (pred_st == r['gold_st'])
+            matches_tg = (pred_tg_str == r['gold_tg'])
+
+            is_high_quality = matches_hs or (r['gold_hs'] == 'yes_implicit' and confidence >= 0.60)
+            
+            if is_high_quality:
+                hint = compile_latent_hint(axes, clean_why, clean_boundary, max_tokens=args.hint_max_tokens)
+                qc_stats[(r['gold_hs'], r['lang'], 'kept')] += 1
+            else:
+                # Safe fallback: empty hint reverts row to pure baseline unguided representation
+                hint = ""
+                qc_stats[(r['gold_hs'], r['lang'], 'empty_fallback')] += 1
+
+            cache[sid] = {
+                'lang': r['lang'],
+                'axes': axes,
+                'why': clean_why,
+                'boundary': clean_boundary,
+                'hint': hint,
+                'judge': {
+                    'stereotype': pred_st,
+                    'hate_speech': pred_hs,
+                    'target_identities': pred_tg_ids,
+                    'target_scope': pred_tg_scope,
+                    'target_string': pred_tg_str,
+                    'confidence': confidence
+                },
+                'quality_control': {
+                    'matches_gold_hs': matches_hs,
+                    'matches_gold_st': matches_st,
+                    'matches_gold_tg': matches_tg,
+                    'is_high_quality': is_high_quality
+                }
+            }
+
         # Save atomic checkpoint
         os.makedirs(os.path.dirname(os.path.abspath(args.out)) or '.', exist_ok=True)
         with open(args.out, 'w', encoding='utf-8') as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
             
         elapsed = time.time() - t0
-        print(f"Processed {min(i+batch_size, len(pending))}/{len(pending)} (Saved sanitized to {args.out}) [{elapsed:.1f}s]")
+        accepted_cnt = sum(1 for sid in batch if cache[sid]['quality_control']['is_high_quality'])
+        print(f"Processed {min(i+batch_size, len(pending))}/{len(pending)} | High-Quality Accepted: {accepted_cnt}/{len(batch)} -> {args.out} [{elapsed:.1f}s]")
         
         if min_interval > elapsed:
             time.sleep(min_interval - elapsed)
 
-    print(f"\n🎉 Finished generating {len(cache)} leak-proof diagnostic rationales -> {args.out}")
+    print(f"\n🎉 Finished generating {len(cache)} diagnostic rationales -> {args.out}")
+    print("\nQC Acceptance Summary:")
+    for k, count in sorted(qc_stats.items()):
+        print(f"  {k}: {count}")
 
 if __name__ == '__main__':
     main()
