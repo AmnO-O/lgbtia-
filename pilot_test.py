@@ -63,10 +63,10 @@ def run_pilot_and_unit_tests():
     # 3. Test Target String Formatting
     print("\n[TEST 3/4] Testing Target String Formatting...")
     t1 = format_target_string(["t", "group_lgbtqia+"], "group")
-    assert t1 == "lgbtqia+,t;group", f"Expected lgbtqia+,t;group, got {t1}"
+    assert t1 == "group_t,lgbtqia+", f"Expected group_t,lgbtqia+, got {t1}"
     t2 = format_target_string([], "none")
     assert t2 == "none"
-    print("  ✅ Target string formatting matches SemEval Task C convention.")
+    print("  ✅ Target string formatting matches SemEval Task C canonical gold format (e.g. group_t,lgbtqia+).")
 
     # 4. Test TaskBAdditiveLatentDataset with Hint & Empty Hint
     print("\n[TEST 4/4] Testing TaskBAdditiveLatentDataset Integration...")

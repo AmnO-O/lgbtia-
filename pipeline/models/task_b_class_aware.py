@@ -233,8 +233,13 @@ class TaskBClassAwareAttentionModel(nn.Module):
             hint_vec = self.extract_hint_vector(hint_ids, hint_mask) # [B, d_model]
             if hint_vec.dtype != h_role.dtype:
                 hint_vec = hint_vec.to(h_role.dtype)
+            
+            # Mask out rows where hint is empty (all PAD, sum == 0)
+            has_hint = (hint_mask.sum(dim=-1, keepdim=True) > 0).to(h_role.dtype) # [B, 1]
+            effective_hint_vec = hint_vec * has_hint # [B, d_model]
+            
             # Broadcast addition across sequence length S: [B, S, d_model] + [B, 1, d_model]
-            h_role = h_role + (hint_alpha * hint_vec.unsqueeze(1))
+            h_role = h_role + (hint_alpha * effective_hint_vec.unsqueeze(1))
 
         # 3. Expand 3 Class Prototype Queries to Batch: [B, total_queries, d_model]
         # .contiguous() ensures memory layout compatibility across CUDA devices

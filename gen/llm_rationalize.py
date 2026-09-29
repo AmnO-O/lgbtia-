@@ -10,7 +10,7 @@ Core Upgrades & Invariants (plan.md §4 & §5):
 3. Quality Control (QC Gate):
    - Compares LLM judge with gold labels.
    - High quality if exact match on hate_speech OR (gold is implicit and confidence >= 0.60).
-   - If not high quality -> 1-time gold-guided regeneration -> if still mismatched, fallback to empty hint (row reverts safely to pure unguided baseline).
+   - If not high quality -> safe fallback to empty hint (hint=""), so sample safely reverts to pure unguided baseline.
 4. Strict Leak-Proof Sanitizer: masks all label tokens (implicit|explicit|hate|neutral|non-hate) to [MASKED].
 5. Pre-compiled <=64 token hint budget ready for DataLoader ingestion.
 """
@@ -64,6 +64,9 @@ LANGUAGE_NAMES = {
     'IT': "Italian",
     'NL': "Dutch"
 }
+
+# Official StereoQueerEval Canonical Identity Ordering for Task C
+ID_ORDER = ['l', 'g', 'b', 't', 'q', 'i', 'a', 'nb', 'lgbtqia+']
 
 # Strict Leak-Proof Sanitization Pattern (plan.md §4)
 LABEL_TOKEN_RE = re.compile(
@@ -138,7 +141,7 @@ class FatalAPIError(Exception):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--api', choices=['gemini', 'groq'], default='gemini')
-    parser.add_argument('--model', default='gemini-2.5-flash', help='Model default (e.g. gemini-2.5-flash or gemini-1.5-flash)')
+    parser.add_argument('--model', default='gemini-2.5-flash', help='Default model (or gemini-1.5-flash / gemini-2.5-flash)')
     parser.add_argument('--input', action='append', default=None)
     parser.add_argument('--lang', default=None, help='EN, IT, NL')
     parser.add_argument('--limit', type=int, default=None)
@@ -263,14 +266,21 @@ def call_llm(cli_tuple, model_name: str, sys_prompt: str, user_prompt: str, temp
     return ""
 
 def format_target_string(identities: Any, scope: Any) -> str:
+    """
+    Formats predicted target to canonical StereoQueerEval format:
+    e.g. 'group_t,lgbtqia+' or 'individual_g' or 'none'.
+    Canonical order: ['l', 'g', 'b', 't', 'q', 'i', 'a', 'nb', 'lgbtqia+']
+    """
     if not identities or identities == 'none' or (isinstance(identities, list) and not identities):
         return "none"
     
     if isinstance(identities, list):
-        clean_ids = [str(x).strip().lower().replace("group_", "") for x in identities if str(x).strip()]
-        id_part = ",".join(sorted(clean_ids))
+        clean_ids = [str(x).strip().lower().replace("group_", "").replace("individual_", "") for x in identities if str(x).strip()]
+        # Preserve canonical StereoQueerEval identity ordering
+        ordered_ids = [x for x in ID_ORDER if x in clean_ids]
+        id_part = ",".join(ordered_ids)
     else:
-        id_part = str(identities).strip().lower().replace("group_", "")
+        id_part = str(identities).strip().lower().replace("group_", "").replace("individual_", "")
 
     if not id_part or id_part == 'none':
         return "none"
@@ -279,7 +289,7 @@ def format_target_string(identities: Any, scope: Any) -> str:
     if clean_scope not in ['group', 'individual']:
         clean_scope = 'group'
 
-    return f"{id_part};{clean_scope}"
+    return f"{clean_scope}_{id_part}"
 
 def compile_latent_hint(axes: Dict[str, Any], why: str, boundary: str, max_tokens: int = 64) -> str:
     """Compiles a compact, label-free diagnostic hint within token budget."""
@@ -337,8 +347,8 @@ def main():
         except Exception:
             cache = {}
     
-    # Checkpoint check: skip already high-quality entries
-    pending = [r for r in rows if r['id'] not in cache or not cache[r['id']].get('quality_control', {}).get('is_high_quality', False)]
+    # Checkpoint check: skip already analyzed entries
+    pending = [r for r in rows if r['id'] not in cache]
     print(f"Total rows: {len(rows)} | Cached: {len(cache)} | Pending: {len(pending)}")
     if not pending:
         print("All rows already analyzed and validated! Done.")
