@@ -113,6 +113,7 @@ class TaskBTrainer:
 
         self.best_macro_f1 = 0.0
         self.best_checkpoint_path = ""
+        self.history: List[Dict[str, Any]] = []
 
     def build_optimizer(self, lr: float) -> torch.optim.Optimizer:
         no_decay = ["bias", "LayerNorm.weight", "norm.weight", "norm_q.weight", "norm_kv.weight", "norm_self.weight"]
@@ -168,7 +169,6 @@ class TaskBTrainer:
         all_train_targets: List[np.ndarray] = []
 
         for batch in self.train_loader:
-            # Flexible unpack: handles both standard and privileged datasets
             if len(batch) >= 8:
                 input_ids, attention_mask, role_ids, hint_ids, hint_mask, _, hs_labels, _ = batch[:8]
                 hint_ids = hint_ids.to(self.device, non_blocking=True)
@@ -185,7 +185,7 @@ class TaskBTrainer:
             optimizer.zero_grad()
             
             with torch.amp.autocast(self.device_type, enabled=self.use_amp):
-                # 1. Unconditional Forward Pass (p_u: Standard Target Path)
+                # 1. Unconditional Forward Pass (p_u)
                 out_u = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -197,7 +197,7 @@ class TaskBTrainer:
                 )
                 logits_u = out_u[0] if isinstance(out_u, tuple) else out_u
 
-                # 2. Conditional Forward Pass (p_c: Teacher Guidance Path, only if alpha > 0 and hint available)
+                # 2. Conditional Forward Pass (p_c)
                 logits_c = None
                 if hint_ids is not None and hint_alpha > 0.0 and (lambda_c > 0.0 or lambda_cons > 0.0):
                     out_c = self.model(
@@ -211,7 +211,7 @@ class TaskBTrainer:
                     )
                     logits_c = out_c[0] if isinstance(out_c, tuple) else out_c
 
-                # 3. Multi-Objective Privileged Loss
+                # 3. Multi-Objective Loss
                 loss, loss_breakdown = self.criterion(
                     logits_u=logits_u,
                     targets=hs_labels,
@@ -220,7 +220,6 @@ class TaskBTrainer:
                     lambda_cons=lambda_cons
                 )
 
-            # Record predictions for training metrics
             with torch.no_grad():
                 eval_logits = torch.mean(torch.stack(logits_u, dim=0), dim=0) if isinstance(logits_u, list) else logits_u
                 preds = torch.argmax(eval_logits, dim=-1)
@@ -234,7 +233,6 @@ class TaskBTrainer:
             else:
                 loss.backward()
 
-            # Optional FGM Adversarial Step
             if apply_fgm and self.fgm is not None:
                 if self.use_amp:
                     self.scaler.unscale_(optimizer)
@@ -262,7 +260,6 @@ class TaskBTrainer:
                     
                 self.fgm.restore()
 
-            # Step optimizer & scaler
             if self.use_amp:
                 if self.config.clip_grad_norm > 0:
                     if not is_unscaled:
@@ -290,8 +287,7 @@ class TaskBTrainer:
     @torch.no_grad()
     def eval_epoch(self) -> Tuple[float, Dict[str, float], np.ndarray, np.ndarray]:
         """
-        Evaluation is STRICTLY UNCONDITIONAL (hint_alpha=0.0, zero hints).
-        Guarantees 100% genuine evaluation without data leakage or privileged shortcuts.
+        Evaluation is STRICTLY UNCONDITIONAL (hint_alpha=0.0).
         """
         self.model.eval()
         if torch.cuda.is_available():
@@ -354,7 +350,6 @@ class TaskBTrainer:
         patience_limit = getattr(self.config, 'patience', 5)
         model_name = self.model.__class__.__name__
 
-        # Initialize Curriculum Annealer
         use_privileged = getattr(self.config, 'use_privileged_guidance', False)
         start_alpha = getattr(self.config, 'hint_start_alpha', 1.0) if use_privileged else 0.0
         
@@ -373,6 +368,7 @@ class TaskBTrainer:
         print(f"=======================================================")
 
         last_metrics: Dict[str, float] = {}
+        self.history = []
 
         # PHASE 1: Warmup Heads (mmBERT Backbone Frozen)
         if self.config.two_phase:
@@ -397,11 +393,28 @@ class TaskBTrainer:
                 val_loss, val_metrics, _, _ = self.eval_epoch()
                 elapsed = time.time() - t0
 
-                macro_f1 = val_metrics.get('macro_f1', 0.0)
-                imp_f1 = val_metrics.get('class_f1_yes_implicit', 0.0)
+                # Universal metric extraction (supports hs_macro_f1 or macro_f1, hs_f1_implicit, hs_f1_no, hs_f1_explicit)
+                macro_f1 = val_metrics.get('hs_macro_f1', val_metrics.get('macro_f1', 0.0))
+                imp_f1 = val_metrics.get('hs_f1_implicit', val_metrics.get('class_f1_yes_implicit', 0.0))
+                no_f1 = val_metrics.get('hs_f1_no', val_metrics.get('class_f1_no', 0.0))
+                exp_f1 = val_metrics.get('hs_f1_explicit', val_metrics.get('class_f1_yes_explicit', 0.0))
+                val_acc = val_metrics.get('hs_acc', val_metrics.get('accuracy', 0.0))
+
+                self.history.append({
+                    'phase': 1,
+                    'epoch': epoch,
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'hs_macro_f1': macro_f1,
+                    'hs_f1_no': no_f1,
+                    'hs_f1_implicit': imp_f1,
+                    'hs_f1_explicit': exp_f1,
+                    'hs_acc': val_acc
+                })
+
                 print(f"  [P1 Epoch {epoch:02d}/{self.config.freeze_phase_epochs:02d}] "
                       f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                      f"Val Macro-F1: {macro_f1:.4f} | Imp-F1: {imp_f1:.4f} [{elapsed:.1f}s]")
+                      f"Val Macro-F1: {macro_f1:.4f} | No-F1: {no_f1:.4f} | Imp-F1: {imp_f1:.4f} | Exp-F1: {exp_f1:.4f} | Acc: {val_acc:.4f} [{elapsed:.1f}s]")
 
                 if macro_f1 > self.best_macro_f1:
                     self.best_macro_f1 = macro_f1
@@ -418,7 +431,6 @@ class TaskBTrainer:
         print(f"\n>>> [Phase 2/2] Fine-Tuning Top {self.config.unfreeze_layers} Layers for {self.config.unfreeze_phase_epochs} epochs...")
         unfreeze_last_n(self.model.mmbert, self.config.unfreeze_layers)
 
-        # Differential Learning Rates
         backbone_params = [p for p in self.model.mmbert.parameters() if p.requires_grad]
         head_params = [p for n, p in self.model.named_parameters() if not n.startswith('mmbert') and p.requires_grad]
         
@@ -433,7 +445,6 @@ class TaskBTrainer:
         for epoch in range(1, self.config.unfreeze_phase_epochs + 1):
             t0 = time.time()
             
-            # Step curriculum annealer
             curr_params = curriculum_scheduler.step(epoch - 1)
             h_alpha = curr_params['alpha']
             l_c = curr_params['lambda_c']
@@ -450,11 +461,28 @@ class TaskBTrainer:
             val_loss, val_metrics, _, _ = self.eval_epoch()
             elapsed = time.time() - t0
 
-            macro_f1 = val_metrics.get('macro_f1', 0.0)
-            imp_f1 = val_metrics.get('class_f1_yes_implicit', 0.0)
+            macro_f1 = val_metrics.get('hs_macro_f1', val_metrics.get('macro_f1', 0.0))
+            imp_f1 = val_metrics.get('hs_f1_implicit', val_metrics.get('class_f1_yes_implicit', 0.0))
+            no_f1 = val_metrics.get('hs_f1_no', val_metrics.get('class_f1_no', 0.0))
+            exp_f1 = val_metrics.get('hs_f1_explicit', val_metrics.get('class_f1_yes_explicit', 0.0))
+            val_acc = val_metrics.get('hs_acc', val_metrics.get('accuracy', 0.0))
+
+            global_epoch = (self.config.freeze_phase_epochs if self.config.two_phase else 0) + epoch
+            self.history.append({
+                'phase': 2,
+                'epoch': global_epoch,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'hs_macro_f1': macro_f1,
+                'hs_f1_no': no_f1,
+                'hs_f1_implicit': imp_f1,
+                'hs_f1_explicit': exp_f1,
+                'hs_acc': val_acc
+            })
+
             print(f"  [P2 Epoch {epoch:02d}/{self.config.unfreeze_phase_epochs:02d}] "
                   f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                  f"Val Macro-F1: {macro_f1:.4f} | Imp-F1: {imp_f1:.4f} | "
+                  f"Val Macro-F1: {macro_f1:.4f} | No-F1: {no_f1:.4f} | Imp-F1: {imp_f1:.4f} | Exp-F1: {exp_f1:.4f} | Acc: {val_acc:.4f} | "
                   f"α: {h_alpha:.2f} [{elapsed:.1f}s]")
 
             if macro_f1 > self.best_macro_f1:
@@ -479,5 +507,8 @@ class TaskBTrainer:
         return {
             'best_macro_f1': self.best_macro_f1,
             'best_checkpoint_path': self.best_checkpoint_path,
-            'last_metrics': last_metrics
+            'checkpoint_path': self.best_checkpoint_path,
+            'final_metrics': last_metrics,
+            'last_metrics': last_metrics,
+            'history': self.history
         }
