@@ -1,3 +1,8 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
 # Dữ liệu StereoQueerEval — GIỮ LOCAL, không đẩy lên GitHub
 LGBT/
 *.zip

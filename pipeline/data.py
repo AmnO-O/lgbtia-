@@ -152,9 +152,10 @@ class DataPipeline:
 
     def find_data_files(self) -> List[str]:
         """
-        Scans for dataset files and STRICTLY whitelists only:
+        Scans for dataset files and STRICTLY whitelists:
         1. Official training files: StereoQueerEval_{LANG}_training.tsv
         2. Synthetic augmented files: SynthImplicit_{LANG}_training.tsv (or Synth*.tsv)
+        3. Auxiliary implicit hate files: AuxImplicitHate_{LANG}_training.tsv (or Aux*.tsv)
         Explicitly excludes unwanted external benchmarks like HOLD_*, HateAgainstLGBT_*, etc.
         """
         candidate_patterns = [
@@ -169,14 +170,14 @@ class DataPipeline:
         ]
         all_found = sorted({p for pat in candidate_patterns for p in glob.glob(pat, recursive=True) if os.path.isfile(p)})
         
-        # Strict Whitelist Filter: Only allow StereoQueerEval_* and Synth* files
+        # Strict Whitelist Filter: Allow StereoQueerEval_*, Synth*, and Aux* files
         whitelisted_files = []
         for path in all_found:
             fname = os.path.basename(path)
-            # Accept only official StereoQueerEval training and Synth files
-            if (fname.startswith('StereoQueerEval_') or fname.startswith('Synth')) and fname.endswith('.tsv'):
+            # Accept only official StereoQueerEval training, Synth, and Aux files
+            if (fname.startswith('StereoQueerEval_') or fname.startswith('Synth') or fname.startswith('Aux')) and fname.endswith('.tsv'):
                 # Exclude any test/dev splits if specifically looking for training
-                if 'training' in fname or 'Synth' in fname:
+                if 'training' in fname or 'Synth' in fname or 'Aux' in fname:
                     whitelisted_files.append(path)
 
         return sorted(set(whitelisted_files))
@@ -243,9 +244,14 @@ class DataPipeline:
         split_ratio = test_size if test_size is not None else self.config.val_split_ratio
         seed = random_state if random_state is not None else self.config.random_seed
 
-        # Distinguish Real vs Synthetic rows
+        # Distinguish Real official vs Synthetic/Auxiliary rows
         id_series = self.df_all['StereoQueerEval_id'].astype(str)
-        is_synth = id_series.str.startswith('synth_') | id_series.str.contains(r'_v\d+$', regex=True)
+        is_synth = (
+            id_series.str.startswith('synth_') |
+            id_series.str.startswith('aux_') |
+            id_series.str.startswith('Aux_') |
+            id_series.str.contains(r'_v\d+$', regex=True)
+        )
 
         df_real = self.df_all[~is_synth].copy().reset_index(drop=True)
         df_synth = self.df_all[is_synth].copy().reset_index(drop=True)
