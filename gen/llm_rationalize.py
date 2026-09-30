@@ -103,6 +103,7 @@ CONTEXT-FIRST GROUNDING DIRECTIVES (CRITICAL):
    - What LGBTQ+ identities or individuals are featured in the video (e.g., lesbian 'l', gay 'g', bisexual 'b', transgender 't', queer 'q', intersex 'i', asexual 'a', non-binary 'nb', or general 'lgbtqia+').
    - Whether the comment refers to a specific person in the video ('individual') or the broader community ('group').
 2. Evaluate if the comment's meaning depends on or attacks the subject shown in the video. (e.g. If the video is about a lesbian woman, a comment praising denial of communion or mocking her identity directly targets 'l'/'individual' or 'l'/'group').
+3. NON-TARGET & BENIGN COMMENTS GUARD: If the comment is purely generic, off-topic, discussing a non-LGBTQ+ aspect of the video, or simply stating a neutral/benign observation without referencing or attacking LGBTQ+ identities, you MUST set target_identities: [] and target_scope: 'none' and target_reference: 'absent'. Do NOT force a target identity just because the video is LGBTQ+-themed.
 
 CRITICAL INSTRUCTIONS TO PREVENT DATA LEAKAGE:
 1. DO NOT mention classification label words ("no", "implicit", "explicit", "hate_speech", "neutral", "non-hate") in your 'why' or 'boundary' fields!
@@ -161,7 +162,7 @@ def parse_args():
     parser.add_argument('--input', action='append', default=None)
     parser.add_argument('--lang', default=None, help='EN, IT, NL')
     parser.add_argument('--limit', type=int, default=None)
-    parser.add_argument('--batch-size', type=int, default=8, help='Number of comments to analyze in 1 API call')
+    parser.add_argument('--batch-size', type=int, default=1, help='Number of comments to analyze in 1 API call (default 1 for maximum per-sample reasoning accuracy)')
     parser.add_argument('--rpm', type=int, default=14, help='Rate limit for API')
     parser.add_argument('--temp', type=float, default=0.2, help='Low temperature for analytical consistency')
     parser.add_argument('--hint-max-tokens', type=int, default=64, help='Token budget for precompiled hint')
