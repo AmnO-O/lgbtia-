@@ -9,7 +9,8 @@ Core Upgrades & Invariants (plan.md §4 & §5):
 2. Independent LLM Judge (Self-Verification): stereotype, hate_speech, target_identities, target_scope, confidence.
 3. Quality Control (QC Gate):
    - Compares LLM judge with gold labels.
-   - High quality if exact match on hate_speech OR (gold is implicit and confidence >= 0.60).
+   - High quality if exact match on hate_speech OR (gold is implicit and confidence >= 0.60)
+     OR (gold is explicit and judge says hate with confidence >= 0.85).
    - If not high quality -> safe fallback to empty hint (hint=""), so sample safely reverts to pure unguided baseline.
 4. Strict Leak-Proof Sanitizer: masks all label tokens (implicit|explicit|hate|neutral|non-hate) to [MASKED].
 5. Pre-compiled <=64 token hint budget ready for DataLoader ingestion.
@@ -27,10 +28,12 @@ from collections import Counter
 from typing import Dict, List, Optional, Set, Tuple, Any
 
 def auto_load_dotenv():
-    search_dirs = [
-        os.getcwd(),
-        os.path.dirname(os.path.abspath(__file__)),
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Walk up from the script location to the filesystem root, loading the first .env found.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    search_dirs = [os.getcwd(), script_dir] + [
+        os.path.dirname(script_dir),
+        os.path.dirname(os.path.dirname(script_dir)),
+        os.path.dirname(os.path.dirname(os.path.dirname(script_dir)))
     ]
     for d in search_dirs:
         env_path = os.path.join(d, '.env')
@@ -43,11 +46,14 @@ def auto_load_dotenv():
                             continue
                         k, v = line.split('=', 1)
                         k, v = k.strip(), v.strip().strip("'").strip('"')
-                        if k and k not in os.environ:
+                        # Last occurrence wins so a newer key (2nd GEMINI_API_KEY line)
+                        # overrides an older, quota-limited one.
+                        if k:
                             os.environ[k] = v
             except Exception:
                 pass
-            break
+            print(f"Loaded .env from {env_path}")
+            return
 
 auto_load_dotenv()
 
@@ -141,7 +147,7 @@ class FatalAPIError(Exception):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--api', choices=['gemini', 'groq'], default='gemini')
-    parser.add_argument('--model', default='gemini-2.5-flash', help='Default model (or gemini-1.5-flash / gemini-2.5-flash)')
+    parser.add_argument('--model', default='gemini-3.5-flash-lite', help='Default model (verified working: gemini-3.5-flash-lite)')
     parser.add_argument('--input', action='append', default=None)
     parser.add_argument('--lang', default=None, help='EN, IT, NL')
     parser.add_argument('--limit', type=int, default=None)
@@ -149,12 +155,20 @@ def parse_args():
     parser.add_argument('--rpm', type=int, default=14, help='Rate limit for API')
     parser.add_argument('--temp', type=float, default=0.2, help='Low temperature for analytical consistency')
     parser.add_argument('--hint-max-tokens', type=int, default=64, help='Token budget for precompiled hint')
+    parser.add_argument('--desc-max', type=int, default=800, help='Max chars of video_description fed to the LLM (0 = unlimited; whitespace is always collapsed)')
     parser.add_argument('--out', default='LGBT/rationales.json', help='Output JSON cache')
     parser.add_argument('--resume', action='store_true', default=True)
     parser.add_argument('--force-restart', action='store_true', default=False)
     return parser.parse_args()
 
-def read_tsv_rows(paths: List[str], lang_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+def normalize_text(s: str, max_len: Optional[int] = None) -> str:
+    # Collapse all whitespace runs (multi-line YouTube descriptions) into a single space, then cap.
+    s = re.sub(r'\s+', ' ', s or '').strip()
+    if max_len and len(s) > max_len:
+        s = s[:max_len].rstrip()
+    return s
+
+def read_tsv_rows(paths: List[str], lang_filter: Optional[str] = None, desc_max: Optional[int] = None) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for p in paths:
         lang_match = re.search(r'_([A-Z]{2})_training\.tsv$', os.path.basename(p), re.IGNORECASE)
@@ -184,9 +198,10 @@ def read_tsv_rows(paths: List[str], lang_filter: Optional[str] = None) -> List[D
                     sid = row[idx_map[id_col]].strip()
                     if not sid:
                         continue
-                    comment = row[idx_map[c_col]].strip() if c_col and len(row) > idx_map[c_col] else ""
-                    title = row[idx_map[t_col]].strip() if t_col and len(row) > idx_map[t_col] else ""
-                    desc = row[idx_map[d_col]].strip() if d_col and len(row) > idx_map[d_col] else ""
+                    comment = normalize_text(row[idx_map[c_col]] if c_col and len(row) > idx_map[c_col] else "")
+                    title = normalize_text(row[idx_map[t_col]] if t_col and len(row) > idx_map[t_col] else "")
+                    desc = normalize_text(row[idx_map[d_col]] if d_col and len(row) > idx_map[d_col] else "",
+                                          max_len=desc_max)
                     
                     gold_hs = row[idx_map[hs_col]].strip() if hs_col and len(row) > idx_map[hs_col] else ""
                     gold_st_raw = row[idx_map[st_col]].strip().lower() if st_col and len(row) > idx_map[st_col] else "0"
@@ -243,7 +258,8 @@ def call_llm(cli_tuple, model_name: str, sys_prompt: str, user_prompt: str, temp
             return resp.text
         except Exception as e:
             err_str = str(e).lower()
-            if '429' in err_str or 'quota' in err_str or 'resource_exhausted' in err_str or 'rate' in err_str:
+            if ('429' in err_str or 'quota' in err_str or 'resource_exhausted' in err_str or 'rate' in err_str
+                    or '503' in err_str or 'unavailable' in err_str or 'high demand' in err_str):
                 raise RetryableAPIError()
             raise e
     elif api_name == 'groq':
@@ -334,7 +350,7 @@ def main():
         sys.exit(1)
         
     print(f"Reading training files: {input_files}")
-    rows = read_tsv_rows(input_files, lang_filter=args.lang)
+    rows = read_tsv_rows(input_files, lang_filter=args.lang, desc_max=args.desc_max)
     if args.limit:
         rows = rows[:args.limit]
         
@@ -344,8 +360,11 @@ def main():
             with open(args.out, 'r', encoding='utf-8') as f:
                 cache = json.load(f)
             print(f"Loaded existing cache with {len(cache)} diagnostic entries.")
-        except Exception:
-            cache = {}
+        except Exception as e:
+            raise SystemExit(
+                f"[CHECKPOINT ERROR] corrupt cache {args.out}: {e}. "
+                f"Move it aside and re-run with --force-restart if intended; don't silently lose the run."
+            )
     
     # Checkpoint check: skip already analyzed entries
     pending = [r for r in rows if r['id'] not in cache]
@@ -371,7 +390,7 @@ def main():
                 "id": r['id'],
                 "language": LANGUAGE_NAMES.get(r['lang'], r['lang']),
                 "video_title": r['yt_title'],
-                "video_description": r['yt_description'][:200],
+                "video_description": r['yt_description'],
                 "comment": r['yt_comment']
             })
             
@@ -397,6 +416,12 @@ def main():
                 break
 
         res_map = {item.get('id'): item for item in parsed_results if item.get('id')}
+
+        missing_ids = [r['id'] for r in batch if r['id'] not in res_map]
+        if missing_ids:
+            print(f"  [WARN] batch {i//batch_size}: {len(missing_ids)}/{len(batch)} responses missing "
+                  f"({missing_ids[:3]}...) — leaving them out of cache so --resume retries next run")
+            continue
 
         for r in batch:
             sid = r['id']
@@ -430,7 +455,7 @@ def main():
             matches_st = (pred_st == r['gold_st'])
             matches_tg = (pred_tg_str == r['gold_tg'])
 
-            is_high_quality = matches_hs or (r['gold_hs'] == 'yes_implicit' and confidence >= 0.60)
+            is_high_quality = matches_hs and matches_st and matches_tg
             
             if is_high_quality:
                 hint = compile_latent_hint(axes, clean_why, clean_boundary, max_tokens=args.hint_max_tokens)
@@ -462,13 +487,15 @@ def main():
                 }
             }
 
-        # Save atomic checkpoint
+        # Save atomic checkpoint (write .tmp then rename to avoid corruption on interruption)
         os.makedirs(os.path.dirname(os.path.abspath(args.out)) or '.', exist_ok=True)
-        with open(args.out, 'w', encoding='utf-8') as f:
+        tmp_path = args.out + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, args.out)
             
         elapsed = time.time() - t0
-        accepted_cnt = sum(1 for sid in batch if cache[sid]['quality_control']['is_high_quality'])
+        accepted_cnt = sum(1 for r in batch if cache[r['id']]['quality_control']['is_high_quality'])
         print(f"Processed {min(i+batch_size, len(pending))}/{len(pending)} | High-Quality Accepted: {accepted_cnt}/{len(batch)} -> {args.out} [{elapsed:.1f}s]")
         
         if min_interval > elapsed:
