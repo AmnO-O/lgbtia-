@@ -116,6 +116,7 @@ def run_tests():
             
     dummy_encoder = DummyEncoder(d_model=64)
     model = TaskBClassAwareAttentionModel(mmbert_model=dummy_encoder, d_model=64, num_classes=3, use_msd=False)
+    model.eval()
     
     b_in = torch.randint(0, 100, (2, 32))
     b_mask = torch.ones((2, 32), dtype=torch.long)
