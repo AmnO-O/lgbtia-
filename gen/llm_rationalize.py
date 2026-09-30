@@ -96,7 +96,13 @@ def truncate_words(text: str, max_words: int = 8) -> str:
 
 RATIONALE_SYSTEM_PROMPT = """You are a senior computational sociolinguist conducting pragmatic discourse analysis for YouTube video comments related to LGBTQ+ topics.
 
-Analyze the given comment strictly based on pragmatic and linguistic evidence.
+Analyze the given comment strictly grounded in the video's context (title + description).
+
+CONTEXT-FIRST GROUNDING DIRECTIVES (CRITICAL):
+1. MANDATORY: Read the video_title and video_description FIRST to identify:
+   - What LGBTQ+ identities or individuals are featured in the video (e.g., lesbian 'l', gay 'g', bisexual 'b', transgender 't', queer 'q', intersex 'i', asexual 'a', non-binary 'nb', or general 'lgbtqia+').
+   - Whether the comment refers to a specific person in the video ('individual') or the broader community ('group').
+2. Evaluate if the comment's meaning depends on or attacks the subject shown in the video. (e.g. If the video is about a lesbian woman, a comment praising denial of communion or mocking her identity directly targets 'l'/'individual' or 'l'/'group').
 
 CRITICAL INSTRUCTIONS TO PREVENT DATA LEAKAGE:
 1. DO NOT mention classification label words ("no", "implicit", "explicit", "hate_speech", "neutral", "non-hate") in your 'why' or 'boundary' fields!
@@ -108,7 +114,11 @@ CRITICAL INSTRUCTIONS TO PREVENT DATA LEAKAGE:
    - counter_speech: 'weak' (not defending LGBTQ+), 'strong' (defending or supporting LGBTQ+ persons)
    - target_reference: 'present' (explicitly or implicitly mentions LGBTQ+ identities/groups), 'absent'
 4. Write a concise factual explanation (1-2 sentences) of the subtext ('why') and why it might look benign or literal at first glance ('boundary').
-5. In 'judge', provide your independent classification prediction and confidence without seeing any gold reference label.
+5. In 'judge', determine the target identities and scope directly grounded in the video context before deciding the classification:
+   - target_identities: list from ['l', 'g', 'b', 't', 'q', 'i', 'a', 'nb', 'lgbtqia+'] or [] if none.
+   - target_scope: 'group' | 'individual' | 'none'.
+   - stereotype: 0 or 1.
+   - hate_speech: 'no' | 'yes_implicit' | 'yes_explicit'.
 
 OUTPUT FORMAT:
 Reply ONLY with a raw JSON object matching:
@@ -128,8 +138,8 @@ Reply ONLY with a raw JSON object matching:
       "judge": {
         "stereotype": 0,
         "hate_speech": "no|yes_implicit|yes_explicit",
-        "target_identities": ["t", "lgbtqia+"],
-        "target_scope": "group|individual|none",
+        "target_identities": ["l"],
+        "target_scope": "individual|group|none",
         "confidence": 0.85
       }
     }
