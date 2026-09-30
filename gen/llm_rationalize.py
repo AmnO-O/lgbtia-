@@ -103,7 +103,7 @@ CONTEXT-FIRST GROUNDING DIRECTIVES (CRITICAL):
    - What LGBTQ+ identities or individuals are featured in the video (e.g., lesbian 'l', gay 'g', bisexual 'b', transgender 't', queer 'q', intersex 'i', asexual 'a', non-binary 'nb', or general 'lgbtqia+').
    - Whether the comment refers to a specific person in the video ('individual') or the broader community ('group').
 2. Evaluate if the comment's meaning depends on or attacks the subject shown in the video. (e.g. If the video is about a lesbian woman, a comment praising denial of communion or mocking her identity directly targets 'l'/'individual' or 'l'/'group').
-3. NON-TARGET & BENIGN COMMENTS GUARD: If the comment is purely generic, off-topic, discussing a non-LGBTQ+ aspect of the video, or simply stating a neutral/benign observation without referencing or attacking LGBTQ+ identities, you MUST set target_identities: [] and target_scope: 'none' and target_reference: 'absent'. Do NOT force a target identity just because the video is LGBTQ+-themed.
+3. NON-TARGET & BENIGN COMMENTS GUARD: If the comment is genuinely generic, off-topic, discussing an unrelated aspect of the video, or simply stating a neutral observation without attacking or undermining LGBTQ+ identities/persons, set target_identities: [] and target_scope: 'none' and target_reference: 'absent'. However, if the comment uses indirect criticism, moral judgment, sarcasm, slurs, or exclusionary rhetoric aimed at the LGBTQ+ topic or subjects, identify the corresponding target identity and scope.
 
 CRITICAL INSTRUCTIONS TO PREVENT DATA LEAKAGE:
 1. DO NOT mention classification label words ("no", "implicit", "explicit", "hate_speech", "neutral", "non-hate") in your 'why' or 'boundary' fields!
