@@ -15,13 +15,24 @@ from .config import ID_ORDER, SCOPE_DIM, TARGET_DIM, HATE2IDX, PipelineConfig
 
 def safe_clean(text: Union[str, float]) -> str:
     """
-    Cleans text by normalizing whitespace while carefully preserving
-    accented and language-specific characters (e.g., Italian 'perché', 'è', Dutch).
+    Cleans text by normalizing whitespace, stripping invisible/redundant control characters
+    (ZWSP, BOM, BiDi marks, YouTube boilerplate arrows) while carefully preserving:
+      - Accented and language-specific characters (e.g., Italian 'perché', 'è', Dutch).
+      - Legitimate emoji sequences and modifiers (ZWJ U+200D e.g. 🏳️‍🌈, VS16 U+FE0F).
     """
     text = str(text).lower()
-    # Replace line breaks and tabs with space
-    text = re.sub(r'[\n\t\r]+', ' ', text)
-    # Collapse multiple spaces into one
+    
+    # 1. Strip redundant invisible control characters & formatting markers
+    # U+200B (Zero Width Space), U+FEFF (BOM mid-text), U+202D / U+202C (BiDi overrides)
+    text = re.sub(r'[\u200B\uFEFF\u202D\u202C\u200E\u200F]+', '', text)
+    
+    # 2. Replace YouTube boilerplate bullet/arrow markers (e.g. U+25BA '►') with space
+    text = re.sub(r'[\u25BA\u25BC\u25C4\u25B6]+', ' ', text)
+
+    # 3. Normalize non-breaking spaces (U+00A0), line breaks, and tabs
+    text = re.sub(r'[\n\t\r\u00A0]+', ' ', text)
+    
+    # 4. Collapse multiple spaces into one
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -210,15 +221,15 @@ class DataPipeline:
         self.df_all = pd.concat(dfs, ignore_index=True)
 
         # Build compound text: comment: <comment> [SEP] title: <title> [SEP] desc: <description>
-        self.df_all['yt_title'] = self.df_all['yt_title'].fillna('')
-        self.df_all['yt_description'] = self.df_all['yt_description'].fillna('')
-        self.df_all['yt_comment'] = self.df_all['yt_comment'].fillna('')
+        self.df_all['yt_title'] = self.df_all['yt_title'].fillna('').map(safe_clean)
+        self.df_all['yt_description'] = self.df_all['yt_description'].fillna('').map(safe_clean)
+        self.df_all['yt_comment'] = self.df_all['yt_comment'].fillna('').map(safe_clean)
 
         self.df_all['text'] = (
             'comment: ' + self.df_all['yt_comment'] + ' [SEP] ' +
             'title: ' + self.df_all['yt_title'] + ' [SEP] ' +
             'desc: ' + self.df_all['yt_description']
-        ).map(safe_clean)
+        )
 
         # Labels
         self.df_all['st_y'] = (self.df_all['stereotype'] == 'yes').astype(np.float32)
