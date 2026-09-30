@@ -25,6 +25,10 @@ from .metrics import compute_classification_metrics
 from .models.task_b_class_aware import TaskBClassAwareAttentionModel
 from .models.mmbert import unfreeze_last_n
 from .scheduler import CosineCurriculumAnnealingScheduler
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
 
 
 class FGM:
@@ -168,7 +172,11 @@ class TaskBTrainer:
         all_train_preds: List[np.ndarray] = []
         all_train_targets: List[np.ndarray] = []
 
-        for batch in self.train_loader:
+        loader_iter = self.train_loader
+        if tqdm is not None:
+            loader_iter = tqdm(self.train_loader, desc="  Training", leave=False, dynamic_ncols=True)
+
+        for batch in loader_iter:
             if len(batch) >= 8:
                 input_ids, attention_mask, role_ids, hint_ids, hint_mask, _, hs_labels, _ = batch[:8]
                 hint_ids = hint_ids.to(self.device, non_blocking=True)
@@ -277,6 +285,13 @@ class TaskBTrainer:
 
             total_loss += loss.item()
 
+            if tqdm is not None and hasattr(loader_iter, 'set_postfix'):
+                current_lr = optimizer.param_groups[0]['lr']
+                loader_iter.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'lr': f"{current_lr:.2e}"
+                })
+
         avg_loss = total_loss / max(len(self.train_loader), 1)
         y_train_true = np.concatenate(all_train_targets, axis=0) if all_train_targets else np.array([])
         y_train_pred = np.concatenate(all_train_preds, axis=0) if all_train_preds else np.array([])
@@ -299,7 +314,11 @@ class TaskBTrainer:
         all_probs = []
 
         with torch.inference_mode():
-            for batch in self.val_loader:
+            val_iter = self.val_loader
+            if tqdm is not None:
+                val_iter = tqdm(self.val_loader, desc="  Validation", leave=False, dynamic_ncols=True)
+
+            for batch in val_iter:
                 if len(batch) >= 8:
                     input_ids, attention_mask, role_ids, _, _, _, hs_labels, _ = batch[:8]
                 else:
@@ -400,10 +419,15 @@ class TaskBTrainer:
                 exp_f1 = val_metrics.get('hs_f1_explicit', val_metrics.get('class_f1_yes_explicit', 0.0))
                 val_acc = val_metrics.get('hs_acc', val_metrics.get('accuracy', 0.0))
 
+                train_f1 = train_metrics.get('hs_macro_f1', 0.0)
+                train_acc = train_metrics.get('hs_acc', 0.0)
+
                 self.history.append({
                     'phase': 1,
                     'epoch': epoch,
                     'train_loss': train_loss,
+                    'train_macro_f1': train_f1,
+                    'train_acc': train_acc,
                     'val_loss': val_loss,
                     'hs_macro_f1': macro_f1,
                     'hs_f1_no': no_f1,
@@ -413,8 +437,9 @@ class TaskBTrainer:
                 })
 
                 print(f"  [P1 Epoch {epoch:02d}/{self.config.freeze_phase_epochs:02d}] "
-                      f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                      f"Val Macro-F1: {macro_f1:.4f} | No-F1: {no_f1:.4f} | Imp-F1: {imp_f1:.4f} | Exp-F1: {exp_f1:.4f} | Acc: {val_acc:.4f} [{elapsed:.1f}s]")
+                      f"Train Loss: {train_loss:.4f} (F1: {train_f1:.4f}) | "
+                      f"Val Loss: {val_loss:.4f} | Val Macro-F1: {macro_f1:.4f} | "
+                      f"No-F1: {no_f1:.4f} | Imp-F1: {imp_f1:.4f} | Exp-F1: {exp_f1:.4f} | Acc: {val_acc:.4f} [{elapsed:.1f}s]")
 
                 if macro_f1 > self.best_macro_f1:
                     self.best_macro_f1 = macro_f1
@@ -467,23 +492,30 @@ class TaskBTrainer:
             exp_f1 = val_metrics.get('hs_f1_explicit', val_metrics.get('class_f1_yes_explicit', 0.0))
             val_acc = val_metrics.get('hs_acc', val_metrics.get('accuracy', 0.0))
 
+            train_f1 = train_metrics.get('hs_macro_f1', 0.0)
+            train_acc = train_metrics.get('hs_acc', 0.0)
+
             global_epoch = (self.config.freeze_phase_epochs if self.config.two_phase else 0) + epoch
             self.history.append({
                 'phase': 2,
                 'epoch': global_epoch,
                 'train_loss': train_loss,
+                'train_macro_f1': train_f1,
+                'train_acc': train_acc,
                 'val_loss': val_loss,
                 'hs_macro_f1': macro_f1,
                 'hs_f1_no': no_f1,
                 'hs_f1_implicit': imp_f1,
                 'hs_f1_explicit': exp_f1,
-                'hs_acc': val_acc
+                'hs_acc': val_acc,
+                'hint_alpha': h_alpha
             })
 
+            guidance_str = f" | α: {h_alpha:.2f}" if use_privileged else ""
             print(f"  [P2 Epoch {epoch:02d}/{self.config.unfreeze_phase_epochs:02d}] "
-                  f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                  f"Val Macro-F1: {macro_f1:.4f} | No-F1: {no_f1:.4f} | Imp-F1: {imp_f1:.4f} | Exp-F1: {exp_f1:.4f} | Acc: {val_acc:.4f} | "
-                  f"α: {h_alpha:.2f} [{elapsed:.1f}s]")
+                  f"Train Loss: {train_loss:.4f} (F1: {train_f1:.4f}) | Val Loss: {val_loss:.4f} | "
+                  f"Val Macro-F1: {macro_f1:.4f} | No-F1: {no_f1:.4f} | Imp-F1: {imp_f1:.4f} | Exp-F1: {exp_f1:.4f} | Acc: {val_acc:.4f}"
+                  f"{guidance_str} [{elapsed:.1f}s]")
 
             if macro_f1 > self.best_macro_f1:
                 self.best_macro_f1 = macro_f1
