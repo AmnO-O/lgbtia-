@@ -46,9 +46,10 @@ def auto_load_dotenv():
                             continue
                         k, v = line.split('=', 1)
                         k, v = k.strip(), v.strip().strip("'").strip('"')
-                        # Last occurrence wins so a newer key (2nd GEMINI_API_KEY line)
-                        # overrides an older, quota-limited one.
-                        if k:
+                        # First occurrence wins (the fresh/quota-reset key listed first).
+                        # The previous last-wins approach got stuck whenever the newer
+                        # key's quota was exhausted but the older one had reset.
+                        if k and k not in os.environ:
                             os.environ[k] = v
             except Exception:
                 pass
@@ -114,7 +115,10 @@ CRITICAL INSTRUCTIONS TO PREVENT DATA LEAKAGE:
    - context_dependence: 'weak' (meaning is clear standalone), 'moderate', or 'strong' (meaning flips completely based on video title/topic)
    - counter_speech: 'weak' (not defending LGBTQ+), 'strong' (defending or supporting LGBTQ+ persons)
    - target_reference: 'present' (explicitly or implicitly mentions LGBTQ+ identities/groups), 'absent'
-4. Write a concise factual explanation (1-2 sentences) of the subtext ('why') and why it might look benign or literal at first glance ('boundary').
+4. MANDATORY STEP-BY-STEP CONTEXT ANALYSIS (do this BEFORE everything else): For each comment, first fill a 'context_analysis' object in your output:
+   - video_subject: one short factual line identifying who/what the video is actually about (person, group, event). Must follow directly from the title/description.
+   - comment_stance: one short factual line describing the comment's relationship to that subject WITHOUT using classification labels (e.g. 'sympathizes with an accused-abuser figure to endorse the abuse', 'mocks the person coming out', 'defends the group against criticism', 'discusses an unrelated topic').
+   Only after writing context_analysis may you fill 'why', 'boundary', and 'judge'.
 5. In 'judge', determine the target identities and scope directly grounded in the video context before deciding the classification:
    - target_identities: list from ['l', 'g', 'b', 't', 'q', 'i', 'a', 'nb', 'lgbtqia+'] or [] if none.
    - target_scope: 'group' | 'individual' | 'none'.
@@ -127,6 +131,10 @@ Reply ONLY with a raw JSON object matching:
   "results": [
     {
       "id": "sample_id",
+      "context_analysis": {
+        "video_subject": "one line: who/what the video is about",
+        "comment_stance": "one line: comment's relationship to that subject, label-free"
+      },
       "axes": {
         "direct_hostility": "weak|moderate|strong",
         "indirect_subtext": "weak|moderate|strong",
@@ -170,6 +178,9 @@ def parse_args():
     parser.add_argument('--out', default='LGBT/rationales.json', help='Output JSON cache')
     parser.add_argument('--resume', action='store_true', default=True)
     parser.add_argument('--force-restart', action='store_true', default=False)
+    parser.add_argument('--gate', choices=['all', 'hs', 'hint'], default='hint',
+                        help="QC gate: 'all' (approx HS+ST+TG - noisy), 'hs' (hate-speech label + hint quality), "
+                             "'hint' (hint content only, decoupled from noisy judge labels)")
     return parser.parse_args()
 
 def normalize_text(s: str, max_len: Optional[int] = None) -> str:
@@ -318,6 +329,23 @@ def format_target_string(identities: Any, scope: Any) -> str:
 
     return f"{clean_scope}_{id_part}"
 
+def compile_context_hint(subject: str, stance: str, why: str, boundary: str, max_tokens: int = 64) -> str:
+    """Compiles hint from the mandatory step-by-step context analysis:
+    video subject + comment stance + subtext divergence (label-free, context-anchored).
+    """
+    subject_short = truncate_words(subject, 8)
+    stance_short = truncate_words(stance, 12)
+    why_short = truncate_words(why, 8)
+
+    raw_hint = f"context: {subject_short} | stance: {stance_short}"
+    if why_short:
+        raw_hint = f"{raw_hint} | divergence: {why_short}"
+    clean_hint = sanitize_leak_free_text(raw_hint)
+    words = clean_hint.split()
+    if len(words) > max_tokens * 0.9:
+        clean_hint = " ".join(words[:max_tokens])
+    return clean_hint
+
 def compile_latent_hint(axes: Dict[str, Any], why: str, boundary: str, max_tokens: int = 64) -> str:
     """Compiles a compact, label-free diagnostic hint within token budget."""
     ind = axes.get('indirect_subtext', 'weak')
@@ -450,6 +478,11 @@ def main():
             
             clean_why = sanitize_leak_free_text(raw_why)
             clean_boundary = sanitize_leak_free_text(raw_boundary)
+
+            # Step-by-step context analysis (forced context reading)
+            ctx_data = item.get('context_analysis', {}) or {}
+            ctx_subject = sanitize_leak_free_text(ctx_data.get('video_subject', ''))
+            ctx_stance = sanitize_leak_free_text(ctx_data.get('comment_stance', ''))
             
             # Judge extraction
             judge_data = item.get('judge', {})
@@ -466,10 +499,28 @@ def main():
             matches_st = (pred_st == r['gold_st'])
             matches_tg = (pred_tg_str == r['gold_tg'])
 
-            is_high_quality = matches_hs and matches_st and matches_tg
-            
+            # Hint-content quality: the step-by-step context reading must be present,
+            # substantive, and leak-free. Judge label matches are decoupled from gate.
+            subject_words = len(ctx_subject.split())
+            stance_words = len(ctx_stance.split())
+            leak_detected = ('[MASKED]' in ctx_subject) or ('[MASKED]' in ctx_stance)
+            hint_content_ok = (subject_words >= 3 and stance_words >= 3 and not leak_detected)
+
+            # Build final hint first so gate can check its post-compile state
+            candidate_hint = compile_context_hint(ctx_subject, ctx_stance, clean_why, clean_boundary, max_tokens=args.hint_max_tokens)
+            if args.gate == 'all':
+                is_high_quality = matches_hs and matches_st and matches_tg
+            elif args.gate == 'hs':
+                is_high_quality = matches_hs and hint_content_ok
+            else:  # 'hint': gift quality only, decoupled from noisy judge labels
+                is_high_quality = hint_content_ok
+
+            # Post-compile guard: reject hints that still leak masked label residue
+            if is_high_quality and '[MASKED]' in candidate_hint:
+                is_high_quality = False
+
             if is_high_quality:
-                hint = compile_latent_hint(axes, clean_why, clean_boundary, max_tokens=args.hint_max_tokens)
+                hint = candidate_hint
                 qc_stats[(r['gold_hs'], r['lang'], 'kept')] += 1
             else:
                 # Safe fallback: empty hint reverts row to pure baseline unguided representation
@@ -478,6 +529,10 @@ def main():
 
             cache[sid] = {
                 'lang': r['lang'],
+                'context_analysis': {
+                    'video_subject': ctx_subject,
+                    'comment_stance': ctx_stance
+                },
                 'axes': axes,
                 'why': clean_why,
                 'boundary': clean_boundary,
@@ -494,6 +549,7 @@ def main():
                     'matches_gold_hs': matches_hs,
                     'matches_gold_st': matches_st,
                     'matches_gold_tg': matches_tg,
+                    'hint_content_ok': hint_content_ok,
                     'is_high_quality': is_high_quality
                 }
             }
