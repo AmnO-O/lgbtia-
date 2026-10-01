@@ -124,7 +124,8 @@ class TaskBCrossContextAttentionModel(nn.Module):
         d_model: int = 768,
         num_classes: int = NUM_CLASSES,
         num_heads: int = 8,
-        dropout: float = 0.20,
+        dropout: float = 0.50,
+        use_msd: bool = False,
         msd_dropout_rates: Optional[List[float]] = None,
         gate_bias_init: float = -1.50,
         use_rmsnorm: bool = True
@@ -133,6 +134,7 @@ class TaskBCrossContextAttentionModel(nn.Module):
         self.mmbert = mmbert_model
         self.d_model = d_model
         self.num_classes = num_classes
+        self.use_msd = use_msd
         
         # 1. Structural Role Embedding for Title vs Comment tokens
         self.role_embedding = nn.Embedding(NUM_ROLES, d_model, padding_idx=ROLE_PAD)
@@ -142,7 +144,7 @@ class TaskBCrossContextAttentionModel(nn.Module):
         self.cross_context = GatedCrossAttentionContextBlock(
             d_model=d_model,
             num_heads=num_heads,
-            dropout=dropout,
+            dropout=min(dropout, 0.30),
             gate_bias_init=gate_bias_init,
             use_rmsnorm=use_rmsnorm
         )
@@ -153,13 +155,15 @@ class TaskBCrossContextAttentionModel(nn.Module):
         self.desc_norm = NormClass(d_model)
         self.fusion_norm = NormClass(2 * d_model)
 
-        # 4. Multi-Sample Dropout (MSD) Classification Head
+        # 4. Multi-Sample Dropout (MSD) or High Single-Dropout Classification Head
         self.msd_rates = msd_dropout_rates or [0.1, 0.2, 0.3, 0.4, 0.5]
         self.classifier = MultiSampleDropoutHead(
             in_dim=2 * d_model,
             hidden_dim=d_model,
             num_classes=num_classes,
+            use_msd=use_msd,
             msd_dropout_rates=self.msd_rates,
+            dropout=dropout,
             use_rmsnorm=use_rmsnorm
         )
 
