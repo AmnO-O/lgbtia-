@@ -62,6 +62,8 @@ class PipelineConfig:
     # Training hyperparameters
     batch_size: int = 32
     learning_rate: float = 1e-4
+    min_lr: float = 1e-7                        # Minimum LR threshold for cosine decay
+    warmup_ratio: float = 0.10                  # Warmup steps ratio
     weight_decay: float = 1e-4
     clip_grad_norm: float = 1.0
     patience: int = 7

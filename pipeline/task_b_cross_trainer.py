@@ -106,13 +106,17 @@ class TaskBCrossContextTrainer:
 
     def build_scheduler(self, optimizer: torch.optim.Optimizer, num_epochs: int):
         total_steps = len(self.train_loader) * num_epochs
-        warmup_steps = int(total_steps * self.config.warmup_ratio)
+        warmup_ratio = getattr(self.config, 'warmup_ratio', 0.10)
+        min_lr = getattr(self.config, 'min_lr', 1e-7)
+        lr = getattr(self.config, 'learning_rate', 1e-4)
+        warmup_steps = int(total_steps * warmup_ratio)
 
         def lr_lambda(current_step: int):
             if current_step < warmup_steps:
                 return float(current_step) / float(max(1, warmup_steps))
             progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-            return max(self.config.min_lr / self.config.learning_rate, 0.5 * (1.0 + math.cos(math.pi * progress)))
+            min_ratio = min_lr / max(lr, 1e-8)
+            return max(min_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
