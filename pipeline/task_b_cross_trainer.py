@@ -13,8 +13,9 @@ Features:
 import os
 import time
 import math
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -26,7 +27,7 @@ except ImportError:
 
 from .config import PipelineConfig, HATE2IDX, IDX2HATE
 from .metrics import compute_classification_metrics
-from .losses import FocalLoss, LabelSmoothingCrossEntropy
+from .losses import FocalLoss, LabelSmoothingCrossEntropy, build_loss_fn
 from .models.task_b_cross_context import TaskBCrossContextAttentionModel
 
 
@@ -40,7 +41,7 @@ class FGM:
 
     def attack(self):
         for name, param in self.model.named_parameters():
-            if param.requires_grad and self.emb_name in name and param.grad is not None:
+            if param.requires_grad and (self.emb_name in name or "tok_embeddings" in name or "word_embeddings" in name) and param.grad is not None:
                 self.backup[name] = param.data.clone()
                 norm = torch.norm(param.grad)
                 if norm != 0 and not torch.isnan(norm):
@@ -49,7 +50,7 @@ class FGM:
 
     def restore(self):
         for name, param in self.model.named_parameters():
-            if name in self.backup:
+            if param.requires_grad and (self.emb_name in name or "tok_embeddings" in name or "word_embeddings" in name) and name in self.backup:
                 param.data = self.backup[name]
         self.backup.clear()
 
@@ -89,31 +90,50 @@ def unfreeze_last_n(model: nn.Module, n: int):
 class TaskBCrossTrainer:
     """
     Dedicated Trainer for Task B Dual-Stream Cross-Context Attention Model.
+    Accepts flexible argument order and optional parameters (class_weights, df_val, use_amp, device).
     """
     def __init__(
         self,
         model: TaskBCrossContextAttentionModel,
+        config: PipelineConfig,
         train_loader: DataLoader,
         val_loader: DataLoader,
-        config: PipelineConfig,
-        device: Optional[torch.device] = None
+        df_val: Optional[pd.DataFrame] = None,
+        class_weights: Optional[Union[List[float], torch.Tensor]] = None,
+        device: Optional[torch.device] = None,
+        use_amp: bool = True,
+        **kwargs
     ):
         self.model = model
+        self.config = config
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.config = config
-        self.device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+        self.df_val = df_val
+
+        # Device determination
+        if device is not None:
+            self.device = device
+        elif getattr(config, 'device', None):
+            self.device = torch.device(config.device)
+        else:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
         self.model.to(self.device)
 
         # Mixed Precision
-        self.use_amp = (self.device.type == 'cuda')
+        self.use_amp = use_amp and (self.device.type == 'cuda')
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
         self.device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
 
-        # Loss Function
-        self.criterion = FocalLoss(
+        # Class weights determination (prioritize parameter if passed, else config)
+        weights_to_use = class_weights if class_weights is not None else getattr(config, 'class_weights', None)
+
+        # Loss Function using build_loss_fn
+        loss_type = getattr(config, 'loss_type', 'focal')
+        self.criterion = build_loss_fn(
+            loss_type=loss_type,
+            class_weights=weights_to_use,
             gamma=getattr(config, 'focal_gamma', 2.0),
-            weights=config.class_weights,
             label_smoothing=getattr(config, 'label_smoothing', 0.05),
             device=self.device
         )
