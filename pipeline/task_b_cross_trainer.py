@@ -8,7 +8,8 @@ Features:
 - Automatic Mixed Precision (AMP) with GradScaler.
 - Fast Gradient Method (FGM) Adversarial Regularization on Token Embeddings.
 - Focal Loss & Class-Weighted Cross-Entropy support.
-- Real-time tqdm progress bars and Macro-F1 checkpointing.
+- Early Stopping with customizable Patience on Validation Macro-F1.
+- Automatic Best Weights Restoration.
 """
 
 import os
@@ -288,12 +289,15 @@ class TaskBCrossContextTrainer:
         return avg_loss, val_metrics, y_true, y_pred, avg_gate
 
     def train(self) -> Dict[str, Any]:
-        """Executes full Two-Phase Differential Training Routine."""
+        """Executes full Two-Phase Differential Training Routine with Early Stopping."""
         print("================================================================================")
         print("🚀 STARTING TASK B DUAL-STREAM CROSS-CONTEXT TRAINING")
         print("================================================================================")
         print(f"Device: {self.device} | AMP: {self.use_amp} | FGM: {self.fgm is not None}")
         print(f"Batch Size: {self.config.batch_size} | Two-Phase: {self.config.two_phase}")
+
+        patience = getattr(self.config, 'patience', 5)
+        patience_counter = 0
 
         # PHASE 1: Freeze Backbone & Train Fusion Head
         if self.config.two_phase and self.config.freeze_phase_epochs > 0:
@@ -350,7 +354,7 @@ class TaskBCrossContextTrainer:
                     print(f"    ⭐ New Best Task B Macro-F1: {macro_f1:.4f} -> Saved checkpoint.")
 
         # PHASE 2: Differential Fine-Tuning
-        print(f"\n>>> [Phase 2/2] Fine-Tuning Top {self.config.unfreeze_layers} Layers for {self.config.unfreeze_phase_epochs} epochs...")
+        print(f"\n>>> [Phase 2/2] Fine-Tuning Top {self.config.unfreeze_layers} Layers for {self.config.unfreeze_phase_epochs} epochs (Early Stopping Patience: {patience})...")
         unfreeze_last_n(self.model.mmbert, self.config.unfreeze_layers)
 
         backbone_params = [p for p in self.model.mmbert.parameters() if p.requires_grad]
@@ -405,6 +409,12 @@ class TaskBCrossContextTrainer:
                 self.best_checkpoint_path = os.path.join(self.config.output_dir, "best_task_b_cross_model.pt")
                 torch.save(self.model.state_dict(), self.best_checkpoint_path)
                 print(f"    ⭐ New Best Task B Macro-F1: {macro_f1:.4f} -> Saved checkpoint.")
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"\n🛑 Early stopping triggered after {patience} epochs without Macro-F1 improvement!")
+                    break
 
         # Load best weights
         if self.best_checkpoint_path and os.path.exists(self.best_checkpoint_path):
