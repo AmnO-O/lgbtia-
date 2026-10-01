@@ -85,9 +85,15 @@ class TaskBCrossContextTrainer:
         self.scaler = torch.amp.GradScaler(self.device_type, enabled=self.use_amp)
 
         # Loss function
-        weights = class_weights.to(self.device) if class_weights is not None else None
+        weights_list = class_weights.tolist() if isinstance(class_weights, torch.Tensor) else class_weights
         loss_type = getattr(config, 'loss_type', 'focal')
-        self.criterion = build_loss_fn(loss_type=loss_type, weights=weights)
+        self.criterion = build_loss_fn(
+            loss_type=loss_type,
+            class_weights=weights_list,
+            gamma=getattr(config, 'focal_gamma', 2.0),
+            label_smoothing=getattr(config, 'label_smoothing', 0.05),
+            device=self.device
+        )
 
         # FGM
         use_fgm = getattr(config, 'use_fgm', True)

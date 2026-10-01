@@ -10,8 +10,15 @@ Validates:
 7. Full Training Step and Eval Step sanity check with Dummy DataLoader.
 """
 
+import os
 import sys
 import unittest
+
+# Ensure repo root is on sys.path
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 import numpy as np
 import pandas as pd
 import torch
