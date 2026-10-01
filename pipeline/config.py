@@ -43,6 +43,11 @@ class PipelineConfig:
     use_query_interaction: bool = False         # Inter-Query Self-Attention
     use_rmsnorm: bool = True                    # Use RMSNorm over LayerNorm for stability & speed
     
+    # Asymmetric Cross-Context Attention Settings
+    gate_bias_init: float = -1.50               # Initial bias for gate (sigmoid(-1.5) approx 0.18)
+    gate_gain_init: float = 0.05                # Gain for Xavier uniform init of gate weights (0.05 allows active input-dependence)
+    context_dropout_prob: float = 0.20          # Probability of replacing Description with empty string during training (avoids shortcutting)
+    
     # Scratch model parameters
     vocab_size: int = 30000
     embedding_dim: int = 256

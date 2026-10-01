@@ -1,44 +1,38 @@
 """
-Task B Dual-Stream Cross-Context Trainer.
+Task B Cross-Context Training Loop.
 
 Features:
-- Two-Phase Training Strategy:
-  - Phase 1 (Linear Probing / Freeze Backbone): Warms up Cross-Attention, Gated Highway, and MSD Classifier.
-  - Phase 2 (Differential Fine-Tuning): Unfreezes Top N layers of mmBERT with layer-wise differential learning rates.
-- Automatic Mixed Precision (AMP) with GradScaler.
-- Fast Gradient Method (FGM) Adversarial Regularization on Token Embeddings.
-- Focal Loss & Class-Weighted Cross-Entropy support.
-- Early Stopping with customizable Patience on Validation Macro-F1.
-- Automatic Best Weights Restoration.
+- Two-Phase Training: Linear probing of cross-attention & role embeddings followed by fine-tuning.
+- Multi-Sample Dropout loss aggregation.
+- Cosine Annealing with Linear Warmup.
+- Fast Gradient Method (FGM) adversarial training.
+- Per-Class Gate Diagnostics (Review #16): Computes and logs E[g | Implicit], E[g | Explicit], and E[g | Non-Hate]
+  to scientifically validate whether the model relies on Description context more heavily for implicit hate speech.
 """
 
 import os
 import time
 import math
-import gc
-from typing import Dict, Any, Optional, Tuple, List, Union
+from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 try:
-    from tqdm.auto import tqdm
+    from tqdm import tqdm
 except ImportError:
     tqdm = None
 
-from .config import PipelineConfig, IDX2HATE
-from .losses import build_loss_fn
+from .config import PipelineConfig, HATE2IDX, IDX2HATE
 from .metrics import compute_classification_metrics
+from .losses import FocalLoss, LabelSmoothingCrossEntropy
 from .models.task_b_cross_context import TaskBCrossContextAttentionModel
-from .models.mmbert import unfreeze_last_n
 
 
 class FGM:
-    """Fast Gradient Method (FGM) Adversarial Training on PyTorch Embeddings."""
-    def __init__(self, model: nn.Module, emb_name: str = 'embeddings', epsilon: float = 0.5):
+    """Fast Gradient Method (FGM) for embedding space adversarial perturbation."""
+    def __init__(self, model: nn.Module, emb_name: str = 'embeddings', epsilon: float = 0.50):
         self.model = model
         self.emb_name = emb_name
         self.epsilon = epsilon
@@ -55,43 +49,71 @@ class FGM:
 
     def restore(self):
         for name, param in self.model.named_parameters():
-            if param.requires_grad and self.emb_name in name:
-                if name in self.backup:
-                    param.data = self.backup[name]
+            if name in self.backup:
+                param.data = self.backup[name]
         self.backup.clear()
 
 
-class TaskBCrossContextTrainer:
+def unfreeze_last_n(model: nn.Module, n: int):
+    """
+    Freezes or unfreezes backbone transformer layers.
+    n = 0: Freeze all backbone parameters.
+    n > 0: Freeze all except the last n transformer layers + pooler.
+    """
+    for param in model.parameters():
+        param.requires_grad = False
+
+    if n <= 0:
+        return
+
+    encoder_layers = None
+    if hasattr(model, 'encoder') and hasattr(model.encoder, 'layer'):
+        encoder_layers = model.encoder.layer
+    elif hasattr(model, 'layers'):
+        encoder_layers = model.layers
+    elif hasattr(model, 'transformer') and hasattr(model.transformer, 'layer'):
+        encoder_layers = model.transformer.layer
+
+    if encoder_layers is not None:
+        total_layers = len(encoder_layers)
+        start_idx = max(0, total_layers - n)
+        for layer in encoder_layers[start_idx:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+
+    if hasattr(model, 'pooler') and model.pooler is not None:
+        for p in model.pooler.parameters():
+            p.requires_grad = True
+
+
+class TaskBCrossTrainer:
     """
     Dedicated Trainer for Task B Dual-Stream Cross-Context Attention Model.
     """
     def __init__(
         self,
         model: TaskBCrossContextAttentionModel,
-        config: PipelineConfig,
         train_loader: DataLoader,
         val_loader: DataLoader,
-        device: Optional[torch.device] = None,
-        class_weights: Optional[torch.Tensor] = None
+        config: PipelineConfig,
+        device: Optional[torch.device] = None
     ):
         self.model = model
-        self.config = config
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.config = config
         self.device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
         self.model.to(self.device)
 
-        self.device_type = 'cuda' if 'cuda' in self.device.type else 'cpu'
-        self.use_amp = getattr(config, 'use_amp', True) and (self.device_type == 'cuda')
-        self.scaler = torch.amp.GradScaler(self.device_type, enabled=self.use_amp)
+        # Mixed Precision
+        self.use_amp = (self.device.type == 'cuda')
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
+        self.device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
 
-        # Loss function
-        weights_list = class_weights.tolist() if isinstance(class_weights, torch.Tensor) else class_weights
-        loss_type = getattr(config, 'loss_type', 'focal')
-        self.criterion = build_loss_fn(
-            loss_type=loss_type,
-            class_weights=weights_list,
+        # Loss Function
+        self.criterion = FocalLoss(
             gamma=getattr(config, 'focal_gamma', 2.0),
+            weights=config.class_weights,
             label_smoothing=getattr(config, 'label_smoothing', 0.05),
             device=self.device
         )
@@ -116,8 +138,8 @@ class TaskBCrossContextTrainer:
             if current_step < warmup_steps:
                 return float(current_step) / float(max(1, warmup_steps))
             progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-            min_ratio = min_lr / max(lr, 1e-8)
-            return max(min_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return max(min_lr / lr, cosine_decay)
 
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -125,12 +147,12 @@ class TaskBCrossContextTrainer:
         self,
         optimizer: torch.optim.Optimizer,
         scheduler: Optional[Any] = None,
-        apply_fgm: bool = True
+        apply_fgm: bool = False
     ) -> Tuple[float, Dict[str, float]]:
         self.model.train()
         total_loss = 0.0
-        all_train_preds: List[np.ndarray] = []
-        all_train_targets: List[np.ndarray] = []
+        all_train_preds = []
+        all_train_targets = []
 
         loader_iter = self.train_loader
         if tqdm is not None:
@@ -146,46 +168,52 @@ class TaskBCrossContextTrainer:
             desc_mask = desc_mask.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(self.device_type, enabled=self.use_amp):
-                msd_logits = self.model(
-                    tc_input_ids=tc_ids,
-                    tc_attention_mask=tc_mask,
-                    tc_role_ids=tc_roles,
-                    desc_input_ids=desc_ids,
-                    desc_attention_mask=desc_mask,
-                    return_all_msd_logits=True
-                )
-                
-                # Compute Multi-Sample Dropout Loss
-                if isinstance(msd_logits, list):
-                    sample_losses = [self.criterion(logit_sample, labels) for logit_sample in msd_logits]
-                    loss = torch.mean(torch.stack(sample_losses))
-                    eval_logits = torch.mean(torch.stack(msd_logits, dim=0), dim=0)
+                # Standard Forward pass with MSD
+                if self.model.use_msd:
+                    logits_list = self.model(
+                        tc_input_ids=tc_ids,
+                        tc_attention_mask=tc_mask,
+                        tc_role_ids=tc_roles,
+                        desc_input_ids=desc_ids,
+                        desc_attention_mask=desc_mask,
+                        return_all_msd_logits=True
+                    )
+                    loss = torch.mean(torch.stack([self.criterion(l, labels) for l in logits_list]))
+                    logits_avg = torch.mean(torch.stack(logits_list, dim=0), dim=0)
                 else:
-                    loss = self.criterion(msd_logits, labels)
-                    eval_logits = msd_logits
+                    logits = self.model(
+                        tc_input_ids=tc_ids,
+                        tc_attention_mask=tc_mask,
+                        tc_role_ids=tc_roles,
+                        desc_input_ids=desc_ids,
+                        desc_attention_mask=desc_mask,
+                        return_all_msd_logits=False
+                    )
+                    loss = self.criterion(logits, labels)
+                    logits_avg = logits
 
-            with torch.no_grad():
-                preds = torch.argmax(eval_logits, dim=-1)
-                all_train_preds.append(preds.detach().cpu().numpy())
-                all_train_targets.append(labels.detach().cpu().numpy())
+            preds = torch.argmax(logits_avg, dim=-1)
+            all_train_preds.append(preds.detach().cpu().numpy())
+            all_train_targets.append(labels.detach().cpu().numpy())
 
+            # Backward pass
             is_unscaled = False
             if self.use_amp:
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
 
-            # FGM Adversarial Step
+            # Adversarial Training (FGM)
             if apply_fgm and self.fgm is not None:
                 if self.use_amp:
                     self.scaler.unscale_(optimizer)
                     is_unscaled = True
                 
                 self.fgm.attack()
-
+                
                 with torch.amp.autocast(self.device_type, enabled=self.use_amp):
                     adv_logits = self.model(
                         tc_input_ids=tc_ids,
@@ -236,7 +264,14 @@ class TaskBCrossContextTrainer:
         return avg_loss, train_metrics
 
     @torch.no_grad()
-    def eval_epoch(self) -> Tuple[float, Dict[str, float], np.ndarray, np.ndarray, float]:
+    def eval_epoch(self) -> Tuple[float, Dict[str, float], np.ndarray, np.ndarray, Dict[str, float]]:
+        """
+        Evaluates the model on the validation set and returns detailed per-class gate statistics:
+        - gate_mean (overall E[g])
+        - gate_no (E[g | Non-Hate])
+        - gate_implicit (E[g | Implicit])
+        - gate_explicit (E[g | Explicit])
+        """
         self.model.eval()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -244,7 +279,7 @@ class TaskBCrossContextTrainer:
         total_loss = 0.0
         all_preds = []
         all_labels = []
-        all_gate_means = []
+        sample_gate_means = []
 
         with torch.inference_mode():
             val_iter = self.val_loader
@@ -277,16 +312,44 @@ class TaskBCrossContextTrainer:
                 preds = torch.argmax(logits, dim=-1)
                 all_preds.append(preds.cpu().numpy())
                 all_labels.append(labels.cpu().numpy())
+                
                 if gate is not None:
-                    all_gate_means.append(gate.mean().item())
+                    # gate shape: [B, S_c, d_model] -> average over tokens & dims per sample: [B]
+                    per_sample_gate = gate.mean(dim=(1, 2)).cpu().numpy()
+                    sample_gate_means.append(per_sample_gate)
 
         avg_loss = total_loss / max(len(self.val_loader), 1)
         y_true = np.concatenate(all_labels, axis=0)
         y_pred = np.concatenate(all_preds, axis=0)
-        avg_gate = float(np.mean(all_gate_means)) if all_gate_means else 0.0
+        
+        # Calculate Per-Class Gate Diagnostics (Review #16)
+        gate_stats = {
+            'gate_mean': 0.0,
+            'gate_no': 0.0,
+            'gate_implicit': 0.0,
+            'gate_explicit': 0.0,
+        }
+        if sample_gate_means:
+            all_gates = np.concatenate(sample_gate_means, axis=0)
+            gate_stats['gate_mean'] = float(np.mean(all_gates))
+
+            idx_no = HATE2IDX.get('no', 0)
+            idx_imp = HATE2IDX.get('yes_implicit', 1)
+            idx_exp = HATE2IDX.get('yes_explicit', 2)
+
+            mask_no = (y_true == idx_no)
+            mask_imp = (y_true == idx_imp)
+            mask_exp = (y_true == idx_exp)
+
+            if mask_no.any():
+                gate_stats['gate_no'] = float(np.mean(all_gates[mask_no]))
+            if mask_imp.any():
+                gate_stats['gate_implicit'] = float(np.mean(all_gates[mask_imp]))
+            if mask_exp.any():
+                gate_stats['gate_explicit'] = float(np.mean(all_gates[mask_exp]))
 
         val_metrics = compute_classification_metrics(y_true, y_pred, task="hs")
-        return avg_loss, val_metrics, y_true, y_pred, avg_gate
+        return avg_loss, val_metrics, y_true, y_pred, gate_stats
 
     def train(self) -> Dict[str, Any]:
         """Executes full Two-Phase Differential Training Routine with Early Stopping."""
@@ -318,7 +381,7 @@ class TaskBCrossContextTrainer:
             for epoch in range(1, self.config.freeze_phase_epochs + 1):
                 t0 = time.time()
                 train_loss, train_metrics = self.train_epoch(optimizer=optimizer, scheduler=scheduler, apply_fgm=False)
-                val_loss, val_metrics, _, _, avg_gate = self.eval_epoch()
+                val_loss, val_metrics, _, _, gate_stats = self.eval_epoch()
                 elapsed = time.time() - t0
 
                 macro_f1 = val_metrics.get('hs_macro_f1', 0.0)
@@ -339,13 +402,13 @@ class TaskBCrossContextTrainer:
                     'hs_f1_implicit': imp_f1,
                     'hs_f1_explicit': exp_f1,
                     'hs_acc': val_acc,
-                    'gate_mean': avg_gate
+                    **gate_stats
                 })
 
                 print(f"  [P1 Epoch {epoch:02d}/{self.config.freeze_phase_epochs:02d}] "
                       f"Train Loss: {train_loss:.4f} (F1: {train_f1:.4f}) | Val Loss: {val_loss:.4f} | "
-                      f"Val Macro-F1: {macro_f1:.4f} | No-F1: {no_f1:.4f} | Imp-F1: {imp_f1:.4f} | Exp-F1: {exp_f1:.4f} | "
-                      f"Gate: {avg_gate:.3f} [{elapsed:.1f}s]")
+                      f"Val Macro-F1: {macro_f1:.4f} | No: {no_f1:.4f} | Imp: {imp_f1:.4f} | Exp: {exp_f1:.4f} | "
+                      f"Gate (All/No/Imp/Exp): {gate_stats['gate_mean']:.3f}/{gate_stats['gate_no']:.3f}/{gate_stats['gate_implicit']:.3f}/{gate_stats['gate_explicit']:.3f} [{elapsed:.1f}s]")
 
                 if macro_f1 > self.best_macro_f1:
                     self.best_macro_f1 = macro_f1
@@ -379,7 +442,7 @@ class TaskBCrossContextTrainer:
                 scheduler=scheduler,
                 apply_fgm=getattr(self.config, 'use_fgm', True)
             )
-            val_loss, val_metrics, _, _, avg_gate = self.eval_epoch()
+            val_loss, val_metrics, _, _, gate_stats = self.eval_epoch()
             elapsed = time.time() - t0
 
             macro_f1 = val_metrics.get('hs_macro_f1', 0.0)
@@ -401,13 +464,13 @@ class TaskBCrossContextTrainer:
                 'hs_f1_implicit': imp_f1,
                 'hs_f1_explicit': exp_f1,
                 'hs_acc': val_acc,
-                'gate_mean': avg_gate
+                **gate_stats
             })
 
             print(f"  [P2 Epoch {epoch:02d}/{self.config.unfreeze_phase_epochs:02d}] "
                   f"Train Loss: {train_loss:.4f} (F1: {train_f1:.4f}) | Val Loss: {val_loss:.4f} | "
-                  f"Val Macro-F1: {macro_f1:.4f} | No-F1: {no_f1:.4f} | Imp-F1: {imp_f1:.4f} | Exp-F1: {exp_f1:.4f} | "
-                  f"Gate: {avg_gate:.3f} [{elapsed:.1f}s]")
+                  f"Val Macro-F1: {macro_f1:.4f} | No: {no_f1:.4f} | Imp: {imp_f1:.4f} | Exp: {exp_f1:.4f} | "
+                  f"Gate (All/No/Imp/Exp): {gate_stats['gate_mean']:.3f}/{gate_stats['gate_no']:.3f}/{gate_stats['gate_implicit']:.3f}/{gate_stats['gate_explicit']:.3f} [{elapsed:.1f}s]")
 
             if macro_f1 > self.best_macro_f1:
                 self.best_macro_f1 = macro_f1
@@ -427,7 +490,7 @@ class TaskBCrossContextTrainer:
             print(f"\n🏆 Successfully reloaded best checkpoint with Macro-F1: {self.best_macro_f1:.4f}")
 
         # Final Evaluation
-        final_loss, final_metrics, y_true, y_pred, final_gate = self.eval_epoch()
+        final_loss, final_metrics, y_true, y_pred, final_gate_stats = self.eval_epoch()
         return {
             'best_macro_f1': self.best_macro_f1,
             'final_metrics': final_metrics,
@@ -435,5 +498,5 @@ class TaskBCrossContextTrainer:
             'y_pred': y_pred,
             'history': self.history,
             'checkpoint_path': self.best_checkpoint_path,
-            'final_gate': final_gate
+            'final_gate_stats': final_gate_stats
         }

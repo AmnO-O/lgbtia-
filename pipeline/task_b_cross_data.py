@@ -6,9 +6,12 @@ Encodes inputs into two distinct branches:
    - Generates precise Role IDs: 1 for Title tokens, 2 for Comment tokens, 0 for Padding.
 2. Desc Stream: [CLS] desc: <yt_description> [SEP]
    - Generates pure Description token IDs and attention mask.
+   - Supports Context Dropout (Review #17): randomly replaces Description with empty string during training
+     with probability p (default 0.20) to prevent the model from shortcutting on video descriptions.
 """
 
 from typing import List, Tuple, Dict, Optional, Union, Any
+import random
 import numpy as np
 import pandas as pd
 import torch
@@ -37,7 +40,9 @@ class TaskBDualStreamDataset(Dataset):
         labels: Optional[List[int]],
         tokenizer: Any,
         tc_max_len: int = 128,
-        desc_max_len: int = 128
+        desc_max_len: int = 128,
+        context_dropout_prob: float = 0.0,
+        is_train: bool = False
     ):
         self.titles = list(titles)
         self.comments = list(comments)
@@ -46,6 +51,8 @@ class TaskBDualStreamDataset(Dataset):
         self.tokenizer = tokenizer
         self.tc_max_len = tc_max_len
         self.desc_max_len = desc_max_len
+        self.context_dropout_prob = context_dropout_prob
+        self.is_train = is_train
 
         self.cls_token_id = getattr(tokenizer, 'cls_token_id', None) or getattr(tokenizer, 'bos_token_id', 0)
         self.sep_token_id = getattr(tokenizer, 'sep_token_id', None) or getattr(tokenizer, 'eos_token_id', 2)
@@ -104,7 +111,8 @@ class TaskBDualStreamDataset(Dataset):
         """
         Tokenizes Description in isolation: [CLS] desc: <desc> [SEP]
         """
-        desc_text = "desc: " + safe_clean(desc_str)
+        cleaned_desc = safe_clean(desc_str)
+        desc_text = "desc: " + cleaned_desc if cleaned_desc else "desc: none"
         desc_ids = self.tokenizer.encode(desc_text, add_special_tokens=False)
 
         max_desc_content = self.desc_max_len - 2
@@ -131,6 +139,13 @@ class TaskBDualStreamDataset(Dataset):
         comment = self.comments[idx]
         desc = self.descriptions[idx]
 
+        # Context Dropout (Review #17):
+        # With probability p during training, replace Description with empty string
+        # to ensure the model treats Description as auxiliary context, not a shortcut.
+        if self.is_train and self.context_dropout_prob > 0.0:
+            if random.random() < self.context_dropout_prob:
+                desc = ""
+
         tc_ids, tc_mask, tc_roles = self._build_tc_stream(title, comment)
         desc_ids, desc_mask = self._build_desc_stream(desc)
 
@@ -155,10 +170,12 @@ def create_task_b_dual_stream_loaders(
     batch_size: int = 32,
     tc_max_len: int = 128,
     desc_max_len: int = 128,
+    context_dropout_prob: float = 0.20,
     num_workers: int = 0
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Factory function creating training and validation DataLoaders for the Dual-Stream Architecture.
+    Applies Context Dropout with probability context_dropout_prob (default 0.20) during training.
     """
     train_ds = TaskBDualStreamDataset(
         titles=df_train['yt_title'].values,
@@ -167,7 +184,9 @@ def create_task_b_dual_stream_loaders(
         labels=df_train['hs_y'].values,
         tokenizer=tokenizer,
         tc_max_len=tc_max_len,
-        desc_max_len=desc_max_len
+        desc_max_len=desc_max_len,
+        context_dropout_prob=context_dropout_prob,
+        is_train=True
     )
 
     val_ds = TaskBDualStreamDataset(
@@ -177,7 +196,9 @@ def create_task_b_dual_stream_loaders(
         labels=df_val['hs_y'].values,
         tokenizer=tokenizer,
         tc_max_len=tc_max_len,
-        desc_max_len=desc_max_len
+        desc_max_len=desc_max_len,
+        context_dropout_prob=0.0,
+        is_train=False
     )
 
     pin_mem = torch.cuda.is_available()
