@@ -334,8 +334,11 @@ class TaskBCrossTrainer:
                 all_labels.append(labels.cpu().numpy())
                 
                 if gate is not None:
-                    # gate shape: [B, S_c, d_model] -> average over tokens & dims per sample: [B]
-                    per_sample_gate = gate.mean(dim=(1, 2)).cpu().numpy()
+                    # gate shape: [B, S_tc, d_model] with non-comment positions zeroed
+                    # Compute mean over valid comment tokens per sample
+                    is_comment = (tc_roles == 2).unsqueeze(-1).float() # [B, S_tc, 1]
+                    num_comment_tokens = torch.clamp(is_comment.sum(dim=(1, 2)), min=1.0)
+                    per_sample_gate = (gate.sum(dim=(1, 2)) / (num_comment_tokens * self.model.d_model)).cpu().numpy()
                     sample_gate_means.append(per_sample_gate)
 
         avg_loss = total_loss / max(len(self.val_loader), 1)
