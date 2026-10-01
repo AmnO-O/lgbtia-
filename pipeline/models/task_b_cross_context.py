@@ -265,13 +265,15 @@ class TaskBCrossContextAttentionModel(nn.Module):
         # ==========================================================
         # 5. MULTI-SAMPLE DROPOUT CLASSIFICATION HEAD
         # ==========================================================
-        msd_logits = self.classifier(z_fusion) # List of [B, num_classes]
+        logits_output = self.classifier(z_fusion, return_all_msd_logits=return_all_msd_logits)
 
         if return_all_msd_logits:
-            out_logits = msd_logits
+            out_logits = logits_output if isinstance(logits_output, list) else [logits_output]
         else:
-            # Average logits across all dropout samples
-            out_logits = torch.mean(torch.stack(msd_logits, dim=0), dim=0) # [B, num_classes]
+            if isinstance(logits_output, list):
+                out_logits = torch.mean(torch.stack(logits_output, dim=0), dim=0)
+            else:
+                out_logits = logits_output
 
         if return_gate_values:
             return out_logits, gate
