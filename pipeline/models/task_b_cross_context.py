@@ -61,7 +61,7 @@ class GatedCrossAttentionContextBlock(nn.Module):
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=num_heads,
-            dropout=dropout,
+            dropout=dropout,    
             batch_first=True
         )
         
@@ -124,8 +124,8 @@ class TaskBCrossContextAttentionModel(nn.Module):
         d_model: int = 768,
         num_classes: int = NUM_CLASSES,
         num_heads: int = 8,
-        dropout: float = 0.50,
-        use_msd: bool = False,
+        dropout: float = 0.30,
+        use_msd: bool = True,
         msd_dropout_rates: Optional[List[float]] = None,
         gate_bias_init: float = -1.50,
         use_rmsnorm: bool = True
@@ -173,7 +173,14 @@ class TaskBCrossContextAttentionModel(nn.Module):
         attention_mask: torch.Tensor
     ) -> torch.Tensor:
         """Helper to run the backbone and return sequence tensor [B, S, d_model]."""
-        outputs = self.mmbert(input_ids=input_ids, attention_mask=attention_mask)
+        # Fast path: If backbone parameters don't require grad (e.g. Phase 1), execute with no_grad
+        is_trainable = any(p.requires_grad for p in self.mmbert.parameters())
+        if not is_trainable:
+            with torch.no_grad():
+                outputs = self.mmbert(input_ids=input_ids, attention_mask=attention_mask)
+        else:
+            outputs = self.mmbert(input_ids=input_ids, attention_mask=attention_mask)
+
         if hasattr(outputs, 'last_hidden_state'):
             return outputs.last_hidden_state
         elif isinstance(outputs, (tuple, list)):
@@ -235,32 +242,36 @@ class TaskBCrossContextAttentionModel(nn.Module):
         # ==========================================================
         # 3. ASYMMETRIC CROSS-ATTENTION & GATED FUSION
         # ==========================================================
-        # Create boolean key padding mask for PyTorch MultiheadAttention (True = Pad token to ignore)
+        # Boolean key padding mask for PyTorch MultiheadAttention (True = Pad token to ignore)
         desc_pad_mask = (desc_attention_mask == 0) # [B, S_d]
 
-        # Extract only comment tokens for cross-attention
+        # Explicit boolean masks for Title vs Comment tokens
         comment_mask = (tc_role_ids == ROLE_COMMENT) # [B, S_tc]
         title_mask = (tc_role_ids == ROLE_TITLE)     # [B, S_tc]
 
-        # Zero out non-comment token representations to ensure clean Query projection
-        h_comment_pure = h_tc * comment_mask.unsqueeze(-1).float()
-
-        # Run Gated Cross-Attention
-        h_fused_comment, gate = self.cross_context(
-            h_comment=h_comment_pure,
+        # Run Gated Cross-Attention on full sequence
+        # h_tc contains both Title and Comment. We pass it through cross-attention.
+        h_cross_infused, gate = self.cross_context(
+            h_comment=h_tc,
             h_desc=h_desc,
             desc_key_padding_mask=desc_pad_mask,
             return_gate_values=return_gate_values
         )
 
+        # Apply Selective Replacement:
+        # Title tokens remain pure unmodified h_tc (no description noise)
+        # Comment tokens get the context-infused representations h_cross_infused
+        comment_mask_expanded = comment_mask.unsqueeze(-1).float() # [B, S_tc, 1]
+        h_fused_tc = (1.0 - comment_mask_expanded) * h_tc + comment_mask_expanded * h_cross_infused
+
         # ==========================================================
         # 4. DUAL TOKEN POOLING & CONCATENATION
         # ==========================================================
-        # Pool title representation
+        # 1. Pure Title representation pooled only from Title tokens
         h_title_pooled = self.masked_mean_pool(h_tc, title_mask) # [B, d]
 
-        # Pool context-infused comment representation
-        h_comment_pooled = self.masked_mean_pool(h_fused_comment, comment_mask) # [B, d]
+        # 2. Context-infused Comment representation pooled only from Comment tokens
+        h_comment_pooled = self.masked_mean_pool(h_fused_tc, comment_mask) # [B, d]
 
         # Joint Multi-Aspect Representation [B, 2*d]
         z_fusion = torch.cat([h_title_pooled, h_comment_pooled], dim=-1)

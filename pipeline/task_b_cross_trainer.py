@@ -354,6 +354,11 @@ class TaskBCrossContextTrainer:
                     print(f"    ⭐ New Best Task B Macro-F1: {macro_f1:.4f} -> Saved checkpoint.")
 
         # PHASE 2: Differential Fine-Tuning
+        # Reload best model weights from Phase 1 to prevent carrying over overfitted weights
+        if self.best_checkpoint_path and os.path.exists(self.best_checkpoint_path):
+            print(f"  🔄 Restoring best Phase 1 checkpoint (Macro-F1: {self.best_macro_f1:.4f}) before fine-tuning...")
+            self.model.load_state_dict(torch.load(self.best_checkpoint_path, map_location=self.device))
+
         print(f"\n>>> [Phase 2/2] Fine-Tuning Top {self.config.unfreeze_layers} Layers for {self.config.unfreeze_phase_epochs} epochs (Early Stopping Patience: {patience})...")
         unfreeze_last_n(self.model.mmbert, self.config.unfreeze_layers)
 
