@@ -4,7 +4,7 @@ A modular PyTorch pipeline supporting multi-task stereotype & hate-speech classi
 ModernBERT/mmBERT backbones, Bi-LSTM, and Transformer baselines.
 """
 
-from .config import PipelineConfig, HATE_CLASSES, HATE2IDX, IDX2HATE
+from .config import PipelineConfig, HATE_CLASSES, NUM_CLASSES, HATE2IDX, IDX2HATE
 from .data import StereoQueerDataset, MMBertSeqDataset, DataPipeline, safe_clean, encode_target, decode_target
 from .task_b_data import TaskBAdditiveLatentDataset, TaskBRoleDataset
 from .augmentation import (
