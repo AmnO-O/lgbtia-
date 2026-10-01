@@ -17,20 +17,15 @@ from .augmentation import (
     augment_multilingual_dataframe,
     augment_task_b_dataframe,
 )
-from .models.task_b_class_aware import (
-    TaskBClassAwareAttentionModel,
-    RMSNorm,
-    CLASS_NO_HATE,
-    CLASS_IMPLICIT_HATE,
-    CLASS_EXPLICIT_HATE,
-    NUM_CLASSES,
-    ROLE_PAD,
-    ROLE_TITLE,
-    ROLE_DESC,
-    ROLE_COMMENT,
-    ROLE_HINT,
-    NUM_ROLES,
+from .models.task_b_cross_context import (
+    TaskBCrossContextAttentionModel,
+    GatedCrossAttentionContextBlock,
 )
+from .task_b_cross_data import (
+    TaskBDualStreamDataset,
+    create_task_b_dual_stream_loaders,
+)
+from .task_b_cross_trainer import TaskBCrossContextTrainer
 from .models.task_b_questions import (
     QueryProbe,
     DEFAULT_TASK_B_PROBES,
@@ -69,6 +64,11 @@ __all__ = [
     "augment_task_b_dataframe",
     "RMSNorm",
     "TaskBClassAwareAttentionModel",
+    "TaskBCrossContextAttentionModel",
+    "GatedCrossAttentionContextBlock",
+    "TaskBDualStreamDataset",
+    "create_task_b_dual_stream_loaders",
+    "TaskBCrossContextTrainer",
     "CLASS_NO_HATE",
     "CLASS_IMPLICIT_HATE",
     "CLASS_EXPLICIT_HATE",
