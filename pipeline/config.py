@@ -13,6 +13,12 @@ NUM_CLASSES = len(HATE_CLASSES)
 HATE2IDX = {'no': 0, 'yes_implicit': 1, 'yes_explicit': 2}
 IDX2HATE = {v: k for k, v in HATE2IDX.items()}
 
+# Structural Role IDs for Task B Pre-Backbone Embeddings
+ROLE_PAD = 0
+ROLE_TITLE = 1
+ROLE_COMMENT = 2
+ROLE_DESC = 3
+
 @dataclass
 class PipelineConfig:
     """Configuration class for the model training pipeline."""
