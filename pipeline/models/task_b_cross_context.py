@@ -402,7 +402,11 @@ class TaskBCrossContextAttentionModel(nn.Module):
         # ==========================================================
         # 5. CLASSIFICATION HEAD (1536 -> 384 -> 3)
         # ==========================================================
-        logits_output = self.classifier(z_fusion, return_all_msd_logits=return_all_msd_logits)
+        if self.use_msd:
+            logits_output = self.classifier(z_fusion, return_all_msd_logits=return_all_msd_logits)
+        else:
+            raw_logits = self.classifier(z_fusion)
+            logits_output = [raw_logits] if return_all_msd_logits else raw_logits
 
         if return_all_msd_logits:
             out_logits = logits_output if isinstance(logits_output, list) else [logits_output]
