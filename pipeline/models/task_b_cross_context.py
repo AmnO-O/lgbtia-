@@ -156,9 +156,11 @@ class TaskBCrossContextAttentionModel(nn.Module):
         # 4. Multi-Sample Dropout (MSD) Classification Head
         self.msd_rates = msd_dropout_rates or [0.1, 0.2, 0.3, 0.4, 0.5]
         self.classifier = MultiSampleDropoutHead(
-            in_features=2 * d_model,
-            out_features=num_classes,
-            dropout_rates=self.msd_rates
+            in_dim=2 * d_model,
+            hidden_dim=d_model,
+            num_classes=num_classes,
+            msd_dropout_rates=self.msd_rates,
+            use_rmsnorm=use_rmsnorm
         )
 
     def extract_backbone_features(
