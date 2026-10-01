@@ -500,3 +500,7 @@ class TaskBCrossTrainer:
             'checkpoint_path': self.best_checkpoint_path,
             'final_gate_stats': final_gate_stats
         }
+
+
+# Backward-compatible alias
+TaskBCrossContextTrainer = TaskBCrossTrainer

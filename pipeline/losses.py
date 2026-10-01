@@ -63,6 +63,39 @@ class FocalLoss(nn.Module):
         return focal_loss
 
 
+class LabelSmoothingCrossEntropy(nn.Module):
+    """
+    Cross Entropy Loss with Label Smoothing support and optional class weighting.
+    """
+    def __init__(
+        self,
+        label_smoothing: float = 0.05,
+        weights: Optional[Union[torch.Tensor, List[float]]] = None,
+        reduction: str = "mean",
+        device: Optional[torch.device] = None
+    ):
+        super().__init__()
+        self.label_smoothing = float(label_smoothing)
+        self.reduction = reduction
+        if weights is not None:
+            if not isinstance(weights, torch.Tensor):
+                weights = torch.tensor(weights, dtype=torch.float32)
+            if device is not None:
+                weights = weights.to(device)
+            self.register_buffer("weights", weights)
+        else:
+            self.weights = None
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(
+            inputs,
+            targets,
+            weight=self.weights,
+            label_smoothing=self.label_smoothing,
+            reduction=self.reduction
+        )
+
+
 class UnidirectionalKLDivergenceLoss(nn.Module):
     """
     Unidirectional KL Divergence Consistency Distillation Loss with Stop-Gradient.
