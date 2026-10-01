@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 from .config import HATE2IDX, PipelineConfig
-from .data import safe_clean, DataLoaderFactory
+from .data import safe_clean, DataPipeline
 
 ROLE_PAD = 0
 ROLE_TITLE = 1
