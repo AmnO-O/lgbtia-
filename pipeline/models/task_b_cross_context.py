@@ -22,8 +22,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import NUM_CLASSES
-from .task_b_cross_data import ROLE_PAD, ROLE_TITLE, ROLE_COMMENT
+from ..config import NUM_CLASSES
+from ..task_b_cross_data import ROLE_PAD, ROLE_TITLE, ROLE_COMMENT
 
 
 class RMSNorm(nn.Module):
