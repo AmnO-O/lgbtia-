@@ -51,9 +51,9 @@ class FocalLoss(nn.Module):
         B, C = inputs.shape
         if is_already_log_probs:
             # Clamp log_p to prevent -inf / NaN in AMP
-            log_p = torch.clamp(inputs, min=-30.0, max=0.0)
+            log_p = torch.clamp(inputs.float(), min=-30.0, max=0.0)
         else:
-            log_p = F.log_softmax(inputs, dim=-1)
+            log_p = F.log_softmax(inputs.float(), dim=-1)
 
         # 1. Exact valid log probability of target class
         target_log_p = log_p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
@@ -71,7 +71,7 @@ class FocalLoss(nn.Module):
         focal_loss = focal_weight * ce_loss
 
         if self.alpha is not None:
-            alpha = self.alpha.to(targets.device)
+            alpha = self.alpha.to(targets.device).float()
             alpha_t = alpha[targets]
             focal_loss = alpha_t * focal_loss
 
@@ -370,18 +370,20 @@ class BinaryFocalLoss(nn.Module):
             self.pos_weight = None
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        p = torch.sigmoid(logits)
-        eps = 1e-7
+        logits_f32 = logits.float()
+        targets_f32 = targets.float()
+        p = torch.sigmoid(logits_f32)
+        eps = 1e-6
         p = torch.clamp(p, min=eps, max=1.0 - eps)
 
         # p_t: probability of true class
-        p_t = p * targets + (1.0 - p) * (1.0 - targets)
+        p_t = p * targets_f32 + (1.0 - p) * (1.0 - targets_f32)
         focal_weight = torch.pow(torch.clamp(1.0 - p_t, min=0.0, max=1.0), self.gamma)
 
         bce = F.binary_cross_entropy_with_logits(
-            logits,
-            targets,
-            pos_weight=self.pos_weight.to(logits.device) if self.pos_weight is not None else None,
+            logits_f32,
+            targets_f32,
+            pos_weight=self.pos_weight.to(logits.device).float() if self.pos_weight is not None else None,
             reduction='none'
         )
         loss = focal_weight * bce
@@ -469,13 +471,19 @@ class HierarchicalTaskBLoss(nn.Module):
             return F.cross_entropy(logits_or_dict, targets, label_smoothing=self.label_smoothing)
 
         # 1. Primary Objective: Compound 3-Class Joint Loss
-        if self.use_focal and log_probs is not None:
-            l_joint = self.joint_loss(log_probs, targets)
+        if self.use_focal:
+            # Pass dictionary so FocalLoss knows it's already in log_prob space
+            if log_probs is not None:
+                l_joint = self.joint_loss({'log_probs': log_probs}, targets)
+            elif probs_3cls is not None:
+                l_joint = self.joint_loss({'probs': probs_3cls}, targets)
+            else:
+                l_joint = torch.tensor(0.0, device=targets.device)
         elif log_probs is not None:
-            l_joint = F.nll_loss(torch.clamp(log_probs, min=-30.0, max=0.0), targets)
+            l_joint = F.nll_loss(torch.clamp(log_probs.float(), min=-30.0, max=0.0), targets)
         elif probs_3cls is not None:
-            eps = 1e-7
-            probs_clamped = torch.clamp(probs_3cls, min=eps, max=1.0)
+            eps = 1e-6
+            probs_clamped = torch.clamp(probs_3cls.float(), min=eps, max=1.0)
             log_probs_fallback = torch.log(probs_clamped)
             l_joint = F.nll_loss(log_probs_fallback, targets)
         else:
@@ -495,15 +503,9 @@ class HierarchicalTaskBLoss(nn.Module):
                 hate_sub_targets = (targets[hate_mask] == 1).float()
                 hate_sub_logits = logit_type[hate_mask]
                 if self.use_focal:
-                    p = torch.sigmoid(hate_sub_logits)
-                    eps = 1e-7
-                    p = torch.clamp(p, min=eps, max=1.0 - eps)
-                    p_t = p * hate_sub_targets + (1.0 - p) * (1.0 - hate_sub_targets)
-                    focal_weight = torch.pow(torch.clamp(1.0 - p_t, min=0.0, max=1.0), 2.0)
-                    bce = F.binary_cross_entropy_with_logits(hate_sub_logits, hate_sub_targets, reduction='none')
-                    l_fine = (focal_weight * bce).sum() / float(targets.shape[0])
+                    l_fine = self.binary_fine_loss(hate_sub_logits, hate_sub_targets)
                 else:
-                    l_fine = F.binary_cross_entropy_with_logits(hate_sub_logits, hate_sub_targets, reduction='sum') / float(targets.shape[0])
+                    l_fine = F.binary_cross_entropy_with_logits(hate_sub_logits.float(), hate_sub_targets.float(), reduction='mean')
             else:
                 l_fine = torch.tensor(0.0, device=targets.device, dtype=logit_type.dtype)
         else:

@@ -36,15 +36,17 @@ from ..config import NUM_CLASSES, ROLE_PAD, ROLE_TITLE, ROLE_COMMENT
 
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization for improved numerical stability and speed."""
+    """Root Mean Square Layer Normalization with float32 precision for numerical stability in AMP."""
     def __init__(self, dim: int, eps: float = 1e-6):
         super(RMSNorm, self).__init__()
         self.eps = eps
         self.scale = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        variance = x.pow(2).mean(-1, keepdim=True)
-        return x * torch.rsqrt(variance + self.eps) * self.scale
+        x_f32 = x.float()
+        variance = x_f32.pow(2).mean(-1, keepdim=True)
+        normed = (x_f32 * torch.rsqrt(variance + self.eps)).to(x.dtype)
+        return normed * self.scale
 
 
 class MultiSampleDropoutClassifier(nn.Module):
@@ -155,17 +157,17 @@ class HierarchicalMSDClassifier(nn.Module):
                 logit_hate = self.hate_out_proj(drop_h(h_hate)) # [B, 1]
                 logit_type = self.type_out_proj(drop_t(h_type)) # [B, 1]
 
-                p_hate = torch.sigmoid(logit_hate)
-                p_imp = torch.sigmoid(logit_type)
+                p_hate = torch.sigmoid(logit_hate.float())
+                p_imp = torch.sigmoid(logit_type.float())
 
                 p_no = 1.0 - p_hate
                 p_implicit = p_hate * p_imp
                 p_explicit = p_hate * (1.0 - p_imp)
-                probs = torch.cat([p_no, p_implicit, p_explicit], dim=-1) # [B, 3]
+                probs = torch.cat([p_no, p_implicit, p_explicit], dim=-1).to(logit_hate.dtype)
 
-                # Convert compound probabilities back to logit space for metric computation
-                eps = 1e-7
-                compound_logits = torch.log(torch.clamp(probs, min=eps, max=1.0 - eps))
+                # Safe compound logits in float32
+                eps = 1e-6
+                compound_logits = torch.log(torch.clamp(probs.float(), min=eps, max=1.0 - eps)).to(logit_hate.dtype)
 
                 outs.append({
                     'logit_hate': logit_hate,
@@ -198,16 +200,16 @@ class HierarchicalMSDClassifier(nn.Module):
             logit_hate = self.hate_out_proj(h_hate)
             logit_type = self.type_out_proj(h_type)
 
-        p_hate = torch.sigmoid(logit_hate)
-        p_imp = torch.sigmoid(logit_type)
+        p_hate = torch.sigmoid(logit_hate.float())
+        p_imp = torch.sigmoid(logit_type.float())
 
         p_no = 1.0 - p_hate
         p_implicit = p_hate * p_imp
         p_explicit = p_hate * (1.0 - p_imp)
-        probs = torch.cat([p_no, p_implicit, p_explicit], dim=-1) # [B, 3]
+        probs = torch.cat([p_no, p_implicit, p_explicit], dim=-1).to(logit_hate.dtype)
 
-        eps = 1e-7
-        compound_logits = torch.log(torch.clamp(probs, min=eps, max=1.0 - eps))
+        eps = 1e-6
+        compound_logits = torch.log(torch.clamp(probs.float(), min=eps, max=1.0 - eps)).to(logit_hate.dtype)
 
         single_out = {
             'logit_hate': logit_hate,
@@ -456,13 +458,8 @@ class TaskBCrossContextAttentionModel(nn.Module):
     @staticmethod
     def masked_mean_pool(tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
-        Vectorized mean pooling across the sequence dimension only over valid tokens.
-        Executed entirely in PyTorch GPU memory with zero CPU-GPU sync.
-        Args:
-            tensor: [B, S, d]
-            mask: [B, S] (1/True for valid tokens, 0/False for excluded/pad)
-        Returns:
-            [B, d]
+        Vectorized mean pooling across sequence dimension only over valid tokens.
+        Ensures clamp min=1.0 to prevent 0 division.
         """
         if mask.dtype == torch.bool:
             mask_float = mask.float().unsqueeze(-1)
@@ -470,7 +467,7 @@ class TaskBCrossContextAttentionModel(nn.Module):
             mask_float = mask.unsqueeze(-1).float()
             
         sum_embeddings = torch.sum(tensor * mask_float, dim=1) # [B, d]
-        sum_mask = torch.clamp(mask_float.sum(dim=1), min=1e-9) # [B, 1]
+        sum_mask = torch.clamp(mask_float.sum(dim=1), min=1.0) # [B, 1]
         return sum_embeddings / sum_mask
 
     def forward(
@@ -514,8 +511,10 @@ class TaskBCrossContextAttentionModel(nn.Module):
         # ==========================================================
         # Boolean key padding mask for PyTorch MultiheadAttention (True = Pad token to ignore)
         desc_pad_mask = (desc_attention_mask == 0) # [B, S_d]
-        if desc_pad_mask.all(dim=-1).any():
-            desc_pad_mask[:, 0] = False # Safety unmask [CLS]
+        all_masked = desc_pad_mask.all(dim=-1)
+        if all_masked.any():
+            desc_pad_mask = desc_pad_mask.clone()
+            desc_pad_mask[all_masked, 0] = False # Safety unmask token 0 ONLY for samples where all tokens are masked
 
         comment_mask = (tc_role_ids == ROLE_COMMENT) # [B, S_tc] (Boolean tensor)
         title_mask = (tc_role_ids == ROLE_TITLE)     # [B, S_tc] (Boolean tensor)

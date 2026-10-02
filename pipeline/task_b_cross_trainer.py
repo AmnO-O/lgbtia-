@@ -235,6 +235,10 @@ class TaskBCrossTrainer:
             all_train_preds.append(preds.detach().cpu().numpy())
             all_train_targets.append(labels.detach().cpu().numpy())
 
+            if torch.isnan(loss) or torch.isinf(loss):
+                print("⚠️ [Warning] Detected NaN/Inf loss in batch — skipping backward step.")
+                continue
+
             # Backward pass
             is_unscaled = False
             if self.use_amp:
