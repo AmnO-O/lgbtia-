@@ -148,7 +148,9 @@ class PretrainedCrossAttentionLayer(nn.Module):
         # 4. Global Asymmetric Attention Matrix (Full Non-PAD Visibility)
         scores = torch.matmul(q, k.transpose(-1, -2)) * self.scaling  # [B, H, K, L]
         if context_mask is not None:
-            mask_4d = (1.0 - context_mask.unsqueeze(1).unsqueeze(2).to(scores.dtype)) * -10000.0
+            # Numerically stable masking in FP16/BF16/FP32
+            mask_val = -10000.0 if scores.dtype == torch.float32 else -1e4
+            mask_4d = (1.0 - context_mask.unsqueeze(1).unsqueeze(2).to(scores.dtype)) * mask_val
             scores = scores + mask_4d
 
         attn_weights = F.softmax(scores, dim=-1) # [B, H, K, L]
@@ -311,8 +313,13 @@ class HierarchicalClassQueryHead(nn.Module):
                 log_p_implicit = log_p_hate + log_p_imp_given_hate
                 log_p_explicit = log_p_hate + log_p_exp_given_hate
 
+                # Clamp to prevent -inf in half precision / AMP
+                log_p_no = torch.clamp(log_p_no, min=-30.0, max=0.0)
+                log_p_implicit = torch.clamp(log_p_implicit, min=-30.0, max=0.0)
+                log_p_explicit = torch.clamp(log_p_explicit, min=-30.0, max=0.0)
+
                 log_probs = torch.cat([log_p_no, log_p_implicit, log_p_explicit], dim=-1) # [B, 3]
-                probs = torch.exp(log_probs) # [B, 3]
+                probs = torch.clamp(torch.exp(log_probs), min=1e-7, max=1.0) # [B, 3]
 
                 outs.append({
                     'logit_hate': logit_hate,
@@ -328,8 +335,7 @@ class HierarchicalClassQueryHead(nn.Module):
             avg_logit_hate = torch.mean(torch.stack([o['logit_hate'] for o in outs], dim=0), dim=0)
             avg_logit_type = torch.mean(torch.stack([o['logit_type'] for o in outs], dim=0), dim=0)
             avg_probs = torch.mean(torch.stack([o['probs'] for o in outs], dim=0), dim=0)
-            eps = 1e-7
-            avg_log_probs = torch.log(torch.clamp(avg_probs, min=eps, max=1.0 - eps))
+            avg_log_probs = torch.log(torch.clamp(avg_probs, min=1e-7, max=1.0))
 
             return {
                 'logit_hate': avg_logit_hate,
@@ -356,8 +362,13 @@ class HierarchicalClassQueryHead(nn.Module):
         log_p_implicit = log_p_hate + log_p_imp_given_hate
         log_p_explicit = log_p_hate + log_p_exp_given_hate
 
+        # Clamp to prevent -inf in half precision / AMP
+        log_p_no = torch.clamp(log_p_no, min=-30.0, max=0.0)
+        log_p_implicit = torch.clamp(log_p_implicit, min=-30.0, max=0.0)
+        log_p_explicit = torch.clamp(log_p_explicit, min=-30.0, max=0.0)
+
         log_probs = torch.cat([log_p_no, log_p_implicit, log_p_explicit], dim=-1) # [B, 3]
-        probs = torch.exp(log_probs) # [B, 3]
+        probs = torch.clamp(torch.exp(log_probs), min=1e-7, max=1.0) # [B, 3]
 
         single_out = {
             'logit_hate': logit_hate,
@@ -591,13 +602,8 @@ class TaskBClassAwareAttentionModel(nn.Module):
         """
         Extracts H_17 (the contextual hidden states output at layer 17) via ModernBERT's
         native forward execution with output_hidden_states=True.
-        
-        This delegates full responsibility for cu_seqlens, sliding_window_mask,
-        and internal ModernBertRotaryEmbedding parameters to Hugging Face's official code,
-        completely eliminating version-dependent RoPE calling crashes.
         """
         backbone = self.mmbert
-        # ModernBERT forwards inputs_embeds cleanly
         outputs = backbone(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -607,8 +613,6 @@ class TaskBClassAwareAttentionModel(nn.Module):
 
         hidden_states_list = getattr(outputs, "hidden_states", None)
         if hidden_states_list is not None and len(hidden_states_list) > self.cross_layer_start:
-            # hidden_states_list[0] = embedding layer output
-            # hidden_states_list[17] = layer 17 output (H_17)
             h_17 = hidden_states_list[self.cross_layer_start]
         else:
             h_17 = outputs[0]

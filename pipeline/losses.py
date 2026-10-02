@@ -50,17 +50,18 @@ class FocalLoss(nn.Module):
 
         B, C = inputs.shape
         if is_already_log_probs:
-            log_p = inputs
+            # Clamp log_p to prevent -inf / NaN in AMP
+            log_p = torch.clamp(inputs, min=-30.0, max=0.0)
         else:
             log_p = F.log_softmax(inputs, dim=-1)
 
         # 1. Exact valid log probability of target class
         target_log_p = log_p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
 
-        # 2. Probability p_t for focal weight with lower clamp to prevent underflow
-        target_p = torch.exp(target_log_p).clamp_min(1e-7)
+        # 2. Probability p_t for focal weight with lower/upper clamp to prevent underflow/overflow
+        target_p = torch.clamp(torch.exp(target_log_p), min=1e-7, max=1.0)
 
-        focal_weight = torch.pow(1.0 - target_p, self.gamma)
+        focal_weight = torch.pow(torch.clamp(1.0 - target_p, min=0.0, max=1.0), self.gamma)
         ce_loss = - target_log_p
 
         if self.label_smoothing > 0.0:
@@ -122,8 +123,8 @@ class LabelSmoothingCrossEntropy(nn.Module):
                 inputs = inputs['logits']
 
         if is_already_log_probs:
+            log_p = torch.clamp(inputs, min=-30.0, max=0.0)
             if self.label_smoothing > 0.0:
-                log_p = inputs
                 target_log_p = log_p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
                 smooth_loss = - log_p.mean(dim=-1)
                 ce_loss = (1.0 - self.label_smoothing) * (-target_log_p) + self.label_smoothing * smooth_loss
@@ -132,7 +133,7 @@ class LabelSmoothingCrossEntropy(nn.Module):
                     ce_loss = w * ce_loss
                 return ce_loss.mean() if self.reduction == "mean" else ce_loss.sum()
             else:
-                return F.nll_loss(inputs, targets, weight=self.weights, reduction=self.reduction)
+                return F.nll_loss(log_p, targets, weight=self.weights, reduction=self.reduction)
 
         return F.cross_entropy(
             inputs,
@@ -203,13 +204,13 @@ class PrivilegedConsistencyTaskBLoss(nn.Module):
         def _to_probs(x):
             if isinstance(x, dict):
                 if x.get('probs') is not None:
-                    return x['probs']
+                    return torch.clamp(x['probs'], min=1e-7, max=1.0)
                 if x.get('log_probs') is not None:
-                    return torch.exp(x['log_probs'])
+                    return torch.clamp(torch.exp(x['log_probs']), min=1e-7, max=1.0)
+                if x.get('compound_logits') is not None:
+                    return torch.clamp(torch.exp(x['compound_logits']), min=1e-7, max=1.0)
                 if x.get('logits') is not None:
                     return F.softmax(x['logits'], dim=-1)
-                if x.get('compound_logits') is not None:
-                    return torch.exp(x['compound_logits'])
             return F.softmax(x, dim=-1)
 
         if isinstance(logits_u, list):
@@ -298,83 +299,72 @@ class MultiTaskLoss(nn.Module):
       - Hate Speech Type (HS): CrossEntropyLoss or FocalLoss
       - Stereotype Target Group (TG): BCEWithLogitsLoss
     """
-    def __init__(self, config: PipelineConfig):
+    def __init__(
+        self,
+        loss_st_weight: float = 1.5,
+        loss_hs_weight: float = 1.0,
+        loss_tg_weight: float = 1.5,
+        loss_type: str = "focal",
+        class_weights: Optional[List[float]] = None,
+        focal_gamma: float = 2.0,
+        label_smoothing: float = 0.05,
+        target_dim: int = 10,
+        device: Optional[torch.device] = None
+    ):
         super().__init__()
-        self.w_st = config.loss_st_weight
-        self.w_hs = config.loss_hs_weight
-        self.w_tg = config.loss_tg_weight
-        
+        self.loss_st_weight = loss_st_weight
+        self.loss_hs_weight = loss_hs_weight
+        self.loss_tg_weight = loss_tg_weight
+        self.target_dim = target_dim
+
         self.loss_st = nn.BCEWithLogitsLoss()
-        
-        if getattr(config, 'loss_type', 'focal') == 'focal':
-            class_weights = getattr(config, 'class_weights', None)
-            focal_gamma = getattr(config, 'focal_gamma', 2.0)
-            label_smoothing = getattr(config, 'label_smoothing', 0.05)
-            self.loss_hs = FocalLoss(
-                gamma=focal_gamma,
-                alpha=class_weights,
-                label_smoothing=label_smoothing
-            )
-        else:
-            class_weights = getattr(config, 'class_weights', None)
-            weight_tensor = torch.tensor(class_weights, dtype=torch.float32) if class_weights else None
-            self.loss_hs = nn.CrossEntropyLoss(weight=weight_tensor)
-            
+        self.loss_hs = build_loss_fn(
+            loss_type=loss_type,
+            class_weights=class_weights,
+            gamma=focal_gamma,
+            label_smoothing=label_smoothing,
+            device=device
+        )
         self.loss_tg = nn.BCEWithLogitsLoss()
 
     def forward(
         self,
-        *args,
-        **kwargs
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        if len(args) == 2 and isinstance(args[0], dict) and isinstance(args[1], dict):
-            preds, targets = args[0], args[1]
-            st_pred, hs_pred, tg_pred = preds['st'], preds['hs'], preds['tg']
-            st_tgt, hs_tgt, tg_tgt = targets['st'], targets['hs'], targets['tg']
-        elif len(args) == 6:
-            st_pred, hs_pred, tg_pred, st_tgt, hs_tgt, tg_tgt = args
-        elif 'preds' in kwargs and 'targets' in kwargs:
-            preds, targets = kwargs['preds'], kwargs['targets']
-            st_pred, hs_pred, tg_pred = preds['st'], preds['hs'], preds['tg']
-            st_tgt, hs_tgt, tg_tgt = targets['st'], targets['hs'], targets['tg']
-        else:
-            raise ValueError("MultiTaskLoss expects either 2 dicts (preds, targets) or 6 positional tensors.")
+        preds: Tuple[torch.Tensor, Union[torch.Tensor, Dict[str, torch.Tensor]], torch.Tensor],
+        targets: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        st_pred, hs_pred, tg_pred = preds
+        st_target, hs_target, tg_target = targets
 
-        st_pred = st_pred.squeeze(-1) if st_pred.ndim > 1 and st_pred.shape[-1] == 1 else st_pred
-        st_tgt = st_tgt.view_as(st_pred)
+        loss_st = self.loss_st(st_pred.squeeze(-1), st_target.float())
+        loss_hs = self.loss_hs(hs_pred, hs_target)
+        loss_tg = self.loss_tg(tg_pred, tg_target.float())
 
-        l_st = self.loss_st(st_pred, st_tgt)
-        l_hs = self.loss_hs(hs_pred, hs_tgt)
-        l_tg = self.loss_tg(tg_pred, tg_tgt)
+        total_loss = (
+            self.loss_st_weight * loss_st +
+            self.loss_hs_weight * loss_hs +
+            self.loss_tg_weight * loss_tg
+        )
 
-        total = self.w_st * l_st + self.w_hs * l_hs + self.w_tg * l_tg
-        loss_dict = {
-            'total': total,
-            'st': l_st,
-            'hs': l_hs,
-            'tg': l_tg,
+        breakdown = {
+            'loss_total': float(total_loss.detach().item()),
+            'loss_st': float(loss_st.detach().item()),
+            'loss_hs': float(loss_hs.detach().item()),
+            'loss_tg': float(loss_tg.detach().item())
         }
-
-        return total, loss_dict
+        return total_loss, breakdown
 
 
 class BinaryFocalLoss(nn.Module):
-    """
-    Binary Focal Loss for class imbalance and hard example mining:
-        FL(p_t) = - alpha_t * (1 - p_t)^gamma * log(p_t)
-    """
     def __init__(
         self,
         gamma: float = 2.0,
-        pos_weight: Optional[Union[float, torch.Tensor]] = None,
+        pos_weight: Optional[torch.Tensor] = None,
         reduction: str = "mean"
     ):
         super().__init__()
-        self.gamma = float(gamma)
+        self.gamma = gamma
         self.reduction = reduction
         if pos_weight is not None:
-            if not isinstance(pos_weight, torch.Tensor):
-                pos_weight = torch.tensor([pos_weight], dtype=torch.float32)
             self.register_buffer("pos_weight", pos_weight)
         else:
             self.pos_weight = None
@@ -386,7 +376,7 @@ class BinaryFocalLoss(nn.Module):
 
         # p_t: probability of true class
         p_t = p * targets + (1.0 - p) * (1.0 - targets)
-        focal_weight = torch.pow(1.0 - p_t, self.gamma)
+        focal_weight = torch.pow(torch.clamp(1.0 - p_t, min=0.0, max=1.0), self.gamma)
 
         bce = F.binary_cross_entropy_with_logits(
             logits,
@@ -440,10 +430,6 @@ class HierarchicalTaskBLoss(nn.Module):
         self.use_focal = use_focal
         self.label_smoothing = float(label_smoothing)
 
-        # 1. Clean & Controlled Weighting:
-        # 3-class weights are applied strictly to the primary joint loss.
-        # Auxiliary binary heads are unweighted by default to avoid double-weighting,
-        # unless explicitly specified via hate_pos_weight or type_pos_weight.
         pos_weight_hate_tensor = None
         if hate_pos_weight is not None:
             pos_weight_hate_tensor = torch.tensor([hate_pos_weight], dtype=torch.float32)
@@ -486,10 +472,10 @@ class HierarchicalTaskBLoss(nn.Module):
         if self.use_focal and log_probs is not None:
             l_joint = self.joint_loss(log_probs, targets)
         elif log_probs is not None:
-            l_joint = F.nll_loss(log_probs, targets)
+            l_joint = F.nll_loss(torch.clamp(log_probs, min=-30.0, max=0.0), targets)
         elif probs_3cls is not None:
             eps = 1e-7
-            probs_clamped = torch.clamp(probs_3cls, min=eps, max=1.0 - eps)
+            probs_clamped = torch.clamp(probs_3cls, min=eps, max=1.0)
             log_probs_fallback = torch.log(probs_clamped)
             l_joint = F.nll_loss(log_probs_fallback, targets)
         else:
@@ -503,19 +489,17 @@ class HierarchicalTaskBLoss(nn.Module):
             l_binary = torch.tensor(0.0, device=targets.device)
 
         # 3. Auxiliary Level 2: Conditional Fine-Grained Implicit vs Explicit Loss
-        # Normalized by total batch size B to prevent disproportionate gradient scaling on low-hate batches
         if self.lambda_type > 0.0:
             hate_mask = (targets > 0)
             if hate_mask.sum() > 0:
                 hate_sub_targets = (targets[hate_mask] == 1).float()
                 hate_sub_logits = logit_type[hate_mask]
-                # Compute sum over hateful samples, then divide by total batch size B for consistent scaling
                 if self.use_focal:
                     p = torch.sigmoid(hate_sub_logits)
                     eps = 1e-7
                     p = torch.clamp(p, min=eps, max=1.0 - eps)
                     p_t = p * hate_sub_targets + (1.0 - p) * (1.0 - hate_sub_targets)
-                    focal_weight = torch.pow(1.0 - p_t, 2.0)
+                    focal_weight = torch.pow(torch.clamp(1.0 - p_t, min=0.0, max=1.0), 2.0)
                     bce = F.binary_cross_entropy_with_logits(hate_sub_logits, hate_sub_targets, reduction='none')
                     l_fine = (focal_weight * bce).sum() / float(targets.shape[0])
                 else:
