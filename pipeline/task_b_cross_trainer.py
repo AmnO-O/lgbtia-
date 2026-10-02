@@ -120,10 +120,22 @@ class TaskBCrossTrainer:
 
         self.model.to(self.device)
 
-        # Mixed Precision
+        # Smart Mixed Precision (ModernBERT requires bfloat16 or safe float16 to prevent attention overflow)
         self.use_amp = use_amp and (self.device.type == 'cuda')
-        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
         self.device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
+        
+        if self.use_amp:
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                self.amp_dtype = torch.bfloat16
+                self.use_scaler = False
+            else:
+                self.amp_dtype = torch.float16
+                self.use_scaler = True
+        else:
+            self.amp_dtype = torch.float32
+            self.use_scaler = False
+
+        self.scaler = torch.amp.GradScaler('cuda', enabled=(self.use_amp and self.use_scaler))
 
         # Class weights determination (prioritize parameter if passed, else config)
         weights_to_use = class_weights if class_weights is not None else getattr(config, 'class_weights', None)
@@ -203,7 +215,7 @@ class TaskBCrossTrainer:
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast(self.device_type, enabled=self.use_amp):
+            with torch.amp.autocast(self.device_type, dtype=self.amp_dtype, enabled=self.use_amp):
                 # Standard Forward pass with MSD
                 if self.model.use_msd or getattr(self.model, 'use_hierarchical_head', False):
                     logits_list = self.model(
@@ -241,20 +253,20 @@ class TaskBCrossTrainer:
 
             # Backward pass
             is_unscaled = False
-            if self.use_amp:
+            if self.use_amp and self.use_scaler:
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
 
             # Adversarial Training (FGM)
             if apply_fgm and self.fgm is not None:
-                if self.use_amp:
+                if self.use_amp and self.use_scaler:
                     self.scaler.unscale_(optimizer)
                     is_unscaled = True
                 
                 self.fgm.attack()
                 
-                with torch.amp.autocast(self.device_type, enabled=self.use_amp):
+                with torch.amp.autocast(self.device_type, dtype=self.amp_dtype, enabled=self.use_amp):
                     adv_logits = self.model(
                         tc_input_ids=tc_ids,
                         tc_attention_mask=tc_mask,
@@ -265,14 +277,14 @@ class TaskBCrossTrainer:
                     )
                     adv_loss = self.criterion(adv_logits, labels)
 
-                if self.use_amp:
+                if self.use_amp and self.use_scaler:
                     self.scaler.scale(adv_loss).backward()
                 else:
                     adv_loss.backward()
                 
                 self.fgm.restore()
 
-            if self.use_amp:
+            if self.use_amp and self.use_scaler:
                 if self.config.clip_grad_norm > 0:
                     if not is_unscaled:
                         self.scaler.unscale_(optimizer)
@@ -336,7 +348,7 @@ class TaskBCrossTrainer:
                 desc_mask = desc_mask.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
 
-                with torch.amp.autocast(self.device_type, enabled=self.use_amp):
+                with torch.amp.autocast(self.device_type, dtype=self.amp_dtype, enabled=self.use_amp):
                     logits, gate = self.model(
                         tc_input_ids=tc_ids,
                         tc_attention_mask=tc_mask,
