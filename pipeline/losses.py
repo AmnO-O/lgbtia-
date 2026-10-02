@@ -79,16 +79,10 @@ class FocalLoss(nn.Module):
             focal_loss = alpha_t * focal_loss
 
         if self.reduction == "mean":
-            result = focal_loss.mean()
+            return focal_loss.mean()
         elif self.reduction == "sum":
-            result = focal_loss.sum()
-        else:
-            result = focal_loss
-
-        # NaN safety guard: return zero loss rather than propagating NaN
-        if torch.isnan(result) or torch.isinf(result):
-            return torch.zeros(1, device=result.device, dtype=result.dtype, requires_grad=True).squeeze()
-        return result
+            return focal_loss.sum()
+        return focal_loss
 
 
 class LabelSmoothingCrossEntropy(nn.Module):

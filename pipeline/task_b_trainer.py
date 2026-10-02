@@ -94,7 +94,19 @@ class TaskBTrainer:
         self.model.to(self.device)
         self.use_amp = use_amp and (self.device.type == 'cuda')
         self.device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
-        self.scaler = torch.amp.GradScaler(self.device_type, enabled=self.use_amp)
+
+        if self.use_amp:
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                self.amp_dtype = torch.bfloat16
+                self.use_scaler = False
+            else:
+                self.amp_dtype = torch.float16
+                self.use_scaler = True
+        else:
+            self.amp_dtype = torch.float32
+            self.use_scaler = False
+
+        self.scaler = torch.amp.GradScaler(self.device_type, enabled=(self.use_amp and self.use_scaler))
 
         # Base Loss Function & Privileged Multi-Objective Criterion
         base_loss_fn = build_loss_fn(
@@ -192,7 +204,7 @@ class TaskBTrainer:
 
             optimizer.zero_grad()
             
-            with torch.amp.autocast(self.device_type, enabled=self.use_amp):
+            with torch.amp.autocast(self.device_type, dtype=self.amp_dtype, enabled=self.use_amp):
                 # 1. Unconditional Forward Pass (p_u)
                 out_u = self.model(
                     input_ids=input_ids,
@@ -228,6 +240,11 @@ class TaskBTrainer:
                     lambda_cons=lambda_cons
                 )
 
+            if torch.isnan(loss) or torch.isinf(loss):
+                print("⚠️ [Warning] Detected NaN/Inf loss in batch — skipping optimizer step.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             with torch.no_grad():
                 if isinstance(logits_u, list):
                     if isinstance(logits_u[0], dict):
@@ -245,19 +262,19 @@ class TaskBTrainer:
 
             is_unscaled = False
 
-            if self.use_amp:
+            if self.use_amp and self.use_scaler:
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
 
             if apply_fgm and self.fgm is not None:
-                if self.use_amp:
+                if self.use_amp and self.use_scaler:
                     self.scaler.unscale_(optimizer)
                     is_unscaled = True
                 
                 self.fgm.attack()
                 
-                with torch.amp.autocast(self.device_type, enabled=self.use_amp):
+                with torch.amp.autocast(self.device_type, dtype=self.amp_dtype, enabled=self.use_amp):
                     adv_out = self.model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
@@ -270,14 +287,14 @@ class TaskBTrainer:
                     adv_logits = adv_out[0] if isinstance(adv_out, tuple) else adv_out
                     adv_loss, _ = self.criterion(logits_u=adv_logits, targets=hs_labels)
                 
-                if self.use_amp:
+                if self.use_amp and self.use_scaler:
                     self.scaler.scale(adv_loss).backward()
                 else:
                     adv_loss.backward()
                     
                 self.fgm.restore()
 
-            if self.use_amp:
+            if self.use_amp and self.use_scaler:
                 if self.config.clip_grad_norm > 0:
                     if not is_unscaled:
                         self.scaler.unscale_(optimizer)
@@ -338,7 +355,7 @@ class TaskBTrainer:
                 role_ids = role_ids.to(self.device, non_blocking=True)
                 hs_labels = hs_labels.to(self.device, non_blocking=True)
 
-                with torch.amp.autocast(self.device_type, enabled=self.use_amp):
+                with torch.amp.autocast(self.device_type, dtype=self.amp_dtype, enabled=self.use_amp):
                     out = self.model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
