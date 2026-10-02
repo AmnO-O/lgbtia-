@@ -166,22 +166,25 @@ class HierarchicalClassQueryHead(nn.Module):
                 logit_hate = self.hate_out_proj(drop_h(h_hate)) # [B, 1]
                 logit_type = self.type_out_proj(drop_t(h_type)) # [B, 1]
 
-                p_hate = torch.sigmoid(logit_hate)
-                p_imp = torch.sigmoid(logit_type)
+                # Stable direct computation of tree log probabilities via logsigmoid
+                log_p_hate = F.logsigmoid(logit_hate)
+                log_p_no = F.logsigmoid(-logit_hate)
 
-                p_no = 1.0 - p_hate
-                p_implicit = p_hate * p_imp
-                p_explicit = p_hate * (1.0 - p_imp)
-                probs = torch.cat([p_no, p_implicit, p_explicit], dim=-1) # [B, 3]
+                log_p_imp_given_hate = F.logsigmoid(logit_type)
+                log_p_exp_given_hate = F.logsigmoid(-logit_type)
 
-                eps = 1e-7
-                compound_logits = torch.log(torch.clamp(probs, min=eps, max=1.0 - eps))
+                log_p_implicit = log_p_hate + log_p_imp_given_hate
+                log_p_explicit = log_p_hate + log_p_exp_given_hate
+
+                log_probs = torch.cat([log_p_no, log_p_implicit, log_p_explicit], dim=-1) # [B, 3]
+                probs = torch.exp(log_probs) # [B, 3]
 
                 outs.append({
                     'logit_hate': logit_hate,
                     'logit_type': logit_type,
                     'probs': probs,
-                    'compound_logits': compound_logits
+                    'log_probs': log_probs,
+                    'compound_logits': log_probs # backward compatibility alias
                 })
 
             if return_all_msd_logits:
@@ -191,13 +194,14 @@ class HierarchicalClassQueryHead(nn.Module):
             avg_logit_type = torch.mean(torch.stack([o['logit_type'] for o in outs], dim=0), dim=0)
             avg_probs = torch.mean(torch.stack([o['probs'] for o in outs], dim=0), dim=0)
             eps = 1e-7
-            avg_compound = torch.log(torch.clamp(avg_probs, min=eps, max=1.0 - eps))
+            avg_log_probs = torch.log(torch.clamp(avg_probs, min=eps, max=1.0 - eps))
 
             return {
                 'logit_hate': avg_logit_hate,
                 'logit_type': avg_logit_type,
                 'probs': avg_probs,
-                'compound_logits': avg_compound
+                'log_probs': avg_log_probs,
+                'compound_logits': avg_log_probs
             }
 
         # Non-MSD training or Eval mode
@@ -208,22 +212,25 @@ class HierarchicalClassQueryHead(nn.Module):
             logit_hate = self.hate_out_proj(h_hate)
             logit_type = self.type_out_proj(h_type)
 
-        p_hate = torch.sigmoid(logit_hate)
-        p_imp = torch.sigmoid(logit_type)
+        # Stable direct computation of tree log probabilities via logsigmoid
+        log_p_hate = F.logsigmoid(logit_hate)
+        log_p_no = F.logsigmoid(-logit_hate)
 
-        p_no = 1.0 - p_hate
-        p_implicit = p_hate * p_imp
-        p_explicit = p_hate * (1.0 - p_imp)
-        probs = torch.cat([p_no, p_implicit, p_explicit], dim=-1) # [B, 3]
+        log_p_imp_given_hate = F.logsigmoid(logit_type)
+        log_p_exp_given_hate = F.logsigmoid(-logit_type)
 
-        eps = 1e-7
-        compound_logits = torch.log(torch.clamp(probs, min=eps, max=1.0 - eps))
+        log_p_implicit = log_p_hate + log_p_imp_given_hate
+        log_p_explicit = log_p_hate + log_p_exp_given_hate
+
+        log_probs = torch.cat([log_p_no, log_p_implicit, log_p_explicit], dim=-1) # [B, 3]
+        probs = torch.exp(log_probs) # [B, 3]
 
         single_out = {
             'logit_hate': logit_hate,
             'logit_type': logit_type,
             'probs': probs,
-            'compound_logits': compound_logits
+            'log_probs': log_probs,
+            'compound_logits': log_probs
         }
         if return_all_msd_logits:
             return [single_out]

@@ -231,15 +231,15 @@ class TaskBTrainer:
             with torch.no_grad():
                 if isinstance(logits_u, list):
                     if isinstance(logits_u[0], dict):
-                        eval_logits = torch.mean(torch.stack([o.get('compound_logits', o.get('probs')) for o in logits_u], dim=0), dim=0)
+                        eval_probs = torch.mean(torch.stack([o.get('probs', torch.exp(o['log_probs'])) for o in logits_u], dim=0), dim=0)
                     else:
-                        eval_logits = torch.mean(torch.stack(logits_u, dim=0), dim=0)
+                        eval_probs = torch.mean(torch.stack([F.softmax(b, dim=-1) for b in logits_u], dim=0), dim=0)
                 elif isinstance(logits_u, dict):
-                    eval_logits = logits_u.get('compound_logits', logits_u.get('probs'))
+                    eval_probs = logits_u.get('probs', torch.exp(logits_u.get('log_probs', logits_u.get('compound_logits'))))
                 else:
-                    eval_logits = logits_u
+                    eval_probs = F.softmax(logits_u, dim=-1)
 
-                preds = torch.argmax(eval_logits, dim=-1)
+                preds = torch.argmax(eval_probs, dim=-1)
                 all_train_preds.append(preds.detach().cpu().numpy())
                 all_train_targets.append(hs_labels.detach().cpu().numpy())
 

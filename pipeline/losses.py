@@ -32,25 +32,33 @@ class FocalLoss(nn.Module):
             self.alpha = None
 
     def forward(self, inputs: Union[torch.Tensor, Dict[str, torch.Tensor]], targets: torch.Tensor) -> torch.Tensor:
+        is_already_log_probs = False
         if isinstance(inputs, dict):
-            if 'compound_logits' in inputs and inputs['compound_logits'] is not None:
+            if 'log_probs' in inputs and inputs['log_probs'] is not None:
+                inputs = inputs['log_probs']
+                is_already_log_probs = True
+            elif 'compound_logits' in inputs and inputs['compound_logits'] is not None:
                 inputs = inputs['compound_logits']
+                is_already_log_probs = True
             elif 'probs' in inputs and inputs['probs'] is not None:
                 eps = 1e-7
                 probs_clamped = torch.clamp(inputs['probs'], min=eps, max=1.0 - eps)
                 inputs = torch.log(probs_clamped)
+                is_already_log_probs = True
             elif 'logits' in inputs:
                 inputs = inputs['logits']
 
         B, C = inputs.shape
-        log_p = F.log_softmax(inputs, dim=-1)
-        p = torch.exp(log_p)
+        if is_already_log_probs:
+            log_p = inputs
+        else:
+            log_p = F.log_softmax(inputs, dim=-1)
 
-        p = torch.clamp(p, min=1e-7, max=1.0 - 1e-7)
-
-        target_p = p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
-        target_p = torch.clamp(target_p, min=1e-7, max=1.0 - 1e-7)
+        # 1. Exact valid log probability of target class
         target_log_p = log_p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+
+        # 2. Probability p_t for focal weight with lower clamp to prevent underflow
+        target_p = torch.exp(target_log_p).clamp_min(1e-7)
 
         focal_weight = torch.pow(1.0 - target_p, self.gamma)
         ce_loss = - target_log_p
@@ -97,15 +105,34 @@ class LabelSmoothingCrossEntropy(nn.Module):
             self.weights = None
 
     def forward(self, inputs: Union[torch.Tensor, Dict[str, torch.Tensor]], targets: torch.Tensor) -> torch.Tensor:
+        is_already_log_probs = False
         if isinstance(inputs, dict):
-            if 'compound_logits' in inputs and inputs['compound_logits'] is not None:
+            if 'log_probs' in inputs and inputs['log_probs'] is not None:
+                inputs = inputs['log_probs']
+                is_already_log_probs = True
+            elif 'compound_logits' in inputs and inputs['compound_logits'] is not None:
                 inputs = inputs['compound_logits']
+                is_already_log_probs = True
             elif 'probs' in inputs and inputs['probs'] is not None:
                 eps = 1e-7
                 probs_clamped = torch.clamp(inputs['probs'], min=eps, max=1.0 - eps)
                 inputs = torch.log(probs_clamped)
+                is_already_log_probs = True
             elif 'logits' in inputs:
                 inputs = inputs['logits']
+
+        if is_already_log_probs:
+            if self.label_smoothing > 0.0:
+                log_p = inputs
+                target_log_p = log_p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+                smooth_loss = - log_p.mean(dim=-1)
+                ce_loss = (1.0 - self.label_smoothing) * (-target_log_p) + self.label_smoothing * smooth_loss
+                if self.weights is not None:
+                    w = self.weights.to(targets.device)[targets]
+                    ce_loss = w * ce_loss
+                return ce_loss.mean() if self.reduction == "mean" else ce_loss.sum()
+            else:
+                return F.nll_loss(inputs, targets, weight=self.weights, reduction=self.reduction)
 
         return F.cross_entropy(
             inputs,
@@ -118,7 +145,9 @@ class LabelSmoothingCrossEntropy(nn.Module):
 
 class UnidirectionalKLDivergenceLoss(nn.Module):
     """
-    Unidirectional KL Divergence Consistency Distillation Loss with Stop-Gradient.
+    Unidirectional KL Divergence Consistency Distillation Loss with Stop-Gradient on Teacher:
+        KL(p_teacher || p_student) = sum p_teacher * (log p_teacher - log p_student)
+    Accepts either probabilities or log-probabilities directly.
     """
     def __init__(self, temperature: float = 1.0, reduction: str = "mean"):
         super().__init__()
@@ -127,17 +156,19 @@ class UnidirectionalKLDivergenceLoss(nn.Module):
 
     def forward(
         self,
-        student_logits: torch.Tensor,
-        teacher_logits: torch.Tensor
+        student_probs: torch.Tensor,
+        teacher_probs: torch.Tensor
     ) -> torch.Tensor:
-        s_logits = student_logits / self.temperature
-        t_logits = teacher_logits.detach() / self.temperature
+        eps = 1e-7
+        p_s = torch.clamp(student_probs, min=eps, max=1.0 - eps)
+        p_t = torch.clamp(teacher_probs.detach(), min=eps, max=1.0 - eps)
 
-        log_p_student = F.log_softmax(s_logits, dim=-1)
-        p_teacher = F.softmax(t_logits, dim=-1)
-        p_teacher = torch.clamp(p_teacher, min=1e-7, max=1.0 - 1e-7)
+        if self.temperature != 1.0:
+            # Temperature scaling in probability space
+            p_s = F.softmax(torch.log(p_s) / self.temperature, dim=-1)
+            p_t = F.softmax(torch.log(p_t) / self.temperature, dim=-1)
 
-        kl_per_sample = torch.sum(p_teacher * (torch.log(p_teacher) - log_p_student), dim=-1)
+        kl_per_sample = torch.sum(p_t * (torch.log(p_t) - torch.log(p_s)), dim=-1)
         kl_per_sample = (self.temperature ** 2) * kl_per_sample
 
         if self.reduction == "mean":
@@ -169,18 +200,25 @@ class PrivilegedConsistencyTaskBLoss(nn.Module):
         lambda_c: float = 0.0,
         lambda_cons: float = 0.0
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        def _to_tensor(x):
+        def _to_probs(x):
             if isinstance(x, dict):
-                return x.get('compound_logits', x.get('probs'))
-            return x
+                if x.get('probs') is not None:
+                    return x['probs']
+                if x.get('log_probs') is not None:
+                    return torch.exp(x['log_probs'])
+                if x.get('logits') is not None:
+                    return F.softmax(x['logits'], dim=-1)
+                if x.get('compound_logits') is not None:
+                    return torch.exp(x['compound_logits'])
+            return F.softmax(x, dim=-1)
 
         if isinstance(logits_u, list):
             losses_u = [self.base_criterion(b, targets) for b in logits_u]
             loss_u = torch.mean(torch.stack(losses_u))
-            eval_logits_u = torch.mean(torch.stack([_to_tensor(b) for b in logits_u], dim=0), dim=0)
+            eval_probs_u = torch.mean(torch.stack([_to_probs(b) for b in logits_u], dim=0), dim=0)
         else:
             loss_u = self.base_criterion(logits_u, targets)
-            eval_logits_u = _to_tensor(logits_u)
+            eval_probs_u = _to_probs(logits_u)
 
         if logits_c is None or (lambda_c <= 0.0 and lambda_cons <= 0.0):
             return loss_u, {
@@ -193,12 +231,12 @@ class PrivilegedConsistencyTaskBLoss(nn.Module):
         if isinstance(logits_c, list):
             losses_c = [self.base_criterion(b, targets) for b in logits_c]
             loss_c = torch.mean(torch.stack(losses_c))
-            eval_logits_c = torch.mean(torch.stack([_to_tensor(b) for b in logits_c], dim=0), dim=0)
+            eval_probs_c = torch.mean(torch.stack([_to_probs(b) for b in logits_c], dim=0), dim=0)
         else:
             loss_c = self.base_criterion(logits_c, targets)
-            eval_logits_c = _to_tensor(logits_c)
+            eval_probs_c = _to_probs(logits_c)
 
-        loss_cons = self.kl_criterion(eval_logits_u, eval_logits_c)
+        loss_cons = self.kl_criterion(eval_probs_u, eval_probs_c)
         total_loss = loss_u + (lambda_c * loss_c) + (lambda_cons * loss_cons)
 
         return total_loss, {
@@ -367,43 +405,64 @@ class BinaryFocalLoss(nn.Module):
 
 class HierarchicalTaskBLoss(nn.Module):
     """
-    Multi-Task Conditional Hierarchical Loss with optional Focal Loss for Hate Speech Detection:
-        L_total = alpha * L_binary(is_hate) + beta * I_{is_hate=1} * L_fine(implicit vs explicit) + gamma * L_joint(3-class Focal/NLL)
+    Hierarchical Loss with Joint 3-Class Compound Objective as Primary,
+    and Decoupled Binary/Fine Heads as Auxiliary Regularization:
+        L_total = L_joint(3-class) + lambda_hate * L_binary(is_hate) + lambda_type * I_{is_hate=1} * L_fine(implicit vs explicit)
     """
     def __init__(
         self,
-        alpha: float = 0.50,
-        beta: float = 0.50,
-        gamma: float = 1.00,
+        lambda_hate: float = 0.20,
+        lambda_type: float = 0.20,
         use_focal: bool = True,
         focal_gamma: float = 2.0,
         class_weights: Optional[List[float]] = None,
-        label_smoothing: float = 0.05,
-        device: Optional[torch.device] = None
+        hate_pos_weight: Optional[float] = None,
+        type_pos_weight: Optional[float] = None,
+        label_smoothing: float = 0.0,
+        device: Optional[torch.device] = None,
+        # Backward-compatibility alias params
+        alpha: Optional[float] = None,
+        beta: Optional[float] = None,
+        gamma: Optional[float] = None
     ):
         super().__init__()
-        self.alpha = float(alpha)
-        self.beta = float(beta)
-        self.gamma = float(gamma)
+        # If legacy alpha/beta/gamma provided, normalize with gamma=1.0 as base
+        if alpha is not None:
+            self.lambda_hate = float(alpha)
+        else:
+            self.lambda_hate = float(lambda_hate)
+
+        if beta is not None:
+            self.lambda_type = float(beta)
+        else:
+            self.lambda_type = float(lambda_type)
+
         self.use_focal = use_focal
         self.label_smoothing = float(label_smoothing)
 
-        # Binary hate weight (w_hate / w_no)
-        pos_weight = None
-        if class_weights is not None and len(class_weights) >= 3:
-            w_no = class_weights[0]
-            w_hate = (class_weights[1] + class_weights[2]) / 2.0
-            pos_weight = torch.tensor([w_hate / max(1e-5, w_no)], dtype=torch.float32)
+        # 1. Clean & Controlled Weighting:
+        # 3-class weights are applied strictly to the primary joint loss.
+        # Auxiliary binary heads are unweighted by default to avoid double-weighting,
+        # unless explicitly specified via hate_pos_weight or type_pos_weight.
+        pos_weight_hate_tensor = None
+        if hate_pos_weight is not None:
+            pos_weight_hate_tensor = torch.tensor([hate_pos_weight], dtype=torch.float32)
             if device is not None:
-                pos_weight = pos_weight.to(device)
+                pos_weight_hate_tensor = pos_weight_hate_tensor.to(device)
+
+        pos_weight_type_tensor = None
+        if type_pos_weight is not None:
+            pos_weight_type_tensor = torch.tensor([type_pos_weight], dtype=torch.float32)
+            if device is not None:
+                pos_weight_type_tensor = pos_weight_type_tensor.to(device)
 
         if use_focal:
-            self.binary_hate_loss = BinaryFocalLoss(gamma=focal_gamma, pos_weight=pos_weight)
-            self.binary_fine_loss = BinaryFocalLoss(gamma=focal_gamma)
+            self.binary_hate_loss = BinaryFocalLoss(gamma=focal_gamma, pos_weight=pos_weight_hate_tensor)
+            self.binary_fine_loss = BinaryFocalLoss(gamma=focal_gamma, pos_weight=pos_weight_type_tensor)
             self.joint_loss = FocalLoss(gamma=focal_gamma, alpha=class_weights, label_smoothing=label_smoothing)
         else:
-            self.binary_hate_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-            self.binary_fine_loss = nn.BCEWithLogitsLoss()
+            self.binary_hate_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight_hate_tensor)
+            self.binary_fine_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight_type_tensor)
             self.joint_loss = None
 
     def forward(
@@ -418,37 +477,55 @@ class HierarchicalTaskBLoss(nn.Module):
             logit_hate = logits_or_dict['logit_hate'].squeeze(-1) # [B]
             logit_type = logits_or_dict['logit_type'].squeeze(-1) # [B]
             probs_3cls = logits_or_dict.get('probs')              # [B, 3]
-            compound_logits = logits_or_dict.get('compound_logits') # [B, 3]
+            log_probs = logits_or_dict.get('log_probs', logits_or_dict.get('compound_logits')) # [B, 3]
         else:
             # If standard 3-class logits passed, treat as joint
             return F.cross_entropy(logits_or_dict, targets, label_smoothing=self.label_smoothing)
 
-        # 1. Binary target: 0 for 'no', 1 for 'implicit' or 'explicit'
-        is_hate_target = (targets > 0).float()
-        l_binary = self.binary_hate_loss(logit_hate, is_hate_target)
-
-        # 2. Conditional fine-grained target: calculated ONLY on hateful samples (targets > 0)
-        # 1.0 for 'implicit' (targets==1), 0.0 for 'explicit' (targets==2)
-        hate_mask = (targets > 0)
-        if hate_mask.sum() > 0:
-            hate_sub_targets = (targets[hate_mask] == 1).float()
-            hate_sub_logits = logit_type[hate_mask]
-            l_fine = self.binary_fine_loss(hate_sub_logits, hate_sub_targets)
-        else:
-            l_fine = torch.tensor(0.0, device=targets.device, dtype=logit_type.dtype)
-
-        # 3. Compound 3-class joint loss (Focal or NLL)
-        if self.use_focal and compound_logits is not None:
-            l_joint = self.joint_loss(compound_logits, targets)
+        # 1. Primary Objective: Compound 3-Class Joint Loss
+        if self.use_focal and log_probs is not None:
+            l_joint = self.joint_loss(log_probs, targets)
+        elif log_probs is not None:
+            l_joint = F.nll_loss(log_probs, targets)
         elif probs_3cls is not None:
             eps = 1e-7
             probs_clamped = torch.clamp(probs_3cls, min=eps, max=1.0 - eps)
-            log_probs = torch.log(probs_clamped)
-            l_joint = F.nll_loss(log_probs, targets)
+            log_probs_fallback = torch.log(probs_clamped)
+            l_joint = F.nll_loss(log_probs_fallback, targets)
         else:
             l_joint = torch.tensor(0.0, device=targets.device)
 
-        total_loss = self.alpha * l_binary + self.beta * l_fine + self.gamma * l_joint
+        # 2. Auxiliary Level 1: Super-Class Binary Hate Loss
+        if self.lambda_hate > 0.0:
+            is_hate_target = (targets > 0).float()
+            l_binary = self.binary_hate_loss(logit_hate, is_hate_target)
+        else:
+            l_binary = torch.tensor(0.0, device=targets.device)
+
+        # 3. Auxiliary Level 2: Conditional Fine-Grained Implicit vs Explicit Loss
+        # Normalized by total batch size B to prevent disproportionate gradient scaling on low-hate batches
+        if self.lambda_type > 0.0:
+            hate_mask = (targets > 0)
+            if hate_mask.sum() > 0:
+                hate_sub_targets = (targets[hate_mask] == 1).float()
+                hate_sub_logits = logit_type[hate_mask]
+                # Compute sum over hateful samples, then divide by total batch size B for consistent scaling
+                if self.use_focal:
+                    p = torch.sigmoid(hate_sub_logits)
+                    eps = 1e-7
+                    p = torch.clamp(p, min=eps, max=1.0 - eps)
+                    p_t = p * hate_sub_targets + (1.0 - p) * (1.0 - hate_sub_targets)
+                    focal_weight = torch.pow(1.0 - p_t, 2.0)
+                    bce = F.binary_cross_entropy_with_logits(hate_sub_logits, hate_sub_targets, reduction='none')
+                    l_fine = (focal_weight * bce).sum() / float(targets.shape[0])
+                else:
+                    l_fine = F.binary_cross_entropy_with_logits(hate_sub_logits, hate_sub_targets, reduction='sum') / float(targets.shape[0])
+            else:
+                l_fine = torch.tensor(0.0, device=targets.device, dtype=logit_type.dtype)
+        else:
+            l_fine = torch.tensor(0.0, device=targets.device)
+
+        total_loss = l_joint + (self.lambda_hate * l_binary) + (self.lambda_type * l_fine)
         return total_loss
 
 
