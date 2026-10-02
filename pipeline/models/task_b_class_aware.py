@@ -84,7 +84,7 @@ class PretrainedCrossAttentionLayer(nn.Module):
         self.rotary_emb = rotary_emb or getattr(pretrained_attn, "rotary_emb", None)
 
         self.num_heads = getattr(pretrained_attn.config, "num_attention_heads", 12)
-        self.head_dim = getattr(pretrained_attn, "head_dim", 64)
+        self.head_dim = getattr(pretrained_attn.head_dim, "head_dim", getattr(pretrained_attn, "head_dim", 64))
         self.scaling = self.head_dim ** -0.5
 
     def forward(
@@ -135,7 +135,11 @@ class PretrainedCrossAttentionLayer(nn.Module):
         elif self.rotary_emb is not None:
             if position_ids is None:
                 position_ids = torch.arange(L, device=h_context.device).unsqueeze(0).expand(B, -1)
-            cos, sin = self.rotary_emb(v, position_ids)
+            try:
+                # ModernBERT expects layer_type="global" or "local"
+                cos, sin = self.rotary_emb(v, position_ids, layer_type="global")
+            except TypeError:
+                cos, sin = self.rotary_emb(v, position_ids)
             k = apply_rotary_pos_emb_single(k, cos, sin)
 
         # 4. Global Asymmetric Attention Matrix (Full Non-PAD Visibility)
@@ -378,11 +382,11 @@ class TaskBClassAwareAttentionModel(nn.Module):
        - If freeze_cross_projections=True: Explicitly freezes borrowed Wqkv and Wo in cross_layers.
        - Explicitly enables gradients ONLY on class_queries and scoring_head (and role_embeddings).
     4. Genuine H_17 Extraction:
-       - Computes position_embeddings via self.rotary_emb.
-       - Runs only Layers 1 to 17 (0:17) passing position_embeddings and attention_mask.
+       - Computes both global and local position_embeddings via self.rotary_emb(..., layer_type=...).
+       - Runs only Layers 1 to 17 (0:17) passing the corresponding layer_type position_embeddings.
     5. Pretrained Attention Borrowing Stack:
        - Exactly 5 layers (18 to 22, indices 17:22) applied sequentially to query latents Z.
-       - Asymmetric RoPE: Unrotated Q + Rotated K via the precomputed/callable rotary_emb.
+       - Asymmetric RoPE: Unrotated Q + Rotated K via the global position_embeddings.
     6. Hierarchical LogSigmoid Tree Head.
     """
     def __init__(
@@ -580,6 +584,17 @@ class TaskBClassAwareAttentionModel(nn.Module):
         if hasattr(self.norm_input, 'bias') and self.norm_input.bias is not None:
             self.norm_input.bias.requires_grad = self.train_role_embeddings
 
+    def _compute_pos_emb(self, inputs_embeds: torch.Tensor, position_ids: torch.Tensor, layer_type: str):
+        """Helper to invoke ModernBertRotaryEmbedding with layer_type parameter."""
+        try:
+            return self.rotary_emb(inputs_embeds, position_ids, layer_type=layer_type)
+        except TypeError:
+            try:
+                return self.rotary_emb(inputs_embeds, position_ids)
+            except Exception:
+                # If layer_type argument is positional
+                return self.rotary_emb(inputs_embeds, position_ids, layer_type)
+
     def extract_h17(
         self,
         inputs_embeds: torch.Tensor,
@@ -589,26 +604,38 @@ class TaskBClassAwareAttentionModel(nn.Module):
         Genuinely executes only layers 0 to cross_layer_start-1 (Layers 1 to 17)
         to extract H_17. Completely omits layers 18 to 22 and final_norm.
         
-        Properly computes position_embeddings via self.rotary_emb and passes them
-        into ModernBertEncoderLayer.forward(...) to avoid TypeError unpacking None.
+        ModernBERT uses alternating local vs global attention:
+          - global: i % 3 == 0 (layer_type="global")
+          - local: other layers (layer_type="local")
         """
         B, L, _ = inputs_embeds.shape
         position_ids = torch.arange(L, device=inputs_embeds.device).unsqueeze(0).expand(B, -1)
         
-        # Compute position embeddings required by ModernBert layers: (cos, sin)
-        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
+        # Precompute global and local position embeddings with explicit layer_type
+        global_pos_emb = self._compute_pos_emb(inputs_embeds, position_ids, layer_type="global")
+        local_pos_emb = self._compute_pos_emb(inputs_embeds, position_ids, layer_type="local")
 
         hidden_states = inputs_embeds
         for i in range(self.cross_layer_start):
             layer_module = self.encoder_layers[i]
+            
+            # Determine layer_type matching ModernBERT topology
+            layer_type = getattr(layer_module, "layer_type", None)
+            if layer_type is None:
+                attn_mod = getattr(layer_module, "attn", getattr(layer_module, "attention", None))
+                layer_type = getattr(attn_mod, "layer_type", "global" if (i % 3 == 0) else "local")
+            
+            pos_emb = global_pos_emb if layer_type == "global" else local_pos_emb
+
             layer_outputs = layer_module(
                 hidden_states,
                 attention_mask=attention_mask,
-                position_embeddings=position_embeddings
+                position_embeddings=pos_emb
             )
             hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
         
-        return hidden_states, position_embeddings
+        # Return H_17 and global_pos_emb for global cross-attention in layers 18 to 22
+        return hidden_states, global_pos_emb
 
     def forward(
         self,
@@ -655,7 +682,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
         inputs_embeds = self.norm_input(word_embeds + e_role)
         inputs_embeds = self.dropout_input(inputs_embeds)
 
-        # 2. Genuine H_17 Extraction (Pass through layers 1 to 17 only with position_embeddings)
+        # 2. Genuine H_17 Extraction (Pass through layers 1 to 17 with alternating layer_type pos_emb)
         if needs_grad:
             h_seq, pos_emb = self.extract_h17(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
         else:
@@ -667,7 +694,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
         if z.dtype != h_seq.dtype:
             z = z.to(h_seq.dtype)
 
-        # 4. Cross-Attention Sequential Processing (Layers 18 to 22)
+        # 4. Cross-Attention Sequential Processing (Layers 18 to 22, Global Asymmetric RoPE)
         last_attn_weights = None
         for cross_layer in self.cross_layers:
             z, last_attn_weights = cross_layer(
