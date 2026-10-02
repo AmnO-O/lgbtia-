@@ -90,7 +90,7 @@ class MultiSampleDropoutClassifier(nn.Module):
 
 class HierarchicalMSDClassifier(nn.Module):
     """
-    Hierarchical Conditional Multi-Sample Dropout Classification Head.
+    Hierarchical Conditional Multi-Sample Dropout Classification Head (Decoupled MSD).
     
     Branch 1 (Super-Class Binary Head):
         p_hate = sigmoid(W_h [h_T; h_C'] + b_h) in (0, 1) (No vs. Hate Speech)
@@ -106,10 +106,13 @@ class HierarchicalMSDClassifier(nn.Module):
         self,
         in_features: int,
         hidden_dim: int = 384,
+        use_msd: bool = True,
         dropout_rates: Optional[List[float]] = None,
+        single_dropout: float = 0.20,
         use_rmsnorm: bool = True
     ):
         super(HierarchicalMSDClassifier, self).__init__()
+        self.use_msd = use_msd
         self.dropout_rates = dropout_rates or [0.10, 0.15, 0.20, 0.25, 0.30]
         NormClass = RMSNorm if use_rmsnorm else nn.LayerNorm
 
@@ -117,14 +120,20 @@ class HierarchicalMSDClassifier(nn.Module):
         self.hate_pre_proj = nn.Linear(in_features, hidden_dim)
         self.hate_act = nn.GELU()
         self.hate_norm = NormClass(hidden_dim)
-        self.hate_dropouts = nn.ModuleList([nn.Dropout(p) for p in self.dropout_rates])
+        if self.use_msd:
+            self.hate_dropouts = nn.ModuleList([nn.Dropout(p) for p in self.dropout_rates])
+        else:
+            self.hate_single_dropout = nn.Dropout(single_dropout)
         self.hate_out_proj = nn.Linear(hidden_dim, 1)
 
         # 2. Fine-Grained Sub-Class Projection (Implicit vs Explicit)
         self.type_pre_proj = nn.Linear(in_features, hidden_dim)
         self.type_act = nn.GELU()
         self.type_norm = NormClass(hidden_dim)
-        self.type_dropouts = nn.ModuleList([nn.Dropout(p) for p in self.dropout_rates])
+        if self.use_msd:
+            self.type_dropouts = nn.ModuleList([nn.Dropout(p) for p in self.dropout_rates])
+        else:
+            self.type_single_dropout = nn.Dropout(single_dropout)
         self.type_out_proj = nn.Linear(hidden_dim, 1)
 
         # Initialize weights
@@ -140,7 +149,7 @@ class HierarchicalMSDClassifier(nn.Module):
         h_hate = self.hate_norm(self.hate_act(self.hate_pre_proj(x)))
         h_type = self.type_norm(self.type_act(self.type_pre_proj(x)))
 
-        if self.training:
+        if self.training and self.use_msd:
             outs = []
             for drop_h, drop_t in zip(self.hate_dropouts, self.type_dropouts):
                 logit_hate = self.hate_out_proj(drop_h(h_hate)) # [B, 1]
@@ -181,9 +190,13 @@ class HierarchicalMSDClassifier(nn.Module):
                 'compound_logits': avg_compound
             }
 
-        # Evaluation mode (deterministic)
-        logit_hate = self.hate_out_proj(h_hate)
-        logit_type = self.type_out_proj(h_type)
+        # Training (without MSD) or Evaluation mode
+        if self.training and not self.use_msd:
+            logit_hate = self.hate_out_proj(self.hate_single_dropout(h_hate))
+            logit_type = self.type_out_proj(self.type_single_dropout(h_type))
+        else:
+            logit_hate = self.hate_out_proj(h_hate)
+            logit_type = self.type_out_proj(h_type)
 
         p_hate = torch.sigmoid(logit_hate)
         p_imp = torch.sigmoid(logit_type)
@@ -196,12 +209,15 @@ class HierarchicalMSDClassifier(nn.Module):
         eps = 1e-7
         compound_logits = torch.log(torch.clamp(probs, min=eps, max=1.0 - eps))
 
-        return {
+        single_out = {
             'logit_hate': logit_hate,
             'logit_type': logit_type,
             'probs': probs,
             'compound_logits': compound_logits
         }
+        if return_all_msd_logits:
+            return [single_out]
+        return single_out
 
 
 class GatedCrossAttentionContextBlock(nn.Module):
@@ -336,7 +352,9 @@ class TaskBCrossContextAttentionModel(nn.Module):
             self.classifier = HierarchicalMSDClassifier(
                 in_features=2 * d_model,
                 hidden_dim=hidden_dim,
+                use_msd=use_msd,
                 dropout_rates=msd_dropout_rates,
+                single_dropout=dropout,
                 use_rmsnorm=use_rmsnorm
             )
         elif use_msd:
@@ -492,7 +510,7 @@ class TaskBCrossContextAttentionModel(nn.Module):
         h_desc = self.desc_norm(h_desc)
 
         # ==========================================================
-        # 3. VECTORIZED ASYMMETRIC CROSS-ATTENTION & GATING (ZERO GPU->CPU SYNC)
+        # 3. VECTORIZED PURE COMMENT EXTRACTION & ASYMMETRIC CROSS-ATTENTION (Q = H_C ONLY)
         # ==========================================================
         # Boolean key padding mask for PyTorch MultiheadAttention (True = Pad token to ignore)
         desc_pad_mask = (desc_attention_mask == 0) # [B, S_d]
@@ -502,23 +520,49 @@ class TaskBCrossContextAttentionModel(nn.Module):
         comment_mask = (tc_role_ids == ROLE_COMMENT) # [B, S_tc] (Boolean tensor)
         title_mask = (tc_role_ids == ROLE_TITLE)     # [B, S_tc] (Boolean tensor)
 
-        # Vectorized Cross-Attention: Q = h_tc, K = h_desc, V = h_desc
-        # Runs fully in parallel on GPU without Python per-sample loops or .item() syncs
-        h_fused_all, gate_all = self.cross_context(
-            h_comment=h_tc,
+        # 1. Pure Title representation: pooled directly from Title tokens in h_tc (no description cross-talk)
+        h_title_pooled = self.masked_mean_pool(h_tc, title_mask) # [B, d]
+
+        # 2. Vectorized Comment Token Extraction (NO Python loops, pure GPU tensor indexing):
+        # Because the structure is [CLS] Title... [SEP] Comment... [SEP] [PAD]...,
+        # the comment tokens form a contiguous slice for each sample.
+        # Compute start index and comment length per sample via cumulative masks:
+        is_before_comment = (torch.cumsum(comment_mask.long(), dim=1) == 0) & (~comment_mask)
+        c_start = is_before_comment.long().sum(dim=1) # [B]
+        c_lengths = comment_mask.long().sum(dim=1)    # [B]
+        max_sc = int(torch.clamp(c_lengths.max(), min=1).item())
+
+        # Vectorized gather indices: idx[b, j] = c_start[b] + j
+        j_range = torch.arange(max_sc, device=tc_input_ids.device).unsqueeze(0) # [1, max_sc]
+        gather_idx = c_start.unsqueeze(1) + j_range # [B, max_sc]
+        
+        # Clamp gather_idx to prevent out of bounds indexing on pad
+        max_valid_idx = h_tc.shape[1] - 1
+        gather_idx_clamped = torch.clamp(gather_idx, max=max_valid_idx)
+        
+        # Boolean mask of valid comment positions in [B, max_sc]
+        c_valid_mask = j_range < c_lengths.unsqueeze(1) # [B, max_sc]
+
+        # Gather pure Comment representations: H_C in [B, max_sc, d]
+        h_comment = torch.gather(
+            h_tc,
+            dim=1,
+            index=gather_idx_clamped.unsqueeze(-1).expand(-1, -1, self.d_model)
+        ) # [B, max_sc, d]
+
+        # Vectorized Cross-Attention: Q = H_C ONLY, K = H_Desc, V = H_Desc
+        h_comment_fused, gate = self.cross_context(
+            h_comment=h_comment,
             h_desc=h_desc,
             desc_key_padding_mask=desc_pad_mask,
             return_gate_values=return_gate_values
-        ) # [B, S_tc, d]
+        ) # [B, max_sc, d]
 
         # ==========================================================
         # 4. DUAL TOKEN POOLING & CONCATENATION
         # ==========================================================
-        # 1. Pure Title representation: pooled only from Title tokens in h_tc (no description cross-talk)
-        h_title_pooled = self.masked_mean_pool(h_tc, title_mask) # [B, d]
-
-        # 2. Context-infused Comment representation: pooled only from Comment tokens in h_fused_all
-        h_comment_pooled = self.masked_mean_pool(h_fused_all, comment_mask) # [B, d]
+        # Context-infused Comment representation: pooled only over valid comment tokens in h_comment_fused
+        h_comment_pooled = self.masked_mean_pool(h_comment_fused, c_valid_mask) # [B, d]
 
         # Joint Multi-Aspect Representation: z = RMSNorm([h_T; h_C']) [B, 2*d]
         z_fusion = torch.cat([h_title_pooled, h_comment_pooled], dim=-1)
@@ -555,7 +599,7 @@ class TaskBCrossContextAttentionModel(nn.Module):
                 out_logits = logits_output
 
         if return_gate_values:
-            # If gate values are requested for logging, mask only comment tokens
-            gate_masked = gate_all * comment_mask.unsqueeze(-1).float()
+            # If gate values are requested for logging, mask only valid comment tokens in [B, max_sc, d]
+            gate_masked = gate * c_valid_mask.unsqueeze(-1).float() if gate is not None else None
             return out_logits, gate_masked
         return out_logits
