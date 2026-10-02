@@ -8,7 +8,7 @@ from torch.utils.data import Dataset
 from .config import PipelineConfig
 from .data import safe_clean
 from .models.task_b_class_aware import (
-    ROLE_PAD, ROLE_TITLE, ROLE_DESC, ROLE_COMMENT, ROLE_HINT
+    ROLE_PAD, ROLE_TITLE, ROLE_DESC, ROLE_COMMENT, ROLE_SPECIAL
 )
 
 class TaskBAdditiveLatentDataset(Dataset):
@@ -104,28 +104,28 @@ class TaskBAdditiveLatentDataset(Dataset):
             d_ids = d_ids[:d_budget]
 
             seq_ids = [cls_id]
-            seq_roles = [ROLE_PAD]
+            seq_roles = [ROLE_SPECIAL]
 
             # 1. Comment
             if c_ids:
                 seq_ids.extend(c_ids)
                 seq_roles.extend([ROLE_COMMENT] * len(c_ids))
             seq_ids.append(sep_id)
-            seq_roles.append(ROLE_PAD)
+            seq_roles.append(ROLE_SPECIAL)
 
             # 2. Title
             if t_ids:
                 seq_ids.extend(t_ids)
                 seq_roles.extend([ROLE_TITLE] * len(t_ids))
             seq_ids.append(sep_id)
-            seq_roles.append(ROLE_PAD)
+            seq_roles.append(ROLE_SPECIAL)
 
             # 3. Description
             if d_ids:
                 seq_ids.extend(d_ids)
                 seq_roles.extend([ROLE_DESC] * len(d_ids))
             seq_ids.append(sep_id)
-            seq_roles.append(ROLE_PAD)
+            seq_roles.append(ROLE_SPECIAL)
 
             if len(seq_ids) > max_len:
                 seq_ids = seq_ids[:max_len]

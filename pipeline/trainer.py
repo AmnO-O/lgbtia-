@@ -128,7 +128,10 @@ class StereoQueerTrainer:
             total_val_loss += loss.item()
 
             st_list.append(torch.sigmoid(st_logits.squeeze(-1)).cpu().numpy())
-            hs_list.append(torch.argmax(hs_logits, dim=1).cpu().numpy())
+            if isinstance(hs_logits, dict):
+                hs_list.append(torch.argmax(hs_logits['probs'], dim=1).cpu().numpy())
+            else:
+                hs_list.append(torch.argmax(hs_logits, dim=1).cpu().numpy())
             tg_list.append(torch.sigmoid(tg_logits).cpu().numpy())
 
         avg_val_loss = total_val_loss / max(len(self.val_loader), 1)

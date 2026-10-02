@@ -23,6 +23,7 @@ from .data import safe_clean, DataPipeline
 ROLE_PAD = 0
 ROLE_TITLE = 1
 ROLE_COMMENT = 2
+ROLE_SPECIAL = 3
 
 
 class TaskBDualStreamDataset(Dataset):
@@ -87,7 +88,7 @@ class TaskBDualStreamDataset(Dataset):
 
         # Assemble token sequence: [CLS] + title_ids + [SEP] + comment_ids + [SEP]
         full_ids = [self.cls_token_id] + t_ids_trunc + [self.sep_token_id] + c_ids_trunc + [self.sep_token_id]
-        role_seq = [ROLE_TITLE] + [ROLE_TITLE] * len(t_ids_trunc) + [ROLE_TITLE] + [ROLE_COMMENT] * len(c_ids_trunc) + [ROLE_COMMENT]
+        role_seq = [ROLE_SPECIAL] + [ROLE_TITLE] * len(t_ids_trunc) + [ROLE_SPECIAL] + [ROLE_COMMENT] * len(c_ids_trunc) + [ROLE_SPECIAL]
 
         # Padding / Truncation
         seq_len = len(full_ids)
