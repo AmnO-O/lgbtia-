@@ -17,7 +17,8 @@ ROLE_TITLE = 1
 ROLE_DESC = 2
 ROLE_COMMENT = 3
 ROLE_SPECIAL = 4  # [CLS], [SEP] special delimiter tokens
-NUM_ROLES = 5
+ROLE_HINT = 5     # Optional teacher rationale tokens
+NUM_ROLES = 6
 
 
 class PureClassQueryScoringHead(nn.Module):
