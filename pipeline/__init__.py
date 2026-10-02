@@ -46,6 +46,7 @@ from .models.task_b_questions import (
 from .losses import (
     MultiTaskLoss,
     FocalLoss,
+    BinaryFocalLoss,
     build_loss_fn,
     UnidirectionalKLDivergenceLoss,
     PrivilegedConsistencyTaskBLoss,

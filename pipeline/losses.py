@@ -295,16 +295,63 @@ class MultiTaskLoss(nn.Module):
         return total, loss_dict
 
 
+class BinaryFocalLoss(nn.Module):
+    """
+    Binary Focal Loss for class imbalance and hard example mining:
+        FL(p_t) = - alpha_t * (1 - p_t)^gamma * log(p_t)
+    """
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        pos_weight: Optional[Union[float, torch.Tensor]] = None,
+        reduction: str = "mean"
+    ):
+        super().__init__()
+        self.gamma = float(gamma)
+        self.reduction = reduction
+        if pos_weight is not None:
+            if not isinstance(pos_weight, torch.Tensor):
+                pos_weight = torch.tensor([pos_weight], dtype=torch.float32)
+            self.register_buffer("pos_weight", pos_weight)
+        else:
+            self.pos_weight = None
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        p = torch.sigmoid(logits)
+        eps = 1e-7
+        p = torch.clamp(p, min=eps, max=1.0 - eps)
+
+        # p_t: probability of true class
+        p_t = p * targets + (1.0 - p) * (1.0 - targets)
+        focal_weight = torch.pow(1.0 - p_t, self.gamma)
+
+        bce = F.binary_cross_entropy_with_logits(
+            logits,
+            targets,
+            pos_weight=self.pos_weight.to(logits.device) if self.pos_weight is not None else None,
+            reduction='none'
+        )
+        loss = focal_weight * bce
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
 class HierarchicalTaskBLoss(nn.Module):
     """
-    Multi-Task Conditional Hierarchical Loss for Hate Speech Detection:
-        L_total = alpha * L_binary(is_hate) + beta * I_{is_hate=1} * L_fine(implicit vs explicit) + gamma * L_joint(3-class NLL)
+    Multi-Task Conditional Hierarchical Loss with optional Focal Loss for Hate Speech Detection:
+        L_total = alpha * L_binary(is_hate) + beta * I_{is_hate=1} * L_fine(implicit vs explicit) + gamma * L_joint(3-class Focal/NLL)
     """
     def __init__(
         self,
         alpha: float = 0.50,
         beta: float = 0.50,
         gamma: float = 1.00,
+        use_focal: bool = True,
+        focal_gamma: float = 2.0,
         class_weights: Optional[List[float]] = None,
         label_smoothing: float = 0.05,
         device: Optional[torch.device] = None
@@ -313,20 +360,26 @@ class HierarchicalTaskBLoss(nn.Module):
         self.alpha = float(alpha)
         self.beta = float(beta)
         self.gamma = float(gamma)
+        self.use_focal = use_focal
         self.label_smoothing = float(label_smoothing)
 
         # Binary hate weight (w_hate / w_no)
         pos_weight = None
         if class_weights is not None and len(class_weights) >= 3:
-            # class_weights: [no, implicit, explicit]
             w_no = class_weights[0]
             w_hate = (class_weights[1] + class_weights[2]) / 2.0
             pos_weight = torch.tensor([w_hate / max(1e-5, w_no)], dtype=torch.float32)
             if device is not None:
                 pos_weight = pos_weight.to(device)
 
-        self.bce_hate = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        self.bce_fine = nn.BCEWithLogitsLoss()
+        if use_focal:
+            self.binary_hate_loss = BinaryFocalLoss(gamma=focal_gamma, pos_weight=pos_weight)
+            self.binary_fine_loss = BinaryFocalLoss(gamma=focal_gamma)
+            self.joint_loss = FocalLoss(gamma=focal_gamma, alpha=class_weights, label_smoothing=label_smoothing)
+        else:
+            self.binary_hate_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            self.binary_fine_loss = nn.BCEWithLogitsLoss()
+            self.joint_loss = None
 
     def forward(
         self,
@@ -340,13 +393,14 @@ class HierarchicalTaskBLoss(nn.Module):
             logit_hate = logits_or_dict['logit_hate'].squeeze(-1) # [B]
             logit_type = logits_or_dict['logit_type'].squeeze(-1) # [B]
             probs_3cls = logits_or_dict.get('probs')              # [B, 3]
+            compound_logits = logits_or_dict.get('compound_logits') # [B, 3]
         else:
             # If standard 3-class logits passed, treat as joint
             return F.cross_entropy(logits_or_dict, targets, label_smoothing=self.label_smoothing)
 
         # 1. Binary target: 0 for 'no', 1 for 'implicit' or 'explicit'
         is_hate_target = (targets > 0).float()
-        l_binary = self.bce_hate(logit_hate, is_hate_target)
+        l_binary = self.binary_hate_loss(logit_hate, is_hate_target)
 
         # 2. Conditional fine-grained target: calculated ONLY on hateful samples (targets > 0)
         # 1.0 for 'implicit' (targets==1), 0.0 for 'explicit' (targets==2)
@@ -354,12 +408,14 @@ class HierarchicalTaskBLoss(nn.Module):
         if hate_mask.sum() > 0:
             hate_sub_targets = (targets[hate_mask] == 1).float()
             hate_sub_logits = logit_type[hate_mask]
-            l_fine = self.bce_fine(hate_sub_logits, hate_sub_targets)
+            l_fine = self.binary_fine_loss(hate_sub_logits, hate_sub_targets)
         else:
             l_fine = torch.tensor(0.0, device=targets.device, dtype=logit_type.dtype)
 
-        # 3. Compound 3-class joint NLL loss
-        if probs_3cls is not None:
+        # 3. Compound 3-class joint loss (Focal or NLL)
+        if self.use_focal and compound_logits is not None:
+            l_joint = self.joint_loss(compound_logits, targets)
+        elif probs_3cls is not None:
             eps = 1e-7
             probs_clamped = torch.clamp(probs_3cls, min=eps, max=1.0 - eps)
             log_probs = torch.log(probs_clamped)

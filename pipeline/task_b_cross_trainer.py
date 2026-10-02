@@ -130,10 +130,13 @@ class TaskBCrossTrainer:
 
         # Loss Function using build_loss_fn or HierarchicalTaskBLoss
         if getattr(self.model, 'use_hierarchical_head', False) or getattr(config, 'use_hierarchical_head', False):
+            use_focal = (getattr(config, 'loss_type', 'focal') == 'focal')
             self.criterion = HierarchicalTaskBLoss(
                 alpha=getattr(config, 'hierarchical_alpha', 0.50),
                 beta=getattr(config, 'hierarchical_beta', 0.50),
                 gamma=getattr(config, 'hierarchical_gamma', 1.00),
+                use_focal=use_focal,
+                focal_gamma=getattr(config, 'focal_gamma', 2.0),
                 class_weights=weights_to_use,
                 label_smoothing=getattr(config, 'label_smoothing', 0.05),
                 device=self.device
@@ -470,8 +473,15 @@ class TaskBCrossTrainer:
                     self.best_checkpoint_path = os.path.join(self.config.output_dir, "best_task_b_cross_model.pt")
                     torch.save(self.model.state_dict(), self.best_checkpoint_path)
                     print(f"    ⭐ New Best Task B Macro-F1: {macro_f1:.4f} -> Saved checkpoint.")
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        print(f"\n⚡ Phase 1 Early Transition: Linear probing converged after {patience} epochs without improvement -> Moving to Phase 2 Fine-Tuning.")
+                        break
 
         # PHASE 2: Differential Fine-Tuning
+        patience_counter = 0
         # Reload best model weights from Phase 1 to prevent carrying over overfitted weights
         if self.best_checkpoint_path and os.path.exists(self.best_checkpoint_path):
             print(f"  🔄 Restoring best Phase 1 checkpoint (Macro-F1: {self.best_macro_f1:.4f}) before fine-tuning...")
