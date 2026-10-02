@@ -32,8 +32,19 @@ def apply_rotary_pos_emb_single(tensor: torch.Tensor, cos: torch.Tensor, sin: to
     """
     Applies Rotary Position Embedding exclusively to a single multi-head tensor (e.g. Keys).
     tensor: [B, num_heads, L, head_dim]
-    cos, sin: [1, 1, L, head_dim] or [B, 1, L, head_dim]
+    cos, sin: [1, 1, L, head_dim] or [B, 1, L, head_dim] or [1, L, 1, head_dim]
     """
+    if cos.dim() == 4 and cos.shape[1] != tensor.shape[1] and cos.shape[2] == tensor.shape[2]:
+        # [B, 1, L, d_h] matching [B, H, L, d_h]
+        pass
+    elif cos.dim() == 4 and cos.shape[1] == tensor.shape[2] and cos.shape[2] == 1:
+        # [1, L, 1, d_h] -> transpose to [1, 1, L, d_h]
+        cos = cos.transpose(1, 2)
+        sin = sin.transpose(1, 2)
+    elif cos.dim() == 3:
+        # [1, L, d_h] or [B, L, d_h] -> [B, 1, L, d_h]
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
     return (tensor * cos) + (rotate_half(tensor) * sin)
 
 
@@ -54,6 +65,7 @@ class PretrainedCrossAttentionLayer(nn.Module):
     def __init__(
         self,
         pretrained_attn: nn.Module,
+        rotary_emb: Optional[nn.Module] = None,
         pretrained_norm: Optional[nn.Module] = None,
         use_prenorm: bool = False
     ):
@@ -61,15 +73,19 @@ class PretrainedCrossAttentionLayer(nn.Module):
         self.attn = pretrained_attn
         self.use_prenorm = use_prenorm
 
-        # Borrow pretrained projection layers directly (no new parameters initialized)
+        # Borrow pretrained projection layers directly
+        if not hasattr(pretrained_attn, 'Wqkv') or not hasattr(pretrained_attn, 'Wo'):
+            raise AttributeError("Target attention block must contain ModernBERT 'Wqkv' and 'Wo' projection matrices!")
+
         self.Wqkv = pretrained_attn.Wqkv
         self.Wo = pretrained_attn.Wo
 
         # Optional: Borrow pretrained LayerNorm / RMSNorm for Experiment B
         self.norm = pretrained_norm if use_prenorm else None
 
-        # Borrow rotary embedding module from base ModernBERT attention
-        self.rotary_emb = getattr(pretrained_attn, "rotary_emb", None)
+        # Resolve rotary embedding module: explicitly passed from parent ModernBertModel
+        # or fallback to attribute if present
+        self.rotary_emb = rotary_emb or getattr(pretrained_attn, "rotary_emb", None)
 
         self.num_heads = getattr(pretrained_attn.config, "num_attention_heads", 12)
         self.head_dim = getattr(pretrained_attn, "head_dim", 64)
@@ -100,21 +116,14 @@ class PretrainedCrossAttentionLayer(nn.Module):
         h_in = self.norm(h_context) if (self.use_prenorm and self.norm is not None) else h_context
 
         # 1. Chunk fused ModernBERT Wqkv weight [3D, D] into Q, K, V [D, D]
-        if hasattr(self.Wqkv, 'weight'):
-            q_weight, k_weight, v_weight = self.Wqkv.weight.chunk(3, dim=0)
-            q_bias = k_bias = v_bias = None
-            if getattr(self.Wqkv, 'bias', None) is not None:
-                q_bias, k_bias, v_bias = self.Wqkv.bias.chunk(3, dim=0)
+        q_weight, k_weight, v_weight = self.Wqkv.weight.chunk(3, dim=0)
+        q_bias = k_bias = v_bias = None
+        if getattr(self.Wqkv, 'bias', None) is not None:
+            q_bias, k_bias, v_bias = self.Wqkv.bias.chunk(3, dim=0)
 
-            q = F.linear(z_in, q_weight, q_bias)       # [B, K, D]
-            k = F.linear(h_in, k_weight, k_bias)       # [B, L, D]
-            v = F.linear(h_in, v_weight, v_bias)       # [B, L, D]
-        else:
-            # Fallback if Wqkv is already split or callable
-            qkv = self.Wqkv(h_in)
-            q = F.linear(z_in, self.Wqkv.weight[:D])
-            k = qkv[..., D:2*D]
-            v = qkv[..., 2*D:]
+        q = F.linear(z_in, q_weight, q_bias)       # [B, K, D]
+        k = F.linear(h_in, k_weight, k_bias)       # [B, L, D]
+        v = F.linear(h_in, v_weight, v_bias)       # [B, L, D]
 
         # 2. Reshape into Multi-Head format [B, num_heads, SeqLen, head_dim]
         q = q.contiguous().view(B, K, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, K, d_h]
@@ -125,24 +134,13 @@ class PretrainedCrossAttentionLayer(nn.Module):
         if self.rotary_emb is not None:
             if position_ids is None:
                 position_ids = torch.arange(L, device=h_context.device).unsqueeze(0).expand(B, -1)
-            try:
-                # ModernBERT signature: rotary_emb(value_states, position_ids)
-                cos, sin = self.rotary_emb(v, position_ids)
-                if cos.dim() == 3:
-                    cos = cos.unsqueeze(1)
-                    sin = sin.unsqueeze(1)
-                elif cos.dim() == 2:
-                    cos = cos.unsqueeze(0).unsqueeze(1)
-                    sin = sin.unsqueeze(0).unsqueeze(1)
-                k = apply_rotary_pos_emb_single(k, cos, sin)
-            except Exception:
-                # Fallback if custom signature
-                pass
+            # ModernBERT RotaryEmbedding signature: rotary_emb(v, position_ids)
+            cos, sin = self.rotary_emb(v, position_ids)
+            k = apply_rotary_pos_emb_single(k, cos, sin)
 
         # 4. Global Asymmetric Attention Matrix (Full Non-PAD Visibility)
         scores = torch.matmul(q, k.transpose(-1, -2)) * self.scaling  # [B, H, K, L]
         if context_mask is not None:
-            # Mask out PAD tokens: shape [B, 1, 1, L]
             mask_4d = (1.0 - context_mask.unsqueeze(1).unsqueeze(2).to(scores.dtype)) * -10000.0
             scores = scores + mask_4d
 
@@ -153,7 +151,7 @@ class PretrainedCrossAttentionLayer(nn.Module):
         # 5. Pretrained Wo Linear Projection with Residual Connection
         z_out = z + self.Wo(attn_out)
         
-        # Average attention across heads for interpretability / inspection: [B, K, L]
+        # Average attention across heads for interpretability: [B, K, L]
         avg_attn = attn_weights.mean(dim=1)
         return z_out, avg_attn
 
@@ -371,13 +369,20 @@ class TaskBClassAwareAttentionModel(nn.Module):
     Task B Specialized Architecture with Pretrained Attention Weight Borrowing:
     
     1. Layer 0: Context Role Injection (PAD=0, Title=1, Desc=2, Comment=3, Special=4).
-    2. Backbone Pass: ModernBERT Layers 1 to 17 extract deep contextual features H_17.
-    3. Trainable Query Probes: Z_0 = [q_no, q_implicit, q_explicit] (Position-Free).
-    4. Pretrained Cross-Attention Stack (Layers 18 to 22):
-       - Repurposes frozen/trainable pretrained projection matrices W_qkv and W_o.
-       - Asymmetric RoPE: Unrotated Q + Rotated K.
-       - Full Non-PAD visibility across context.
-    5. Hierarchical Two-Head LogSigmoid Classifier.
+    2. Strict Layer Resolution:
+       - Directly inspects `.model.layers` (AutoModelForMaskedLM / ModernBertModel) or `.layers`.
+       - Enforces exactly 22 pretrained layers.
+       - Discovers `rotary_emb` on ModernBertModel and forwards to all borrowed cross-attention layers.
+    3. Parameter Freeze Enforcement (Scientific Control):
+       - If freeze_backbone=True: Freezes entire mmBERT backbone.
+       - If freeze_cross_projections=True: Explicitly freezes borrowed Wqkv and Wo in cross_layers.
+       - Explicitly enables gradients ONLY on class_queries and scoring_head (and role_embeddings).
+    4. Genuine H_17 Extraction:
+       - Runs only Layers 1 to 17 (0:17) to produce H_17.
+    5. Pretrained Attention Borrowing Stack:
+       - Exactly 5 layers (18 to 22, indices 17:22) applied sequentially to query latents Z.
+       - Asymmetric RoPE: Unrotated Q + Rotated K via the genuine ModernBertRotaryEmbedding.
+    6. Hierarchical LogSigmoid Tree Head.
     """
     def __init__(
         self,
@@ -393,8 +398,11 @@ class TaskBClassAwareAttentionModel(nn.Module):
         use_rmsnorm: bool = True,
         use_msd: bool = True,
         msd_dropout_rates: Optional[List[float]] = None,
-        cross_layer_start: int = 17, # Zero-based: layer index 17 is Layer 18
+        cross_layer_start: int = 17, # Zero-based: index 17 corresponds to Layer 18
         use_prenorm: bool = False,
+        freeze_cross_projections: bool = True, # Enforce frozen borrowed Wqkv, Wo
+        freeze_backbone: bool = True,           # Enforce frozen backbone for Stage 1
+        train_role_embeddings: bool = True,     # Role embedding trainability control
         **kwargs
     ):
         super(TaskBClassAwareAttentionModel, self).__init__()
@@ -410,9 +418,54 @@ class TaskBClassAwareAttentionModel(nn.Module):
         self.use_msd = use_msd
         self.cross_layer_start = cross_layer_start
         self.use_prenorm = use_prenorm
+        self.freeze_cross_projections = freeze_cross_projections
+        self.freeze_backbone = freeze_backbone
+        self.train_role_embeddings = train_role_embeddings
         hidden_dim = hidden_dim or (d_model // 2)
 
         NormClass = RMSNorm if use_rmsnorm else nn.LayerNorm
+
+        # ---------------------------------------------------------------------
+        # 1. STRICT LAYER RESOLUTION & ROTARY EMBEDDING DISCOVERY
+        # ---------------------------------------------------------------------
+        base_model = mmbert_model
+        if hasattr(base_model, "model") and hasattr(base_model.model, "layers"):
+            base_model = base_model.model
+        elif hasattr(base_model, "encoder") and hasattr(base_model.encoder, "layers"):
+            base_model = base_model.encoder
+        elif hasattr(base_model, "layers"):
+            pass
+        else:
+            raise TypeError(
+                "Scientific Integrity Check Failed: Expected a ModernBERT/mmBERT backbone "
+                "exposing `.model.layers`, `.encoder.layers`, or `.layers`."
+            )
+
+        self.encoder_layers = base_model.layers
+        total_layers = len(self.encoder_layers)
+        if total_layers != 22:
+            raise ValueError(
+                f"Scientific Integrity Check Failed: Expected exactly 22 ModernBERT layers, got {total_layers}."
+            )
+
+        # Locate rotary_emb on parent ModernBertModel / mmBERT backbone
+        rotary_emb = None
+        for candidate in [base_model, mmbert_model, getattr(mmbert_model, "model", None)]:
+            if candidate is not None and hasattr(candidate, "rotary_emb") and getattr(candidate, "rotary_emb") is not None:
+                rotary_emb = getattr(candidate, "rotary_emb")
+                break
+
+        # Fallback inspection on first attention layer if model-level attribute is absent
+        if rotary_emb is None and len(self.encoder_layers) > 0:
+            first_attn = getattr(self.encoder_layers[0], 'attn', getattr(self.encoder_layers[0], 'attention', None))
+            rotary_emb = getattr(first_attn, 'rotary_emb', None)
+
+        if rotary_emb is None:
+            raise AttributeError(
+                "Scientific Integrity Check Failed: Cannot locate ModernBERT 'rotary_emb' module "
+                "on backbone. Keys (K) require genuine RoPE to preserve contextual token geometry!"
+            )
+        self.rotary_emb = rotary_emb
 
         # ---------------------------------------------------------------------
         # LAYER 0: Context Role Embeddings (PAD=0, Title=1, Desc=2, Comment=3, Special=4)
@@ -432,46 +485,26 @@ class TaskBClassAwareAttentionModel(nn.Module):
         self.query_embeddings = self.class_queries
 
         # ---------------------------------------------------------------------
-        # LAYER 2: Pretrained Attention Weight Borrowing Stack (Layers 18 to 22)
+        # LAYER 2: Extract Exactly Layers 18 to 22 (Indices 17 to 21)
         # ---------------------------------------------------------------------
+        target_layers = self.encoder_layers[cross_layer_start:22]
+        if len(target_layers) != 5:
+            raise ValueError(f"Expected exactly 5 target borrowed layers, got {len(target_layers)}")
+
         self.cross_layers = nn.ModuleList()
-        
-        # Locate backbone encoder layers (ModernBERT 'layers' or BERT 'layer')
-        encoder_layers = None
-        if hasattr(self.mmbert, 'encoder') and hasattr(self.mmbert.encoder, 'layers'):
-            encoder_layers = self.mmbert.encoder.layers
-        elif hasattr(self.mmbert, 'layers'):
-            encoder_layers = self.mmbert.layers
-        elif hasattr(self.mmbert, 'encoder') and hasattr(self.mmbert.encoder, 'layer'):
-            encoder_layers = self.mmbert.encoder.layer
+        for layer in target_layers:
+            attn_mod = getattr(layer, 'attn', getattr(layer, 'attention', None))
+            norm_mod = getattr(layer, 'attn_norm', getattr(layer, 'input_layernorm', None))
+            if attn_mod is None or not hasattr(attn_mod, 'Wqkv') or not hasattr(attn_mod, 'Wo'):
+                raise AttributeError("Target layer missing required ModernBERT 'Wqkv' or 'Wo' attention weights!")
 
-        self.has_borrowed_layers = False
-        if encoder_layers is not None and len(encoder_layers) > cross_layer_start:
-            target_layers = encoder_layers[cross_layer_start:]
-            for layer in target_layers:
-                attn_mod = getattr(layer, 'attn', getattr(layer, 'attention', None))
-                norm_mod = getattr(layer, 'attn_norm', getattr(layer, 'input_layernorm', None))
-                if attn_mod is not None and hasattr(attn_mod, 'Wqkv'):
-                    cross_mod = PretrainedCrossAttentionLayer(
-                        pretrained_attn=attn_mod,
-                        pretrained_norm=norm_mod,
-                        use_prenorm=use_prenorm
-                    )
-                    self.cross_layers.append(cross_mod)
-            if len(self.cross_layers) > 0:
-                self.has_borrowed_layers = True
-
-        # Fallback multihead attention if backbone does not expose Wqkv directly
-        if not self.has_borrowed_layers:
-            self.norm_q = NormClass(d_model)
-            self.norm_kv = NormClass(d_model)
-            self.cross_attention = nn.MultiheadAttention(
-                embed_dim=d_model,
-                num_heads=num_heads,
-                dropout=dropout,
-                batch_first=True
+            cross_mod = PretrainedCrossAttentionLayer(
+                pretrained_attn=attn_mod,
+                rotary_emb=self.rotary_emb,
+                pretrained_norm=norm_mod,
+                use_prenorm=use_prenorm
             )
-            self.dropout_cross = nn.Dropout(dropout)
+            self.cross_layers.append(cross_mod)
 
         # ---------------------------------------------------------------------
         # LAYER 3: Optional Inter-Class Query Self-Interaction
@@ -508,6 +541,61 @@ class TaskBClassAwareAttentionModel(nn.Module):
                 use_rmsnorm=use_rmsnorm
             )
 
+        # ---------------------------------------------------------------------
+        # 2. ENFORCE SCIENTIFIC FREEZING RULES
+        # ---------------------------------------------------------------------
+        self.enforce_freeze_rules()
+
+    def enforce_freeze_rules(self):
+        """
+        Enforces clean separation between frozen pretrained projections
+        and trainable query directions.
+        """
+        if self.freeze_backbone:
+            for p in self.mmbert.parameters():
+                p.requires_grad = False
+
+        if self.freeze_cross_projections:
+            for layer in self.cross_layers:
+                for p in layer.Wqkv.parameters():
+                    p.requires_grad = False
+                for p in layer.Wo.parameters():
+                    p.requires_grad = False
+                if layer.norm is not None:
+                    for p in layer.norm.parameters():
+                        p.requires_grad = False
+
+        # Explicitly enable gradients for trainable components
+        self.class_queries.requires_grad = True
+        for p in self.scoring_head.parameters():
+            p.requires_grad = True
+
+        if hasattr(self, 'self_attention'):
+            for p in self.self_attention.parameters():
+                p.requires_grad = True
+
+        self.role_embeddings.weight.requires_grad = self.train_role_embeddings
+        self.norm_input.weight.requires_grad = self.train_role_embeddings
+        if hasattr(self.norm_input, 'bias') and self.norm_input.bias is not None:
+            self.norm_input.bias.requires_grad = self.train_role_embeddings
+
+    def extract_h17(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Genuinely executes only layers 0 to cross_layer_start-1 (Layers 1 to 17)
+        to extract H_17. Completely omits layers 18 to 22 and final_norm.
+        """
+        hidden_states = inputs_embeds
+        for i in range(self.cross_layer_start):
+            layer_module = self.encoder_layers[i]
+            layer_outputs = layer_module(hidden_states, attention_mask=attention_mask)
+            hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
+        
+        return hidden_states
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -531,76 +619,50 @@ class TaskBClassAwareAttentionModel(nn.Module):
         role_trainable = self.role_embeddings.weight.requires_grad
         needs_grad = torch.is_grad_enabled() and (backbone_trainable or role_trainable)
 
-        can_inject_embeds = (
-            hasattr(self.mmbert, 'get_input_embeddings')
-            and callable(getattr(self.mmbert, 'get_input_embeddings'))
-            and self.mmbert.get_input_embeddings() is not None
-        )
+        # Retrieve embedding module
+        embed_fn = None
+        if hasattr(self.mmbert, 'get_input_embeddings') and callable(self.mmbert.get_input_embeddings()):
+            embed_fn = self.mmbert.get_input_embeddings()
+        elif hasattr(self.mmbert, 'model') and hasattr(self.mmbert.model, 'embeddings'):
+            embed_fn = self.mmbert.model.embeddings
+        elif hasattr(self.mmbert, 'embeddings'):
+            embed_fn = self.mmbert.embeddings
 
-        if can_inject_embeds:
-            if not backbone_trainable:
-                with torch.no_grad():
-                    word_embeds = self.mmbert.get_input_embeddings()(input_ids)
-            else:
-                word_embeds = self.mmbert.get_input_embeddings()(input_ids)
+        if embed_fn is None:
+            raise AttributeError("Cannot locate input embeddings in backbone model!")
 
-            e_role = self.role_embeddings(role_ids)
-            inputs_embeds = self.norm_input(word_embeds + e_role)
-            inputs_embeds = self.dropout_input(inputs_embeds)
-
-            if needs_grad:
-                h_seq = self.mmbert(inputs_embeds=inputs_embeds, attention_mask=attention_mask).last_hidden_state
-            else:
-                with torch.no_grad():
-                    h_seq = self.mmbert(inputs_embeds=inputs_embeds, attention_mask=attention_mask).last_hidden_state
+        if not backbone_trainable:
+            with torch.no_grad():
+                word_embeds = embed_fn(input_ids)
         else:
-            if needs_grad:
-                h_seq = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-            else:
-                with torch.no_grad():
-                    h_seq = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+            word_embeds = embed_fn(input_ids)
 
-        # 2. Expand Class Prototype Queries: Z_0 [B, total_queries, d_model]
+        e_role = self.role_embeddings(role_ids)
+        inputs_embeds = self.norm_input(word_embeds + e_role)
+        inputs_embeds = self.dropout_input(inputs_embeds)
+
+        # 2. Genuine H_17 Extraction (Pass through layers 1 to 17 only)
+        if needs_grad:
+            h_seq = self.extract_h17(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+        else:
+            with torch.no_grad():
+                h_seq = self.extract_h17(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+
+        # 3. Expand Class Prototype Queries: Z_0 [B, total_queries, d_model]
         z = self.class_queries.unsqueeze(0).expand(B, -1, -1).contiguous()
         if z.dtype != h_seq.dtype:
             z = z.to(h_seq.dtype)
 
-        # 3. Cross-Attention Processing (Borrowed Stack or Fallback)
+        # 4. Cross-Attention Sequential Processing (Layers 18 to 22)
         last_attn_weights = None
-        if self.has_borrowed_layers and len(self.cross_layers) > 0:
-            for cross_layer in self.cross_layers:
-                z, last_attn_weights = cross_layer(
-                    z=z,
-                    h_context=h_seq,
-                    context_mask=attention_mask
-                )
-        else:
-            # Fallback standard cross-attention
-            q_normed = self.norm_q(z)
-            kv_normed = self.norm_kv(h_seq)
-            key_padding_mask = (attention_mask == 0)
+        for cross_layer in self.cross_layers:
+            z, last_attn_weights = cross_layer(
+                z=z,
+                h_context=h_seq,
+                context_mask=attention_mask
+            )
 
-            if return_attention_map:
-                z_attn, last_attn_weights = self.cross_attention(
-                    query=q_normed,
-                    key=kv_normed,
-                    value=kv_normed,
-                    key_padding_mask=key_padding_mask,
-                    need_weights=True,
-                    average_attn_weights=True
-                )
-            else:
-                z_attn, _ = self.cross_attention(
-                    query=q_normed,
-                    key=kv_normed,
-                    value=kv_normed,
-                    key_padding_mask=key_padding_mask,
-                    need_weights=False
-                )
-                last_attn_weights = None
-            z = (z + self.dropout_cross(z_attn)).contiguous()
-
-        # 4. Optional Inter-Class Query Self-Interaction
+        # 5. Optional Inter-Class Query Self-Interaction
         if self.use_query_interaction and self.total_queries > 1:
             z_normed = self.norm_self(z)
             z_self, _ = self.self_attention(
@@ -611,19 +673,19 @@ class TaskBClassAwareAttentionModel(nn.Module):
             )
             z = (z + self.dropout_self(z_self)).contiguous()
 
-        # 5. Slot Aggregation (if num_slots_per_class > 1)
+        # 6. Slot Aggregation (if num_slots_per_class > 1)
         if self.num_slots_per_class == 1:
             z_classes = z.contiguous().reshape(B, self.num_classes, self.d_model)
         else:
             z_classes = z.contiguous().reshape(B, self.num_classes, self.num_slots_per_class, self.d_model).mean(dim=2)
 
-        # 6. Classification Head Readout
+        # 7. Classification Head Readout
         out_logits = self.scoring_head(
             z_classes=z_classes,
             return_all_msd_logits=return_all_msd_logits
         )
 
-        # 7. Task C Latent Bridge (Probability-Weighted Blend)
+        # 8. Task C Latent Bridge (Probability-Weighted Blend)
         if isinstance(out_logits, dict):
             probs = out_logits['probs']
         elif isinstance(out_logits, list):
