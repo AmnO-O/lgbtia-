@@ -31,7 +31,17 @@ class FocalLoss(nn.Module):
         else:
             self.alpha = None
 
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: Union[torch.Tensor, Dict[str, torch.Tensor]], targets: torch.Tensor) -> torch.Tensor:
+        if isinstance(inputs, dict):
+            if 'compound_logits' in inputs and inputs['compound_logits'] is not None:
+                inputs = inputs['compound_logits']
+            elif 'probs' in inputs and inputs['probs'] is not None:
+                eps = 1e-7
+                probs_clamped = torch.clamp(inputs['probs'], min=eps, max=1.0 - eps)
+                inputs = torch.log(probs_clamped)
+            elif 'logits' in inputs:
+                inputs = inputs['logits']
+
         B, C = inputs.shape
         log_p = F.log_softmax(inputs, dim=-1)
         p = torch.exp(log_p)
@@ -86,7 +96,17 @@ class LabelSmoothingCrossEntropy(nn.Module):
         else:
             self.weights = None
 
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: Union[torch.Tensor, Dict[str, torch.Tensor]], targets: torch.Tensor) -> torch.Tensor:
+        if isinstance(inputs, dict):
+            if 'compound_logits' in inputs and inputs['compound_logits'] is not None:
+                inputs = inputs['compound_logits']
+            elif 'probs' in inputs and inputs['probs'] is not None:
+                eps = 1e-7
+                probs_clamped = torch.clamp(inputs['probs'], min=eps, max=1.0 - eps)
+                inputs = torch.log(probs_clamped)
+            elif 'logits' in inputs:
+                inputs = inputs['logits']
+
         return F.cross_entropy(
             inputs,
             targets,
@@ -143,19 +163,24 @@ class PrivilegedConsistencyTaskBLoss(nn.Module):
 
     def forward(
         self,
-        logits_u: Union[torch.Tensor, List[torch.Tensor]],
+        logits_u: Union[torch.Tensor, Dict[str, torch.Tensor], List[Union[torch.Tensor, Dict[str, torch.Tensor]]]],
         targets: torch.Tensor,
-        logits_c: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        logits_c: Optional[Union[torch.Tensor, Dict[str, torch.Tensor], List[Union[torch.Tensor, Dict[str, torch.Tensor]]]]] = None,
         lambda_c: float = 0.0,
         lambda_cons: float = 0.0
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        def _to_tensor(x):
+            if isinstance(x, dict):
+                return x.get('compound_logits', x.get('probs'))
+            return x
+
         if isinstance(logits_u, list):
             losses_u = [self.base_criterion(b, targets) for b in logits_u]
             loss_u = torch.mean(torch.stack(losses_u))
-            eval_logits_u = torch.mean(torch.stack(logits_u, dim=0), dim=0)
+            eval_logits_u = torch.mean(torch.stack([_to_tensor(b) for b in logits_u], dim=0), dim=0)
         else:
             loss_u = self.base_criterion(logits_u, targets)
-            eval_logits_u = logits_u
+            eval_logits_u = _to_tensor(logits_u)
 
         if logits_c is None or (lambda_c <= 0.0 and lambda_cons <= 0.0):
             return loss_u, {
@@ -168,10 +193,10 @@ class PrivilegedConsistencyTaskBLoss(nn.Module):
         if isinstance(logits_c, list):
             losses_c = [self.base_criterion(b, targets) for b in logits_c]
             loss_c = torch.mean(torch.stack(losses_c))
-            eval_logits_c = torch.mean(torch.stack(logits_c, dim=0), dim=0)
+            eval_logits_c = torch.mean(torch.stack([_to_tensor(b) for b in logits_c], dim=0), dim=0)
         else:
             loss_c = self.base_criterion(logits_c, targets)
-            eval_logits_c = logits_c
+            eval_logits_c = _to_tensor(logits_c)
 
         loss_cons = self.kl_criterion(eval_logits_u, eval_logits_c)
         total_loss = loss_u + (lambda_c * loss_c) + (lambda_cons * loss_cons)

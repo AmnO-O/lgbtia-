@@ -229,7 +229,16 @@ class TaskBTrainer:
                 )
 
             with torch.no_grad():
-                eval_logits = torch.mean(torch.stack(logits_u, dim=0), dim=0) if isinstance(logits_u, list) else logits_u
+                if isinstance(logits_u, list):
+                    if isinstance(logits_u[0], dict):
+                        eval_logits = torch.mean(torch.stack([o.get('compound_logits', o.get('probs')) for o in logits_u], dim=0), dim=0)
+                    else:
+                        eval_logits = torch.mean(torch.stack(logits_u, dim=0), dim=0)
+                elif isinstance(logits_u, dict):
+                    eval_logits = logits_u.get('compound_logits', logits_u.get('probs'))
+                else:
+                    eval_logits = logits_u
+
                 preds = torch.argmax(eval_logits, dim=-1)
                 all_train_preds.append(preds.detach().cpu().numpy())
                 all_train_targets.append(hs_labels.detach().cpu().numpy())
@@ -343,7 +352,13 @@ class TaskBTrainer:
                     loss, _ = self.criterion(logits_u=logits, targets=hs_labels)
 
                 total_loss += loss.item()
-                probs = F.softmax(logits, dim=-1)
+                if isinstance(logits, dict):
+                    if 'probs' in logits:
+                        probs = logits['probs']
+                    else:
+                        probs = F.softmax(logits.get('compound_logits', logits.get('logits')), dim=-1)
+                else:
+                    probs = F.softmax(logits, dim=-1)
                 preds = torch.argmax(probs, dim=-1)
 
                 all_preds.extend(preds.cpu().numpy())
