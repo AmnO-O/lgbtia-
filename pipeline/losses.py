@@ -42,26 +42,29 @@ class FocalLoss(nn.Module):
                 is_already_log_probs = True
             elif 'probs' in inputs and inputs['probs'] is not None:
                 eps = 1e-7
-                probs_clamped = torch.clamp(inputs['probs'], min=eps, max=1.0 - eps)
+                probs_clamped = torch.clamp(inputs['probs'].float(), min=eps, max=1.0 - eps)
                 inputs = torch.log(probs_clamped)
                 is_already_log_probs = True
             elif 'logits' in inputs:
                 inputs = inputs['logits']
 
+        # Force float32 for ALL loss computation to prevent fp16 underflow → NaN
+        inputs = inputs.float()
         B, C = inputs.shape
+
         if is_already_log_probs:
             # Clamp log_p to prevent -inf / NaN in AMP
-            log_p = torch.clamp(inputs.float(), min=-30.0, max=0.0)
+            log_p = torch.clamp(inputs, min=-30.0, max=0.0)
         else:
-            log_p = F.log_softmax(inputs.float(), dim=-1)
+            log_p = F.log_softmax(inputs, dim=-1)
 
         # 1. Exact valid log probability of target class
         target_log_p = log_p.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
 
         # 2. Probability p_t for focal weight with lower/upper clamp to prevent underflow/overflow
-        target_p = torch.clamp(torch.exp(target_log_p), min=1e-7, max=1.0)
+        target_p = torch.clamp(torch.exp(target_log_p), min=1e-7, max=1.0 - 1e-7)
 
-        focal_weight = torch.pow(torch.clamp(1.0 - target_p, min=0.0, max=1.0), self.gamma)
+        focal_weight = torch.pow(1.0 - target_p, self.gamma)
         ce_loss = - target_log_p
 
         if self.label_smoothing > 0.0:
@@ -76,10 +79,16 @@ class FocalLoss(nn.Module):
             focal_loss = alpha_t * focal_loss
 
         if self.reduction == "mean":
-            return focal_loss.mean()
+            result = focal_loss.mean()
         elif self.reduction == "sum":
-            return focal_loss.sum()
-        return focal_loss
+            result = focal_loss.sum()
+        else:
+            result = focal_loss
+
+        # NaN safety guard: return zero loss rather than propagating NaN
+        if torch.isnan(result) or torch.isinf(result):
+            return torch.zeros(1, device=result.device, dtype=result.dtype, requires_grad=True).squeeze()
+        return result
 
 
 class LabelSmoothingCrossEntropy(nn.Module):

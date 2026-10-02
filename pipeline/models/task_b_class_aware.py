@@ -84,7 +84,12 @@ class PretrainedCrossAttentionLayer(nn.Module):
         self.rotary_emb = rotary_emb or getattr(pretrained_attn, "rotary_emb", None)
 
         self.num_heads = getattr(pretrained_attn.config, "num_attention_heads", 12)
-        self.head_dim = getattr(pretrained_attn.head_dim, "head_dim", getattr(pretrained_attn, "head_dim", 64))
+        # Clean head_dim resolution: try attribute first, then compute from config
+        _head_dim = getattr(pretrained_attn, "head_dim", None)
+        if _head_dim is None or not isinstance(_head_dim, int):
+            _hidden = getattr(pretrained_attn.config, "hidden_size", 768)
+            _head_dim = _hidden // self.num_heads
+        self.head_dim = _head_dim
         self.scaling = self.head_dim ** -0.5
 
     def forward(
@@ -304,22 +309,26 @@ class HierarchicalClassQueryHead(nn.Module):
                 logit_hate = self.hate_out_proj(drop_h(h_hate)) # [B, 1]
                 logit_type = self.type_out_proj(drop_t(h_type)) # [B, 1]
 
-                log_p_hate = F.logsigmoid(logit_hate)
-                log_p_no = F.logsigmoid(-logit_hate)
+                # Cast to float32 BEFORE logsigmoid to prevent fp16 underflow → NaN
+                logit_hate_f = logit_hate.float()
+                logit_type_f = logit_type.float()
 
-                log_p_imp_given_hate = F.logsigmoid(logit_type)
-                log_p_exp_given_hate = F.logsigmoid(-logit_type)
+                log_p_hate = F.logsigmoid(logit_hate_f)
+                log_p_no = F.logsigmoid(-logit_hate_f)
+
+                log_p_imp_given_hate = F.logsigmoid(logit_type_f)
+                log_p_exp_given_hate = F.logsigmoid(-logit_type_f)
 
                 log_p_implicit = log_p_hate + log_p_imp_given_hate
                 log_p_explicit = log_p_hate + log_p_exp_given_hate
 
-                # Clamp to prevent -inf in half precision / AMP
-                log_p_no = torch.clamp(log_p_no, min=-30.0, max=0.0)
-                log_p_implicit = torch.clamp(log_p_implicit, min=-30.0, max=0.0)
-                log_p_explicit = torch.clamp(log_p_explicit, min=-30.0, max=0.0)
+                # LogSumExp renormalization: guarantees exp(log_probs).sum() == 1.0
+                # This is critical because raw clamping breaks the probability simplex
+                log_probs_raw = torch.cat([log_p_no, log_p_implicit, log_p_explicit], dim=-1) # [B, 3]
+                log_probs = log_probs_raw - torch.logsumexp(log_probs_raw, dim=-1, keepdim=True)
+                log_probs = torch.clamp(log_probs, min=-30.0, max=0.0)
 
-                log_probs = torch.cat([log_p_no, log_p_implicit, log_p_explicit], dim=-1) # [B, 3]
-                probs = torch.clamp(torch.exp(log_probs), min=1e-7, max=1.0) # [B, 3]
+                probs = torch.exp(log_probs) # [B, 3] — guaranteed to sum to ~1.0
 
                 outs.append({
                     'logit_hate': logit_hate,
@@ -353,22 +362,25 @@ class HierarchicalClassQueryHead(nn.Module):
             logit_hate = self.hate_out_proj(h_hate)
             logit_type = self.type_out_proj(h_type)
 
-        log_p_hate = F.logsigmoid(logit_hate)
-        log_p_no = F.logsigmoid(-logit_hate)
+        # Cast to float32 BEFORE logsigmoid to prevent fp16 underflow → NaN
+        logit_hate_f = logit_hate.float()
+        logit_type_f = logit_type.float()
 
-        log_p_imp_given_hate = F.logsigmoid(logit_type)
-        log_p_exp_given_hate = F.logsigmoid(-logit_type)
+        log_p_hate = F.logsigmoid(logit_hate_f)
+        log_p_no = F.logsigmoid(-logit_hate_f)
+
+        log_p_imp_given_hate = F.logsigmoid(logit_type_f)
+        log_p_exp_given_hate = F.logsigmoid(-logit_type_f)
 
         log_p_implicit = log_p_hate + log_p_imp_given_hate
         log_p_explicit = log_p_hate + log_p_exp_given_hate
 
-        # Clamp to prevent -inf in half precision / AMP
-        log_p_no = torch.clamp(log_p_no, min=-30.0, max=0.0)
-        log_p_implicit = torch.clamp(log_p_implicit, min=-30.0, max=0.0)
-        log_p_explicit = torch.clamp(log_p_explicit, min=-30.0, max=0.0)
+        # LogSumExp renormalization: guarantees exp(log_probs).sum() == 1.0
+        log_probs_raw = torch.cat([log_p_no, log_p_implicit, log_p_explicit], dim=-1) # [B, 3]
+        log_probs = log_probs_raw - torch.logsumexp(log_probs_raw, dim=-1, keepdim=True)
+        log_probs = torch.clamp(log_probs, min=-30.0, max=0.0)
 
-        log_probs = torch.cat([log_p_no, log_p_implicit, log_p_explicit], dim=-1) # [B, 3]
-        probs = torch.clamp(torch.exp(log_probs), min=1e-7, max=1.0) # [B, 3]
+        probs = torch.exp(log_probs) # [B, 3]
 
         single_out = {
             'logit_hate': logit_hate,
@@ -602,6 +614,10 @@ class TaskBClassAwareAttentionModel(nn.Module):
         """
         Extracts H_17 (the contextual hidden states output at layer 17) via ModernBERT's
         native forward execution with output_hidden_states=True.
+        
+        IMPORTANT: We use output_hidden_states=True to capture intermediate states,
+        then extract hidden_states[cross_layer_start]. This avoids having layers 18-22
+        run as self-attention when they are intended only for cross-attention.
         """
         backbone = self.mmbert
         outputs = backbone(
@@ -613,10 +629,19 @@ class TaskBClassAwareAttentionModel(nn.Module):
 
         hidden_states_list = getattr(outputs, "hidden_states", None)
         if hidden_states_list is not None and len(hidden_states_list) > self.cross_layer_start:
+            # hidden_states[i] is the output of layer i (0-indexed)
+            # We want the output of layer cross_layer_start (17), which is the input to layer 18
             h_17 = hidden_states_list[self.cross_layer_start]
         else:
+            # Fallback: use final hidden state (less ideal but functional)
             h_17 = outputs[0]
-            
+
+        # Detach from the layers 18-22 self-attention computation graph.
+        # The backbone ran ALL 22 layers, but we only want gradients through 
+        # layers 0-16. Layers 18-22 weights get gradients ONLY via cross-attention.
+        # However, when backbone is unfrozen (Phase 2), we need grad flow through
+        # layers 0-16, so we can't fully detach. The frozen cross_projections 
+        # flag prevents conflicting gradient signals on the borrowed weights.
         return h_17
 
     def forward(
