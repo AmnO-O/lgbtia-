@@ -54,6 +54,13 @@ class PipelineConfig:
     gate_gain_init: float = 0.05                # Gain for Xavier uniform init of gate weights (0.05 allows active input-dependence)
     context_dropout_prob: float = 0.20          # Probability of replacing Description with empty string during training (avoids shortcutting)
     
+    # Hierarchical Conditional Head Settings
+    use_hierarchical_head: bool = True          # Use 2-Stage Hierarchical Head (Hate vs No -> Implicit vs Explicit)
+    hierarchical_threshold: float = 0.50        # Threshold tau for binary hate gating during inference
+    hierarchical_alpha: float = 0.50            # Weight for binary loss
+    hierarchical_beta: float = 0.50             # Weight for conditional fine-grained loss (implicit vs explicit)
+    hierarchical_gamma: float = 1.00            # Weight for compound 3-class NLL loss
+    
     # Scratch model parameters
     vocab_size: int = 30000
     embedding_dim: int = 256

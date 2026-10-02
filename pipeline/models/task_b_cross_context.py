@@ -88,6 +88,122 @@ class MultiSampleDropoutClassifier(nn.Module):
         return self.out_proj(h)
 
 
+class HierarchicalMSDClassifier(nn.Module):
+    """
+    Hierarchical Conditional Multi-Sample Dropout Classification Head.
+    
+    Branch 1 (Super-Class Binary Head):
+        p_hate = sigmoid(W_h [h_T; h_C'] + b_h) in (0, 1) (No vs. Hate Speech)
+    Branch 2 (Fine-Grained Conditional Sub-Head):
+        p_implicit = sigmoid(W_f [h_T; h_C'] + b_f) in (0, 1) (Implicit vs. Explicit Hate)
+        
+    Compound Probability Tree:
+        P(no)          = 1 - p_hate
+        P(yes_implicit)= p_hate * p_implicit
+        P(yes_explicit)= p_hate * (1 - p_implicit)
+    """
+    def __init__(
+        self,
+        in_features: int,
+        hidden_dim: int = 384,
+        dropout_rates: Optional[List[float]] = None,
+        use_rmsnorm: bool = True
+    ):
+        super(HierarchicalMSDClassifier, self).__init__()
+        self.dropout_rates = dropout_rates or [0.10, 0.15, 0.20, 0.25, 0.30]
+        NormClass = RMSNorm if use_rmsnorm else nn.LayerNorm
+
+        # 1. Super-Class Projection (Hate vs No)
+        self.hate_pre_proj = nn.Linear(in_features, hidden_dim)
+        self.hate_act = nn.GELU()
+        self.hate_norm = NormClass(hidden_dim)
+        self.hate_dropouts = nn.ModuleList([nn.Dropout(p) for p in self.dropout_rates])
+        self.hate_out_proj = nn.Linear(hidden_dim, 1)
+
+        # 2. Fine-Grained Sub-Class Projection (Implicit vs Explicit)
+        self.type_pre_proj = nn.Linear(in_features, hidden_dim)
+        self.type_act = nn.GELU()
+        self.type_norm = NormClass(hidden_dim)
+        self.type_dropouts = nn.ModuleList([nn.Dropout(p) for p in self.dropout_rates])
+        self.type_out_proj = nn.Linear(hidden_dim, 1)
+
+        # Initialize weights
+        for mod in [self.hate_pre_proj, self.hate_out_proj, self.type_pre_proj, self.type_out_proj]:
+            nn.init.xavier_uniform_(mod.weight)
+            nn.init.zeros_(mod.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_all_msd_logits: bool = False
+    ) -> Union[Dict[str, torch.Tensor], List[Dict[str, torch.Tensor]]]:
+        h_hate = self.hate_norm(self.hate_act(self.hate_pre_proj(x)))
+        h_type = self.type_norm(self.type_act(self.type_pre_proj(x)))
+
+        if self.training:
+            outs = []
+            for drop_h, drop_t in zip(self.hate_dropouts, self.type_dropouts):
+                logit_hate = self.hate_out_proj(drop_h(h_hate)) # [B, 1]
+                logit_type = self.type_out_proj(drop_t(h_type)) # [B, 1]
+
+                p_hate = torch.sigmoid(logit_hate)
+                p_imp = torch.sigmoid(logit_type)
+
+                p_no = 1.0 - p_hate
+                p_implicit = p_hate * p_imp
+                p_explicit = p_hate * (1.0 - p_imp)
+                probs = torch.cat([p_no, p_implicit, p_explicit], dim=-1) # [B, 3]
+
+                # Convert compound probabilities back to logit space for metric computation
+                eps = 1e-7
+                compound_logits = torch.log(torch.clamp(probs, min=eps, max=1.0 - eps))
+
+                outs.append({
+                    'logit_hate': logit_hate,
+                    'logit_type': logit_type,
+                    'probs': probs,
+                    'compound_logits': compound_logits
+                })
+
+            if return_all_msd_logits:
+                return outs
+
+            # Average over dropout masks
+            avg_logit_hate = torch.mean(torch.stack([o['logit_hate'] for o in outs], dim=0), dim=0)
+            avg_logit_type = torch.mean(torch.stack([o['logit_type'] for o in outs], dim=0), dim=0)
+            avg_probs = torch.mean(torch.stack([o['probs'] for o in outs], dim=0), dim=0)
+            avg_compound = torch.mean(torch.stack([o['compound_logits'] for o in outs], dim=0), dim=0)
+
+            return {
+                'logit_hate': avg_logit_hate,
+                'logit_type': avg_logit_type,
+                'probs': avg_probs,
+                'compound_logits': avg_compound
+            }
+
+        # Evaluation mode (deterministic)
+        logit_hate = self.hate_out_proj(h_hate)
+        logit_type = self.type_out_proj(h_type)
+
+        p_hate = torch.sigmoid(logit_hate)
+        p_imp = torch.sigmoid(logit_type)
+
+        p_no = 1.0 - p_hate
+        p_implicit = p_hate * p_imp
+        p_explicit = p_hate * (1.0 - p_imp)
+        probs = torch.cat([p_no, p_implicit, p_explicit], dim=-1) # [B, 3]
+
+        eps = 1e-7
+        compound_logits = torch.log(torch.clamp(probs, min=eps, max=1.0 - eps))
+
+        return {
+            'logit_hate': logit_hate,
+            'logit_type': logit_type,
+            'probs': probs,
+            'compound_logits': compound_logits
+        }
+
+
 class GatedCrossAttentionContextBlock(nn.Module):
     """
     Asymmetric Cross-Attention Block with Element-wise Gated Residual Highway.
@@ -180,6 +296,7 @@ class TaskBCrossContextAttentionModel(nn.Module):
         dropout: float = 0.30,
         use_msd: bool = True,
         msd_dropout_rates: Optional[List[float]] = None,
+        use_hierarchical_head: bool = True,
         gate_bias_init: float = -1.50,
         gate_gain_init: float = 0.05,
         use_rmsnorm: bool = True
@@ -189,6 +306,7 @@ class TaskBCrossContextAttentionModel(nn.Module):
         self.d_model = d_model
         self.num_classes = num_classes
         self.use_msd = use_msd
+        self.use_hierarchical_head = use_hierarchical_head
         
         # 1. Structural Pre-Backbone Role Embedding for Title vs Comment tokens (0: Pad, 1: Title, 2: Comment)
         NUM_ROLES = 3
@@ -214,7 +332,14 @@ class TaskBCrossContextAttentionModel(nn.Module):
         self.fusion_norm = NormClass(2 * d_model)
 
         # 4. Classification Head (Dual Stream: Title (768) + Context-infused Comment (768) -> 1536)
-        if use_msd:
+        if use_hierarchical_head:
+            self.classifier = HierarchicalMSDClassifier(
+                in_features=2 * d_model,
+                hidden_dim=hidden_dim,
+                dropout_rates=msd_dropout_rates,
+                use_rmsnorm=use_rmsnorm
+            )
+        elif use_msd:
             self.classifier = MultiSampleDropoutClassifier(
                 in_features=2 * d_model,
                 hidden_dim=hidden_dim,
@@ -402,7 +527,7 @@ class TaskBCrossContextAttentionModel(nn.Module):
         # ==========================================================
         # 5. CLASSIFICATION HEAD (1536 -> 384 -> 3)
         # ==========================================================
-        if self.use_msd:
+        if self.use_hierarchical_head or self.use_msd:
             logits_output = self.classifier(z_fusion, return_all_msd_logits=return_all_msd_logits)
         else:
             raw_logits = self.classifier(z_fusion)
@@ -412,7 +537,20 @@ class TaskBCrossContextAttentionModel(nn.Module):
             out_logits = logits_output if isinstance(logits_output, list) else [logits_output]
         else:
             if isinstance(logits_output, list):
-                out_logits = torch.mean(torch.stack(logits_output, dim=0), dim=0)
+                if isinstance(logits_output[0], dict):
+                    # Average dictionary outputs across samples
+                    avg_logit_hate = torch.mean(torch.stack([o['logit_hate'] for o in logits_output], dim=0), dim=0)
+                    avg_logit_type = torch.mean(torch.stack([o['logit_type'] for o in logits_output], dim=0), dim=0)
+                    avg_probs = torch.mean(torch.stack([o['probs'] for o in logits_output], dim=0), dim=0)
+                    avg_compound = torch.mean(torch.stack([o['compound_logits'] for o in logits_output], dim=0), dim=0)
+                    out_logits = {
+                        'logit_hate': avg_logit_hate,
+                        'logit_type': avg_logit_type,
+                        'probs': avg_probs,
+                        'compound_logits': avg_compound
+                    }
+                else:
+                    out_logits = torch.mean(torch.stack(logits_output, dim=0), dim=0)
             else:
                 out_logits = logits_output
 

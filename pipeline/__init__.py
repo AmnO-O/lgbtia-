@@ -30,6 +30,7 @@ from .augmentation import (
 from .models.task_b_cross_context import (
     TaskBCrossContextAttentionModel,
     GatedCrossAttentionContextBlock,
+    HierarchicalMSDClassifier,
 )
 from .task_b_cross_data import (
     TaskBDualStreamDataset,
@@ -48,6 +49,7 @@ from .losses import (
     build_loss_fn,
     UnidirectionalKLDivergenceLoss,
     PrivilegedConsistencyTaskBLoss,
+    HierarchicalTaskBLoss,
     TaskBLoss
 )
 from .metrics import evaluate_stereoqueer, print_metrics, compute_classification_metrics

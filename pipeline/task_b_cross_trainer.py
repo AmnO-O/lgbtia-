@@ -27,7 +27,7 @@ except ImportError:
 
 from .config import PipelineConfig, HATE2IDX, IDX2HATE
 from .metrics import compute_classification_metrics
-from .losses import FocalLoss, LabelSmoothingCrossEntropy, build_loss_fn
+from .losses import FocalLoss, LabelSmoothingCrossEntropy, build_loss_fn, HierarchicalTaskBLoss
 from .models.task_b_cross_context import TaskBCrossContextAttentionModel
 
 
@@ -128,15 +128,25 @@ class TaskBCrossTrainer:
         # Class weights determination (prioritize parameter if passed, else config)
         weights_to_use = class_weights if class_weights is not None else getattr(config, 'class_weights', None)
 
-        # Loss Function using build_loss_fn
-        loss_type = getattr(config, 'loss_type', 'focal')
-        self.criterion = build_loss_fn(
-            loss_type=loss_type,
-            class_weights=weights_to_use,
-            gamma=getattr(config, 'focal_gamma', 2.0),
-            label_smoothing=getattr(config, 'label_smoothing', 0.05),
-            device=self.device
-        )
+        # Loss Function using build_loss_fn or HierarchicalTaskBLoss
+        if getattr(self.model, 'use_hierarchical_head', False) or getattr(config, 'use_hierarchical_head', False):
+            self.criterion = HierarchicalTaskBLoss(
+                alpha=getattr(config, 'hierarchical_alpha', 0.50),
+                beta=getattr(config, 'hierarchical_beta', 0.50),
+                gamma=getattr(config, 'hierarchical_gamma', 1.00),
+                class_weights=weights_to_use,
+                label_smoothing=getattr(config, 'label_smoothing', 0.05),
+                device=self.device
+            )
+        else:
+            loss_type = getattr(config, 'loss_type', 'focal')
+            self.criterion = build_loss_fn(
+                loss_type=loss_type,
+                class_weights=weights_to_use,
+                gamma=getattr(config, 'focal_gamma', 2.0),
+                label_smoothing=getattr(config, 'label_smoothing', 0.05),
+                device=self.device
+            )
 
         # FGM
         use_fgm = getattr(config, 'use_fgm', True)
@@ -192,7 +202,7 @@ class TaskBCrossTrainer:
 
             with torch.amp.autocast(self.device_type, enabled=self.use_amp):
                 # Standard Forward pass with MSD
-                if self.model.use_msd:
+                if self.model.use_msd or getattr(self.model, 'use_hierarchical_head', False):
                     logits_list = self.model(
                         tc_input_ids=tc_ids,
                         tc_attention_mask=tc_mask,
@@ -202,7 +212,10 @@ class TaskBCrossTrainer:
                         return_all_msd_logits=True
                     )
                     loss = torch.mean(torch.stack([self.criterion(l, labels) for l in logits_list]))
-                    logits_avg = torch.mean(torch.stack(logits_list, dim=0), dim=0)
+                    if isinstance(logits_list[0], dict):
+                        logits_avg = torch.mean(torch.stack([l['probs'] for l in logits_list], dim=0), dim=0)
+                    else:
+                        logits_avg = torch.mean(torch.stack(logits_list, dim=0), dim=0)
                 else:
                     logits = self.model(
                         tc_input_ids=tc_ids,
@@ -213,7 +226,7 @@ class TaskBCrossTrainer:
                         return_all_msd_logits=False
                     )
                     loss = self.criterion(logits, labels)
-                    logits_avg = logits
+                    logits_avg = logits['probs'] if isinstance(logits, dict) else logits
 
             preds = torch.argmax(logits_avg, dim=-1)
             all_train_preds.append(preds.detach().cpu().numpy())
@@ -329,7 +342,26 @@ class TaskBCrossTrainer:
                     loss = self.criterion(logits, labels)
 
                 total_loss += loss.item()
-                preds = torch.argmax(logits, dim=-1)
+                if isinstance(logits, dict):
+                    probs = logits['probs'] # [B, 3]
+                    # Hierarchical threshold routing if specified
+                    tau = getattr(self.config, 'hierarchical_threshold', 0.50)
+                    if tau != 0.50:
+                        logit_hate = logits['logit_hate'].squeeze(-1)
+                        p_hate = torch.sigmoid(logit_hate)
+                        logit_type = logits['logit_type'].squeeze(-1)
+                        p_imp = torch.sigmoid(logit_type)
+                        
+                        preds = torch.zeros_like(labels)
+                        is_hate = (p_hate >= tau)
+                        is_imp = (p_imp >= 0.50)
+                        preds[is_hate & is_imp] = 1 # implicit
+                        preds[is_hate & (~is_imp)] = 2 # explicit
+                    else:
+                        preds = torch.argmax(probs, dim=-1)
+                else:
+                    preds = torch.argmax(logits, dim=-1)
+
                 all_preds.append(preds.cpu().numpy())
                 all_labels.append(labels.cpu().numpy())
                 
