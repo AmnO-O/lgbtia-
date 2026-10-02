@@ -30,21 +30,23 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def apply_rotary_pos_emb_single(tensor: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """
-    Applies Rotary Position Embedding exclusively to a single multi-head tensor (e.g. Keys).
+    Applies Rotary Position Embedding exclusively to a single multi-head tensor (Keys).
     tensor: [B, num_heads, L, head_dim]
-    cos, sin: [1, 1, L, head_dim] or [B, 1, L, head_dim] or [1, L, 1, head_dim]
+    cos, sin: [1, 1, L, head_dim] or [B, 1, L, head_dim] or [1, L, 1, head_dim] or [B, L, head_dim]
     """
-    if cos.dim() == 4 and cos.shape[1] != tensor.shape[1] and cos.shape[2] == tensor.shape[2]:
-        # [B, 1, L, d_h] matching [B, H, L, d_h]
-        pass
-    elif cos.dim() == 4 and cos.shape[1] == tensor.shape[2] and cos.shape[2] == 1:
-        # [1, L, 1, d_h] -> transpose to [1, 1, L, d_h]
+    if cos.dim() == 4 and cos.shape[1] == tensor.shape[2] and cos.shape[2] == 1:
+        # [1, L, 1, d_h] -> [1, 1, L, d_h]
         cos = cos.transpose(1, 2)
         sin = sin.transpose(1, 2)
     elif cos.dim() == 3:
-        # [1, L, d_h] or [B, L, d_h] -> [B, 1, L, d_h]
+        # [B, L, d_h] or [1, L, d_h] -> [B, 1, L, d_h]
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
+    elif cos.dim() == 2:
+        # [L, d_h] -> [1, 1, L, d_h]
+        cos = cos.unsqueeze(0).unsqueeze(1)
+        sin = sin.unsqueeze(0).unsqueeze(1)
+
     return (tensor * cos) + (rotate_half(tensor) * sin)
 
 
@@ -53,14 +55,9 @@ class PretrainedCrossAttentionLayer(nn.Module):
     Asymmetric Cross-Attention whose Q/K/V/O projections are borrowed directly
     from one pretrained ModernBERT attention block.
 
-    Scientific Framing (Parameter-Transplanted Cross-Attention):
-      - We transplant the linear projection parameters (Wqkv, Wo) while replacing
-        the pretrained self-attention topology with global latent-to-token cross-attention.
-      - Q is unrotated: Class queries represent abstract, position-free conceptual probes.
-      - K preserves full ModernBERT RoPE: Maintains contextual token order geometry.
-      - Global non-padding visibility: Cross-attention mask only removes PAD tokens,
-        unconstrained by local sliding-window restrictions.
-      - Configurable Pre-Normalization (Exp A: False, Exp B: True).
+    Academic Framing:
+      "We transplant pretrained Q/K/V/O projections while applying 
+       asymmetric RoPE to the context keys."
     """
     def __init__(
         self,
@@ -83,8 +80,7 @@ class PretrainedCrossAttentionLayer(nn.Module):
         # Optional: Borrow pretrained LayerNorm / RMSNorm for Experiment B
         self.norm = pretrained_norm if use_prenorm else None
 
-        # Resolve rotary embedding module: explicitly passed from parent ModernBertModel
-        # or fallback to attribute if present
+        # Wire rotary embedding explicitly from ModernBertModel
         self.rotary_emb = rotary_emb or getattr(pretrained_attn, "rotary_emb", None)
 
         self.num_heads = getattr(pretrained_attn.config, "num_attention_heads", 12)
@@ -96,7 +92,8 @@ class PretrainedCrossAttentionLayer(nn.Module):
         z: torch.Tensor,
         h_context: torch.Tensor,
         context_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None
+        position_ids: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
@@ -104,6 +101,7 @@ class PretrainedCrossAttentionLayer(nn.Module):
             h_context: [B, L, D] - Context token representations
             context_mask: [B, L] - Non-padding mask (1 for valid token, 0 for pad)
             position_ids: [B, L] - Positional indices for context tokens (0 to L-1)
+            position_embeddings: Optional precomputed tuple of (cos, sin) from ModernBERT rotary_emb
         Returns:
             z_out: [B, K, D] - Updated query latents
             attn_weights: [B, K, L] - Averaged cross-attention alignment weights across heads
@@ -130,11 +128,13 @@ class PretrainedCrossAttentionLayer(nn.Module):
         k = k.contiguous().view(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, L, d_h]
         v = v.contiguous().view(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, L, d_h]
 
-        # 3. Apply Native ModernBERT RoPE Exclusively to Keys (K)
-        if self.rotary_emb is not None:
+        # 3. Intentional Asymmetric RoPE: Apply Native ModernBERT RoPE Exclusively to Keys (K)
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            k = apply_rotary_pos_emb_single(k, cos, sin)
+        elif self.rotary_emb is not None:
             if position_ids is None:
                 position_ids = torch.arange(L, device=h_context.device).unsqueeze(0).expand(B, -1)
-            # ModernBERT RotaryEmbedding signature: rotary_emb(v, position_ids)
             cos, sin = self.rotary_emb(v, position_ids)
             k = apply_rotary_pos_emb_single(k, cos, sin)
 
@@ -372,16 +372,17 @@ class TaskBClassAwareAttentionModel(nn.Module):
     2. Strict Layer Resolution:
        - Directly inspects `.model.layers` (AutoModelForMaskedLM / ModernBertModel) or `.layers`.
        - Enforces exactly 22 pretrained layers.
-       - Discovers `rotary_emb` on ModernBertModel and forwards to all borrowed cross-attention layers.
+       - Discovers `rotary_emb` on ModernBertModel.
     3. Parameter Freeze Enforcement (Scientific Control):
        - If freeze_backbone=True: Freezes entire mmBERT backbone.
        - If freeze_cross_projections=True: Explicitly freezes borrowed Wqkv and Wo in cross_layers.
        - Explicitly enables gradients ONLY on class_queries and scoring_head (and role_embeddings).
     4. Genuine H_17 Extraction:
-       - Runs only Layers 1 to 17 (0:17) to produce H_17.
+       - Computes position_embeddings via self.rotary_emb.
+       - Runs only Layers 1 to 17 (0:17) passing position_embeddings and attention_mask.
     5. Pretrained Attention Borrowing Stack:
        - Exactly 5 layers (18 to 22, indices 17:22) applied sequentially to query latents Z.
-       - Asymmetric RoPE: Unrotated Q + Rotated K via the genuine ModernBertRotaryEmbedding.
+       - Asymmetric RoPE: Unrotated Q + Rotated K via the precomputed/callable rotary_emb.
     6. Hierarchical LogSigmoid Tree Head.
     """
     def __init__(
@@ -583,18 +584,31 @@ class TaskBClassAwareAttentionModel(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Genuinely executes only layers 0 to cross_layer_start-1 (Layers 1 to 17)
         to extract H_17. Completely omits layers 18 to 22 and final_norm.
+        
+        Properly computes position_embeddings via self.rotary_emb and passes them
+        into ModernBertEncoderLayer.forward(...) to avoid TypeError unpacking None.
         """
+        B, L, _ = inputs_embeds.shape
+        position_ids = torch.arange(L, device=inputs_embeds.device).unsqueeze(0).expand(B, -1)
+        
+        # Compute position embeddings required by ModernBert layers: (cos, sin)
+        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
+
         hidden_states = inputs_embeds
         for i in range(self.cross_layer_start):
             layer_module = self.encoder_layers[i]
-            layer_outputs = layer_module(hidden_states, attention_mask=attention_mask)
+            layer_outputs = layer_module(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_embeddings=position_embeddings
+            )
             hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
         
-        return hidden_states
+        return hidden_states, position_embeddings
 
     def forward(
         self,
@@ -641,12 +655,12 @@ class TaskBClassAwareAttentionModel(nn.Module):
         inputs_embeds = self.norm_input(word_embeds + e_role)
         inputs_embeds = self.dropout_input(inputs_embeds)
 
-        # 2. Genuine H_17 Extraction (Pass through layers 1 to 17 only)
+        # 2. Genuine H_17 Extraction (Pass through layers 1 to 17 only with position_embeddings)
         if needs_grad:
-            h_seq = self.extract_h17(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+            h_seq, pos_emb = self.extract_h17(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
         else:
             with torch.no_grad():
-                h_seq = self.extract_h17(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+                h_seq, pos_emb = self.extract_h17(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
 
         # 3. Expand Class Prototype Queries: Z_0 [B, total_queries, d_model]
         z = self.class_queries.unsqueeze(0).expand(B, -1, -1).contiguous()
@@ -659,7 +673,8 @@ class TaskBClassAwareAttentionModel(nn.Module):
             z, last_attn_weights = cross_layer(
                 z=z,
                 h_context=h_seq,
-                context_mask=attention_mask
+                context_mask=attention_mask,
+                position_embeddings=pos_emb
             )
 
         # 5. Optional Inter-Class Query Self-Interaction
