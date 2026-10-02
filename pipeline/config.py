@@ -118,7 +118,7 @@ class PipelineConfig:
     val_split_ratio: float = 0.1
     random_seed: int = 42
     device: Optional[str] = None                # Auto-detected if None ('cuda', 'mps', 'cpu')
-    num_workers: int = 2
+    num_workers: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
